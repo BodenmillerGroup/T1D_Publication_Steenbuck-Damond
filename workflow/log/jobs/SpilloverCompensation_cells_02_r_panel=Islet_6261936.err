@@ -1,0 +1,40 @@
+Building DAG of jobs...
+Using shell: /usr/bin/bash
+Provided cores: 1 (use --cores to define parallelism)
+Rules claiming more threads will be scaled down.
+Select jobs to execute...
+
+[Mon Oct 23 17:52:37 2023]
+rule SpilloverCompensation_cells_02_r:
+    input: /home/nsteen/scripts/T1D_analysis/analysis/02_SpilloverCompensation_cells_Islet.Rmd, /home/nsteen/scripts/T1D_analysis/docs/01_ImportData_cells_Islet.html, /data/nsteen/01_ImportData_cells_Islet/cells_Islet.rds
+    output: /home/nsteen/scripts/T1D_analysis/docs/02_SpilloverCompensation_cells_Islet.html
+    log: logs/02_SpilloverCompensation_cells_Islet.log
+    jobid: 0
+    benchmark: benchmark/02_SpilloverCompensation_cells_Islet.txt
+    reason: Forced execution
+    wildcards: panel=Islet
+    resources: mem_mb=80000, disk_mb=4748, tmpdir=/sctmp/nsteen, threads=1, time=5:00:00
+
+Rscript --vanilla -e 'rmarkdown::render("/home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmp26b3zo9t.02_SpilloverCompensation_cells_Islet.Rmd", output_file="/home/nsteen/scripts/T1D_analysis/docs/02_SpilloverCompensation_cells_Islet.html", quiet=TRUE, knit_root_dir = "/home/nsteen/scripts/T1D_analysis", params = list(rmd="/home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmp26b3zo9t.02_SpilloverCompensation_cells_Islet.Rmd"))'
+Activating singularity image /data/nsteen/singularity/sandbox
+
+Quitting from lines 743-746 [save-sce] (/sctmp/nsteen/RtmpBwhDW5/tmp26b3zo9t.02_SpilloverCompensation_cells_Islet.Rmd)
+Error:
+! object 'sce' not found
+Backtrace:
+ 1. base::print(sce)
+Execution halted
+Not cleaning up /home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmp26b3zo9t.02_SpilloverCompensation_cells_Islet.Rmd
+[Mon Oct 23 18:40:09 2023]
+Error in rule SpilloverCompensation_cells_02_r:
+    jobid: 0
+    output: /home/nsteen/scripts/T1D_analysis/docs/02_SpilloverCompensation_cells_Islet.html
+    log: logs/02_SpilloverCompensation_cells_Islet.log (check log file(s) for error message)
+
+RuleException:
+CalledProcessError in line 61 of /home/nsteen/scripts/T1D_analysis/workflow/Snakefile:
+Command ' singularity  exec --home /home/nsteen/scripts/T1D_analysis --bind /scratch/nsteen/processing:/home/processing,/scratch/nsteen/T1D_preprocessing:/scratch/nsteen/T1D_preprocessing,/data/nsteen:/data/nsteen /data/nsteen/singularity/sandbox bash -c 'set -euo pipefail;  Rscript --vanilla -e '\''rmarkdown::render("/home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmp26b3zo9t.02_SpilloverCompensation_cells_Islet.Rmd", output_file="/home/nsteen/scripts/T1D_analysis/docs/02_SpilloverCompensation_cells_Islet.html", quiet=TRUE, knit_root_dir = "/home/nsteen/scripts/T1D_analysis", params = list(rmd="/home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmp26b3zo9t.02_SpilloverCompensation_cells_Islet.Rmd"))'\'''' returned non-zero exit status 1.
+  File "/home/nsteen/scripts/T1D_analysis/workflow/Snakefile", line 61, in __rule_SpilloverCompensation_cells_02_r
+  File "/home/nsteen/data/conda/envs/snakemake_cluster/lib/python3.10/concurrent/futures/thread.py", line 58, in run
+Shutting down, this might take some time.
+Exiting because a job execution failed. Look above for error message

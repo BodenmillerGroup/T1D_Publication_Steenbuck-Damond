@@ -1,0 +1,28 @@
+['/home/nsteen/scripts/T1D_analysis/workflow/.snakemake/scripts', '/opt/conda/lib/python39.zip', '/opt/conda/lib/python3.9', '/opt/conda/lib/python3.9/lib-dynload', '/opt/conda/lib/python3.9/site-packages', '/mnt/snakemake', '/scratch/nsteen/T1D_preprocessing/processing']
+/opt/conda/bin/python
+Islet 
+    channel  metal          name  ... dimred  clustering  short_name
+0        0    Y89       Ghrelin  ...    1.0         1.0        GHRL
+1        1  In113   Histone H3   ...    0.0         0.0          H3
+2        2  In115        Biotin  ...    1.0         0.0         HBP
+6        6  La139  Somatostatin  ...    1.0         1.0         SST
+7        7  Ce140       Insulin  ...    1.0         1.0         INS
+
+[5 rows x 10 columns]
+Immune 
+    channel  metal          name  ... dimred  clustering  short_name
+0        0    Y89           MPO  ...      1           1         MPO
+1        1  In113   Histone H3   ...      0           0          H3
+2        2  In115           SMA  ...      1           1         SMA
+6        6  La139  Somatostatin  ...      1           1         SST
+7        7  Ce140       Insulin  ...      1           1         INS
+
+[5 rows x 10 columns]
+Images with missing corresponding files:
+ []
+
+Deleted files:
+Images with missing corresponding files:
+ []
+
+Deleted files:

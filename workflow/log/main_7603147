@@ -1,0 +1,34 @@
+Building DAG of jobs...
+Using shell: /usr/bin/bash
+Provided cluster nodes: 100
+Job stats:
+job                          count    min threads    max threads
+-------------------------  -------  -------------  -------------
+CellCategories_cells_08_r        1             48             48
+targets                          1              1              1
+total                            2              1             48
+
+Select jobs to execute...
+
+[Wed Jan  3 15:56:27 2024]
+rule CellCategories_cells_08_r:
+    input: /home/nsteen/scripts/T1D_analysis/analysis/08_CellTypesNonIslet_cells_Islet.Rmd, /home/nsteen/scripts/T1D_analysis/docs/06_CellTypesIslet_cells_Islet.html
+    output: /home/nsteen/scripts/T1D_analysis/docs/08_CellTypesNonIslet_cells_Islet.html
+    jobid: 1
+    benchmark: benchmark/08_CellTypesNonIslet_cells_Islet.txt
+    reason: Missing output files: /home/nsteen/scripts/T1D_analysis/docs/08_CellTypesNonIslet_cells_Islet.html
+    wildcards: panel=Islet
+    threads: 48
+    resources: mem_mb=247000, disk_mb=1000, tmpdir=/sctmp/nsteen, time=24:00:00
+
+Submitted job 1 with external jobid 'Submitted batch job 7603148'.
+[Wed Jan  3 18:08:24 2024]
+Error in rule CellCategories_cells_08_r:
+    jobid: 1
+    output: /home/nsteen/scripts/T1D_analysis/docs/08_CellTypesNonIslet_cells_Islet.html
+    cluster_jobid: Submitted batch job 7603148
+
+Error executing rule CellCategories_cells_08_r on cluster (jobid: 1, external: Submitted batch job 7603148, jobscript: /home/nsteen/scripts/T1D_analysis/.snakemake/tmp.b3q60icu/CellCategories_cells_08_r.1). For error details see the cluster log and the log files of the involved rule(s).
+Shutting down, this might take some time.
+Exiting because a job execution failed. Look above for error message
+Complete log: .snakemake/log/2024-01-03T155626.218526.snakemake.log

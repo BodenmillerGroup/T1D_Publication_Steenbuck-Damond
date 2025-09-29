@@ -1,0 +1,54 @@
+Building DAG of jobs...
+Using shell: /usr/bin/bash
+Provided cluster nodes: 100
+Job stats:
+job                          count    min threads    max threads
+-------------------------  -------  -------------  -------------
+CellCategories_cells_05_r        2             48             48
+targets                          1              1              1
+total                            3              1             48
+
+Select jobs to execute...
+
+[Sun Dec  3 17:50:02 2023]
+rule CellCategories_cells_05_r:
+    input: /home/nsteen/scripts/T1D_analysis/analysis/05_CellCategories_cells_Immune.Rmd, /home/nsteen/scripts/T1D_analysis/docs/04_QualityControl_cells_Immune.html
+    output: /home/nsteen/scripts/T1D_analysis/docs/05_CellCategories_cells_Immune.html
+    jobid: 1
+    benchmark: benchmark/05_CellCategories_cells_Immune.txt
+    reason: Missing output files: /home/nsteen/scripts/T1D_analysis/docs/05_CellCategories_cells_Immune.html
+    wildcards: panel=Immune
+    threads: 48
+    resources: mem_mb=350000, disk_mb=1000, tmpdir=/sctmp/nsteen, time=24:00:00
+
+Submitted job 1 with external jobid 'Submitted batch job 6943182'.
+
+[Sun Dec  3 17:50:02 2023]
+rule CellCategories_cells_05_r:
+    input: /home/nsteen/scripts/T1D_analysis/analysis/05_CellCategories_cells_Islet.Rmd, /home/nsteen/scripts/T1D_analysis/docs/04_QualityControl_cells_Islet.html
+    output: /home/nsteen/scripts/T1D_analysis/docs/05_CellCategories_cells_Islet.html
+    jobid: 7
+    benchmark: benchmark/05_CellCategories_cells_Islet.txt
+    reason: Missing output files: /home/nsteen/scripts/T1D_analysis/docs/05_CellCategories_cells_Islet.html
+    wildcards: panel=Islet
+    threads: 48
+    resources: mem_mb=350000, disk_mb=1000, tmpdir=/sctmp/nsteen, time=24:00:00
+
+Submitted job 7 with external jobid 'Submitted batch job 6943183'.
+[Sun Dec  3 18:55:15 2023]
+Error in rule CellCategories_cells_05_r:
+    jobid: 7
+    output: /home/nsteen/scripts/T1D_analysis/docs/05_CellCategories_cells_Islet.html
+    cluster_jobid: Submitted batch job 6943183
+
+Error executing rule CellCategories_cells_05_r on cluster (jobid: 7, external: Submitted batch job 6943183, jobscript: /home/nsteen/scripts/T1D_analysis/.snakemake/tmp.bbkf5kiv/CellCategories_cells_05_r.7). For error details see the cluster log and the log files of the involved rule(s).
+[Mon Dec  4 00:35:14 2023]
+Error in rule CellCategories_cells_05_r:
+    jobid: 1
+    output: /home/nsteen/scripts/T1D_analysis/docs/05_CellCategories_cells_Immune.html
+    cluster_jobid: Submitted batch job 6943182
+
+Error executing rule CellCategories_cells_05_r on cluster (jobid: 1, external: Submitted batch job 6943182, jobscript: /home/nsteen/scripts/T1D_analysis/.snakemake/tmp.bbkf5kiv/CellCategories_cells_05_r.1). For error details see the cluster log and the log files of the involved rule(s).
+Shutting down, this might take some time.
+Exiting because a job execution failed. Look above for error message
+Complete log: .snakemake/log/2023-12-03T175000.758236.snakemake.log

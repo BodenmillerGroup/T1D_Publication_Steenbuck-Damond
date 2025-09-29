@@ -1,0 +1,420 @@
+---
+title: "CohortAnalysis"
+author: "Nicolas Damond, Nathan Steenbuck"
+output: html_document
+date: "2022-01-21"
+editor_options:
+  chunk_output_type: inline
+---
+
+# Introduction
+
+The goal of this script is to plot different parameters relevant to the T1D donor cohort and to allow comparison of these parameters across the different disease groups.
+
+
+# Settings
+
+## Load packages
+
+```{r packages, message=FALSE}
+library(data.table)
+library(dplyr)
+library(ggplot2)
+```
+
+## Load data
+
+The ´CaseList.csv´ file contains information about all cases in the cohort.
+
+```{r readin-case-list}
+processing_folder <- file.path("/mnt/T1D_Vol/T1D_preprocessing")
+cases <- fread(file.path(processing_folder, "samples", "CaseList.csv"))
+cases <- cases[!is.na(CaseID)]
+```
+
+Delete Pancreatitis
+
+```{r}
+cases <- cases[!Group %in% c("Pancreatitis")]
+```
+
+
+## Run Variance Minimization.
+
+This demonstrates running the variance minimization using the VarMin.R by Sella, Raz & Kadosh (2021) https://link.springer.com/article/10.3758/s13423-021-01970-5.
+Output is batch allocation of samples.
+
+```{r packages, message=FALSE}
+source(file.path(processing_folder, "samples/VarMin.R"))
+res <- VarMin(file.path(processing_folder, "samples/VarianceMinimization_Template.csv"))
+batch_allocation <- res$allocations
+```
+
+## Plotting parameters
+
+```{r plotting-parameters}
+# Parameters for saving plots
+plotsave_param <- list(
+  device = "png", units = 'mm',
+  width = 300, height = 125, dpi = 300,
+  path = file.path("/mnt/T1D_Vol/T1D_preprocessing/samples")
+)
+
+
+# Plotting theme
+#' Plotting themes for ggplot2
+mytheme <- list(
+  standard = function(base_size = 16, base_family = "Arial") {
+    theme(
+      plot.title = element_text(size = 24),
+
+      legend.title = element_text(size = 14),
+      legend.text = element_text(size = 14),
+
+      axis.title = element_text(size = 12),
+      axis.text = element_text(size = 10),
+      axis.line  = element_line(linewidth = 0.3),
+      axis.ticks = element_line(linewidth = 0.3),
+
+      strip.text = element_text(size = 12),
+      strip.background = element_blank(),
+
+      panel.background = element_blank(),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_blank(),
+      panel.spacing.x = unit(0.1, "line")
+    )
+  },
+  standard_new = function(base_size = 22, base_family = "Arial") {
+    theme(
+      plot.title = element_text(size = 28),
+
+      legend.title = element_text(size = 25),
+      legend.text = element_text(size = 22),
+
+      axis.title = element_text(size = 22),
+      axis.text = element_text(size = 22),
+      axis.line  = element_line(linewidth = 0.4),
+      axis.ticks = element_line(linewidth = 0.4),
+
+      strip.text = element_text(size = 25),
+      strip.background = element_blank(),
+
+      panel.background = element_blank(),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_blank(),
+      panel.spacing.x = unit(0.3, "line")
+    )
+  },
+  large = function(base_size = 24, base_family = "Arial") {
+    theme(
+      plot.title = element_text(size = 32),
+
+      legend.title = element_text(size = 24),
+      legend.text = element_text(size = 24),
+
+      axis.title = element_text(size = 20),
+      axis.text = element_text(size = 16),
+      axis.line  = element_line(linewidth = 0.5),
+      axis.ticks = element_line(linewidth = 0.5),
+
+      strip.text = element_text(size = 20),
+      strip.background = element_blank(),
+
+      panel.background = element_blank(),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_blank(),
+      panel.spacing.x = unit(0.5, "line")
+    )
+  },
+  large_new = function(base_size = 32, base_family = "Arial") {
+    theme(
+      plot.title = element_text(size = 37),
+
+      legend.title = element_text(size = 35),
+      legend.text = element_text(size = 32),
+
+      axis.title = element_text(size = 35),
+      axis.text = element_text(size = 32),
+      axis.line  = element_line(linewidth = 0.6),
+      axis.ticks = element_line(linewidth = 0.6),
+
+      strip.text = element_text(size = 32),
+      strip.background = element_blank(),
+
+      panel.background = element_blank(),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_blank(),
+      panel.spacing.x = unit(0.5, "line")
+    )
+  }
+)
+
+
+# Color palettes
+palette_stages <- c(
+  "NoDiabetes" = "#3182BD", "sAAb+" = "#FED976", "mAAb+" = "#FD8D3C",
+  "RecentOnset" = "#E31A1C", "LongDuration" = "#800026"
+)
+```
+
+
+# Plot patient groups
+
+## Disease groups
+
+```{r disease-groups}
+groups <- c("NoDiabetes", "sAAb+", "mAAb+",
+            "RecentOnset", "LongDuration")
+cases$Group <- factor(cases$Group, levels = groups)
+
+
+a <- cases %>%
+  ggplot(aes(x = Group, fill = Group)) +
+  geom_bar(stat = "count", show.legend = FALSE) +
+  stat_count(geom = "text", vjust = 3, size = 8,
+             aes(label = paste("N = ", ..count..))) +
+  scale_fill_manual(values = palette_stages) +
+  labs(y = "Number of cases", x = NULL) +
+  mytheme$standard_new() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(a)
+
+fn <- paste("CasesPerStage", "Barplot.png", sep = "_")
+do.call(ggsave, c(list(fn, a), plotsave_param))
+```
+
+## Age
+
+```{r age}
+# Color by batch
+a <- cases[!is.na(CaseID), ] %>%
+  ggplot(aes(x = Group, y = Age)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(aes(color = as.factor(Batch)), width = 0.2, size = 3) +
+  guides(color = guide_legend(title = "Batch")) +
+  labs(y = "Age (years)", x = NULL) +
+  mytheme$standard_new()+ 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  geom_hline(yintercept = 7, linetype = "dashed", color = "black") +
+  geom_hline(yintercept = 13, linetype = "dashed", color = "black") + 
+    scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+",
+                              "RecentOnset", "LongDuration"),
+                    labels = c("Control", "sAAb+", "mAAb+",
+                              "Onset", "LD")) + xlab("Stage")
+
+print(a)
+
+fn <- paste("Age", "byBatch", "Boxplot.png", sep = "_")
+do.call(ggsave, c(list(fn, a), plotsave_param))
+
+# Color by gender
+c <- cases[!is.na(CaseID), ] %>%
+  ggplot(aes(x = Group, y = Age)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(aes(color = as.factor(Gender)), width = 0.2, size = 3) +
+  guides(color = guide_legend(title = "Sex")) +
+  labs(y = "Age (years)", x = NULL) +
+  mytheme$standard_new()+ 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    geom_hline(yintercept = 7, linetype = "dashed", color = "black") +
+  geom_hline(yintercept = 13, linetype = "dashed", color = "black") + 
+  scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+",
+                              "RecentOnset", "LongDuration"),
+                    labels = c("Control", "sAAb+", "mAAb+",
+                              "Onset", "LD")) + xlab("Stage")
+
+print(c)
+
+fn <- paste("Age", "byGender", "Boxplot.png", sep = "_")
+do.call(ggsave, c(list(fn, c), plotsave_param))
+
+# Plot a single batch
+batch_to_plot <- 3
+p <- cases[!is.na(CaseID) & Batch == batch_to_plot, ] %>%
+  ggplot(aes(x = Group, y = Age))  +
+  geom_boxplot(outlier.shape = NA)  +
+  geom_jitter(aes(color = as.factor(Batch)), width = 0.2, size = 3)  +
+  guides(color = guide_legend(title = "Batch"))  +
+  labs(y = "Age (year)", x = NULL)  +
+  mytheme$standard_new()+ 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+    geom_hline(yintercept = 7, linetype = "dashed", color = "black") +
+  geom_hline(yintercept = 13, linetype = "dashed", color = "black")
+print(p)
+
+fn <- paste("Age", paste0("Batch", batch_to_plot), "Boxplot.png", sep = "_")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+## BMI
+
+```{r bmi}
+# Color by batch
+b <- cases[!is.na(CaseID), ] %>%
+  ggplot(aes(x = Group, y = BMI))  +
+  geom_boxplot(outlier.shape = NA)  +
+  geom_jitter(aes(color = as.factor(Batch)), width = 0.2, size = 3)  +
+  guides(color = guide_legend(title = "Batch"))  +
+  labs(y = "BMI", x = NULL)  +
+  mytheme$standard_new()+
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+",
+                              "RecentOnset", "LongDuration"),
+                    labels = c("Control", "sAAb+", "mAAb+",
+                              "Onset", "LD")) + xlab("Stage")
+print(b)
+
+fn <- paste("BMI", "byBatch", "Boxplot.png", sep = "_")
+do.call(ggsave, c(list(fn, b), plotsave_param))
+
+# Color by gender
+d <- cases[!is.na(CaseID), ] %>%
+  ggplot(aes(x = Group, y = BMI))  +
+  geom_boxplot(outlier.shape = NA)  +
+  geom_jitter(aes(color = as.factor(Gender)), width = 0.2, size = 3)  +
+  guides(color = guide_legend(title = "Sex"))  +
+  labs(y = "BMI", x = NULL)  +
+  mytheme$standard_new()+ 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+",
+                              "RecentOnset", "LongDuration"),
+                    labels = c("Control", "sAAb+", "mAAb+",
+                              "Onset", "LD")) + xlab("Stage")
+print(d)
+
+fn <- paste("BMI", "byGender", "Boxplot.png", sep = "_")
+do.call(ggsave, c(list(fn, d), plotsave_param))
+```
+
+## BMI vs Age
+
+```{r bmi-age}
+# By stage
+p <- cases[!is.na(CaseID), ] %>%
+  ggplot(aes(x = Age, y = BMI, color = Group))  +
+  geom_point(size = 3)  +
+  mytheme$standard_new()+ 
+  geom_vline(xintercept = 7, linetype = "dashed", color = "black") +
+  geom_vline(xintercept = 13, linetype = "dashed", color = "black")
+print(p)
+fn <- paste("BMI", "vsAge", "byStage", "Scatter.png", sep = "_")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# By gender
+p <- cases[!is.na(CaseID), ] %>%
+  ggplot(aes(x = Age, y = BMI, color = Gender))  +
+  geom_point(size = 3)  +
+  mytheme$standard_new()
+print(p)
+fn <- paste("BMI", "vsAge", "byGender", "Scatter.png", sep = "_")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# By batch
+p <- cases[!is.na(CaseID), ] %>%
+  ggplot(aes(x = Age, y = BMI, color = as.factor(Batch)))  +
+  geom_point(size = 3)  +
+  labs(color = "Batch")  +
+  mytheme$standard_new()
+print(p)
+fn <- paste("BMI", "vsAge", "byBatch", "Scatter.png", sep = "_")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# By stage - Boxplot
+p <- cases[!is.na(CaseID), ] %>%
+  ggplot(aes(x = Group, y = Age/BMI))  +
+  geom_boxplot(outlier.shape = NA)  +
+  geom_jitter(aes(color = as.factor(Batch)), width = 0.2, size = 3)  +
+  guides(color = guide_legend(title = "Batch"))   + 
+  labs(y = "Age / BMI", x = NULL)  +
+  mytheme$standard_new()
+print(p)
+fn <- paste("BMI", "vsAge", "byStage", "Boxplot.png", sep = "_")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+## Gender
+
+```{r gender}
+# Calculate % women per group
+cases[!is.na(CaseID), CasesPerGroup := .N, by = c("Group")]
+cases[!is.na(CaseID), countGender := .N, by = c("Gender", "Group")]
+cases[!is.na(CaseID), fracGender := countGender / CasesPerGroup]
+
+z <- unique(cases[!is.na(CaseID) & Gender == "Female",
+                  .(Group, Gender, fracGender)]) %>%
+  ggplot(aes(x = Group, y = fracGender, fill = Group))  +
+  geom_bar(stat = "identity", show.legend = FALSE)  +
+  stat_identity(geom = "text", vjust = 3, size = 8,
+                aes(label = round(fracGender, 2)))  +
+  scale_fill_manual(values = palette_stages)  +
+  labs(y = "Fraction women", x = NULL)  +
+  ylim(c(0, 1))  +
+  mytheme$standard_new()+ 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+    scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+",
+                              "RecentOnset", "LongDuration"),
+                    labels = c("Control", "sAAb+", "mAAb+",
+                              "Onset", "LD")) + xlab("Stage")
+print(z)
+
+fn <- paste("Gender", "FractionWomen", "Barplot.png", sep = "_")
+do.call(ggsave, c(list(fn, z), plotsave_param))
+```
+
+## Ethnicity
+
+```{r ethnicity}
+# Calculate percentages per group
+cases[!is.na(CaseID), CasesPerGroup := .N, by = c("Group")]
+cases[!is.na(CaseID), countEthn := .N, by = c("Race", "Group")]
+cases[!is.na(CaseID), fracEthn := countEthn / CasesPerGroup]
+
+dat <- unique(cases[!is.na(Race), .(Group, Race, countEthn, fracEthn)]) |> 
+  as_tibble() |> 
+  mutate(Race = stringr::str_replace(Race, "_", " "))
+
+y <- dat %>%
+  ggplot(aes(x = Group, y = fracEthn, fill = Race))  +
+  geom_bar(stat = "identity", color = 'black')  +
+  labs(y = "Fraction by ethnicity", fill = "Ethnicity")  +
+  scale_fill_brewer(palette = "Set2")  +
+  mytheme$standard_new() +
+  theme(legend.position = "right",legend.direction = "vertical",  # Arrange legend horizontally
+) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+",
+                              "RecentOnset", "LongDuration"),
+                    labels = c("Control", "sAAb+", "mAAb+",
+                              "Onset", "LD")) + xlab("Stage")  
+y <- y + theme(
+  plot.margin = margin(t = 20, r = 30, b = 10, l = 10)  # Adjust top margin (t)
+)
+print(y)
+
+fn <- paste("Ethnicity", "Barplot.png", sep = "_")
+do.call(ggsave, c(list(fn, y), plotsave_param))
+```
+
+```{r fig}
+# plot full fig:
+library(patchwork)
+
+plotsave_param_large <- list(
+  device = "png", units = "mm",
+  width = 600, height = 400, dpi = 300,
+  path = file.path("/mnt/T1D_Vol/T1D_preprocessing/samples")
+)
+
+
+# Patchwork: assign a - f)
+fig <- y + z + a + b + c + d
+
+print(fig)
+fn <- paste("Full_Fig.png", sep = "_")
+do.call(ggsave, c(list(fn, fig), plotsave_param_large))
+```

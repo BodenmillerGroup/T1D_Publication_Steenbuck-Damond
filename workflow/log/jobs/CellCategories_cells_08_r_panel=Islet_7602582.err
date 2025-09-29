@@ -1,0 +1,53 @@
+Building DAG of jobs...
+Using shell: /usr/bin/bash
+Provided cores: 48
+Rules claiming more threads will be scaled down.
+Select jobs to execute...
+
+[Wed Jan  3 14:35:28 2024]
+rule CellCategories_cells_08_r:
+    input: /home/nsteen/scripts/T1D_analysis/analysis/08_CellTypesNonIslet_cells_Islet.Rmd, /home/nsteen/scripts/T1D_analysis/docs/06_CellTypesIslet_cells_Islet.html
+    output: /home/nsteen/scripts/T1D_analysis/docs/08_CellTypesNonIslet_cells_Islet.html
+    jobid: 0
+    benchmark: benchmark/08_CellTypesNonIslet_cells_Islet.txt
+    reason: Forced execution
+    wildcards: panel=Islet
+    threads: 48
+    resources: mem_mb=247000, disk_mb=1000, tmpdir=/sctmp/nsteen, time=24:00:00
+
+Rscript --vanilla -e 'rmarkdown::render("/home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmpfdvczgcp.08_CellTypesNonIslet_cells_Islet.Rmd", output_file="/home/nsteen/scripts/T1D_analysis/docs/08_CellTypesNonIslet_cells_Islet.html", quiet=TRUE, knit_root_dir = "/home/nsteen/scripts/T1D_analysis", params = list(rmd="/home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmpfdvczgcp.08_CellTypesNonIslet_cells_Islet.Rmd"))'
+Activating singularity image /data/nsteen/singularity/sandbox
+
+Quitting from lines 447-485 [phenograph-run] (/sctmp/nsteen/RtmpftO8k1/tmpfdvczgcp.08_CellTypesNonIslet_cells_Islet.Rmd)
+Error in `map()`:
+ℹ In index: 1.
+ℹ With name: exprs.
+Caused by error in `value[[3L]]()`:
+! invalid subscript 'type' in 'reducedDim(<SingleCellExperiment>, type="character", ...)':
+  '4' not in 'reducedDimNames(<SingleCellExperiment>)'
+Backtrace:
+  1. purrr::walk(...)
+  2. purrr::map(.x, .f, ..., .progress = .progress)
+  3. purrr:::map_("list", .x, .f, ..., .progress = .progress)
+  7. global .f(.x[[i]], ...)
+ 11. SingleCellExperiment::reducedDim(sce_sub, cur_assay)
+     ...
+ 14. base::tryCatch(...)
+ 15. base (local) tryCatchList(expr, classes, parentenv, handlers)
+ 16. base (local) tryCatchOne(expr, names, parentenv, handlers[[1L]])
+ 17. value[[3L]](cond)
+ 18. base::stop(...)
+Execution halted
+Not cleaning up /home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmpfdvczgcp.08_CellTypesNonIslet_cells_Islet.Rmd
+[Wed Jan  3 14:42:42 2024]
+Error in rule CellCategories_cells_08_r:
+    jobid: 0
+    output: /home/nsteen/scripts/T1D_analysis/docs/08_CellTypesNonIslet_cells_Islet.html
+
+RuleException:
+CalledProcessError in line 136 of /home/nsteen/scripts/T1D_analysis/workflow/Snakefile:
+Command ' singularity  exec --home /home/nsteen/scripts/T1D_analysis --bind /scratch/nsteen/processing:/home/processing,/scratch/nsteen/T1D_preprocessing:/scratch/nsteen/T1D_preprocessing,/data/nsteen:/data/nsteen /data/nsteen/singularity/sandbox bash -c 'set -euo pipefail;  Rscript --vanilla -e '\''rmarkdown::render("/home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmpfdvczgcp.08_CellTypesNonIslet_cells_Islet.Rmd", output_file="/home/nsteen/scripts/T1D_analysis/docs/08_CellTypesNonIslet_cells_Islet.html", quiet=TRUE, knit_root_dir = "/home/nsteen/scripts/T1D_analysis", params = list(rmd="/home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmpfdvczgcp.08_CellTypesNonIslet_cells_Islet.Rmd"))'\'''' returned non-zero exit status 1.
+  File "/home/nsteen/scripts/T1D_analysis/workflow/Snakefile", line 136, in __rule_CellCategories_cells_08_r
+  File "/home/nsteen/data/conda/envs/snakemake_cluster/lib/python3.10/concurrent/futures/thread.py", line 58, in run
+Shutting down, this might take some time.
+Exiting because a job execution failed. Look above for error message

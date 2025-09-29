@@ -1,0 +1,491 @@
+Building DAG of jobs...
+Using shell: /usr/bin/bash
+Provided cores: 8
+Rules claiming more threads will be scaled down.
+Select jobs to execute...
+
+[Wed Jul  9 12:29:20 2025]
+rule Preprocessing_01_py:
+    input: /scratch/nsteen/T1D_preprocessing/processing/01_Preprocessing.py, /scratch/nsteen/T1D_preprocessing/processing/helper_functions.py
+    output: /scratch/nsteen/processing/txt_output/01_Preprocessing.out
+    jobid: 0
+    reason: Forced execution
+    threads: 8
+    resources: mem_mb=120000, disk_mb=1000, tmpdir=/sctmp/nsteen, time=24:00:00
+
+python /home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmp_b2n_wzt.01_Preprocessing.py
+Activating singularity image /home/nsteen/data/singularity/sandbox/
+Error reading acquisition 55 from file /sctmp/nsteen/tmpkscseec8/6538_Islet/6538_Islet.mcd: MCD file '6538_Islet.mcd' corrupted: inconsistent acquisition image data size
+Recovering from file /home/processing/raw/Islet/6538_Islet.zip/6538_Islet/6538_Islet_ROI_055_55.txt
+Error reading file /sctmp/nsteen/tmpvmfmo7hv/6538_Islet/6538_Islet_ROI_055_55.txt: TXT file '6538_Islet_ROI_055_55.txt' corrupted: inconsistent acquisition image data size
+Traceback (most recent call last):
+  File "/opt/conda/lib/python3.9/site-packages/steinbock/preprocessing/imc.py", line 357, in _try_preprocess_mcd_images_from_disk
+    img = f_mcd.read_acquisition(acquisition)
+  File "/opt/conda/lib/python3.9/site-packages/readimc/_mcd_file.py", line 129, in read_acquisition
+    raise IOError(
+OSError: MCD file '6538_Islet.mcd' corrupted: inconsistent acquisition image data size
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/opt/conda/lib/python3.9/site-packages/steinbock/preprocessing/imc.py", line 320, in _try_preprocess_txt_image_from_disk
+    img = f.read_acquisition()
+  File "/opt/conda/lib/python3.9/site-packages/readimc/_txt_file.py", line 124, in read_acquisition
+    raise IOError(
+OSError: TXT file '6538_Islet_ROI_055_55.txt' corrupted: inconsistent acquisition image data size
+Error reading acquisition 52 from file /sctmp/nsteen/tmpt6sd5bm9/6531_Islet/6531_Islet.mcd: MCD file '6531_Islet.mcd' corrupted: inconsistent acquisition image data size
+Recovering from file /home/processing/raw/Islet/6531_Islet.zip/6531_Islet/6531_Islet_ROI_052_52.txt
+Error reading file /sctmp/nsteen/tmpxj0_57cq/6531_Islet/6531_Islet_ROI_052_52.txt: TXT file '6531_Islet_ROI_052_52.txt' corrupted: inconsistent acquisition image data size
+Traceback (most recent call last):
+  File "/opt/conda/lib/python3.9/site-packages/steinbock/preprocessing/imc.py", line 357, in _try_preprocess_mcd_images_from_disk
+    img = f_mcd.read_acquisition(acquisition)
+  File "/opt/conda/lib/python3.9/site-packages/readimc/_mcd_file.py", line 129, in read_acquisition
+    raise IOError(
+OSError: MCD file '6531_Islet.mcd' corrupted: inconsistent acquisition image data size
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/opt/conda/lib/python3.9/site-packages/steinbock/preprocessing/imc.py", line 320, in _try_preprocess_txt_image_from_disk
+    img = f.read_acquisition()
+  File "/opt/conda/lib/python3.9/site-packages/readimc/_txt_file.py", line 124, in read_acquisition
+    raise IOError(
+OSError: TXT file '6531_Islet_ROI_052_52.txt' corrupted: inconsistent acquisition image data size
+Error reading acquisition 31 from file /sctmp/nsteen/tmpu_571s5e/6496_Islet/6496_Islet.mcd: MCD file '6496_Islet.mcd' corrupted: invalid acquisition image data offsets
+Error reading acquisition 58 from file /sctmp/nsteen/tmpu_571s5e/6496_Islet/6496_Islet.mcd: MCD file '6496_Islet.mcd' corrupted: invalid acquisition image data offsets
+Error reading acquisition 40 from file /sctmp/nsteen/tmpj647jpvs/6483_Islet/6483_Islet.mcd: MCD file '6483_Islet.mcd' corrupted: invalid acquisition image data offsets
+Error reading acquisition 1 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_001_1.txt
+Error reading acquisition 2 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_002_2.txt
+Error reading acquisition 3 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_003_3.txt
+Error reading acquisition 4 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_004_4.txt
+Error reading acquisition 5 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_005_5.txt
+Error reading acquisition 6 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_006_6.txt
+Error reading acquisition 7 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_007_7.txt
+Error reading acquisition 8 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_008_8.txt
+Error reading acquisition 9 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_009_9.txt
+Error reading acquisition 10 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_010_10.txt
+Error reading acquisition 11 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_011_11.txt
+Error reading acquisition 12 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_012_12.txt
+Error reading acquisition 13 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_013_13.txt
+Error reading acquisition 14 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_014_14.txt
+Error reading acquisition 15 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_015_15.txt
+Error reading acquisition 16 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_016_16.txt
+Error reading acquisition 17 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_017_17.txt
+Error reading acquisition 18 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_018_18.txt
+Error reading acquisition 19 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_019_19.txt
+Error reading acquisition 20 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_020_20.txt
+Error reading acquisition 21 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_021_21.txt
+Error reading acquisition 22 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_022_22.txt
+Error reading acquisition 23 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_023_23.txt
+Error reading acquisition 24 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_024_24.txt
+Error reading acquisition 25 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_025_25.txt
+Error reading acquisition 26 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_026_26.txt
+Error reading acquisition 27 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_027_27.txt
+Error reading acquisition 28 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_028_28.txt
+Error reading acquisition 29 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_029_29.txt
+Error reading acquisition 30 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_030_30.txt
+Error reading acquisition 31 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_031_31.txt
+Error reading acquisition 32 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_032_32.txt
+Error reading acquisition 33 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_033_33.txt
+Error reading acquisition 34 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_034_34.txt
+Error reading acquisition 35 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_035_35.txt
+Error reading acquisition 36 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_036_36.txt
+Error reading acquisition 37 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_037_37.txt
+Error reading acquisition 38 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_038_38.txt
+Error reading acquisition 39 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_039_39.txt
+Error reading acquisition 40 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_040_40.txt
+Error reading acquisition 41 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_041_41.txt
+Error reading acquisition 42 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_042_42.txt
+Error reading acquisition 43 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_043_43.txt
+Error reading acquisition 44 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_044_44.txt
+Error reading acquisition 45 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_045_45.txt
+Error reading acquisition 46 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_046_46.txt
+Error reading acquisition 47 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_047_47.txt
+Error reading acquisition 48 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_048_48.txt
+Error reading acquisition 49 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_049_49.txt
+Error reading acquisition 50 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_050_50.txt
+Error reading acquisition 51 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_051_51.txt
+Error reading acquisition 52 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_052_52.txt
+Error reading acquisition 53 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_053_53.txt
+Error reading acquisition 54 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_054_54.txt
+Error reading acquisition 55 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_055_55.txt
+Error reading acquisition 56 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_056_56.txt
+Error reading acquisition 57 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_057_57.txt
+Error reading acquisition 58 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_058_58.txt
+Error reading acquisition 59 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_059_59.txt
+Error reading acquisition 60 from file /sctmp/nsteen/tmpb56mgzzv/6418_Islet/6418_Islet.mcd: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6418_Islet.zip/6418_Islet/6418_Islet_ROI_060_60.txt
+Error reading file /sctmp/nsteen/tmpe7hwl1we/6418_Islet/6418_Islet_ROI_060_60.txt: TXT file '6418_Islet_ROI_060_60.txt' corrupted: inconsistent acquisition image data size
+Traceback (most recent call last):
+  File "/opt/conda/lib/python3.9/site-packages/steinbock/preprocessing/imc.py", line 357, in _try_preprocess_mcd_images_from_disk
+    img = f_mcd.read_acquisition(acquisition)
+  File "/opt/conda/lib/python3.9/site-packages/readimc/_mcd_file.py", line 102, in read_acquisition
+    raise IOError(
+OSError: MCD file '6418_Islet.mcd' corrupted: invalid acquisition image data offsets
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/opt/conda/lib/python3.9/site-packages/steinbock/preprocessing/imc.py", line 320, in _try_preprocess_txt_image_from_disk
+    img = f.read_acquisition()
+  File "/opt/conda/lib/python3.9/site-packages/readimc/_txt_file.py", line 124, in read_acquisition
+    raise IOError(
+OSError: TXT file '6418_Islet_ROI_060_60.txt' corrupted: inconsistent acquisition image data size
+Error reading acquisition 1 from file /sctmp/nsteen/tmpsox9tedm/6388_Islet/6388_Islet.mcd: MCD file '6388_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6388_Islet.zip/6388_Islet/6388_Islet_ROI_001_1.txt
+Error reading acquisition 46 from file /sctmp/nsteen/tmprb54z1s5/6380_Islet/6380_Islet.mcd: MCD file '6380_Islet.mcd' corrupted: inconsistent acquisition image data size
+Recovering from file /home/processing/raw/Islet/6380_Islet.zip/6380_Islet/6380_Islet_ROI_046_46.txt
+Error reading file /sctmp/nsteen/tmpfj6l648u/6380_Islet/6380_Islet_ROI_046_46.txt: TXT file '6380_Islet_ROI_046_46.txt' corrupted: inconsistent acquisition image data size
+Traceback (most recent call last):
+  File "/opt/conda/lib/python3.9/site-packages/steinbock/preprocessing/imc.py", line 357, in _try_preprocess_mcd_images_from_disk
+    img = f_mcd.read_acquisition(acquisition)
+  File "/opt/conda/lib/python3.9/site-packages/readimc/_mcd_file.py", line 129, in read_acquisition
+    raise IOError(
+OSError: MCD file '6380_Islet.mcd' corrupted: inconsistent acquisition image data size
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/opt/conda/lib/python3.9/site-packages/steinbock/preprocessing/imc.py", line 320, in _try_preprocess_txt_image_from_disk
+    img = f.read_acquisition()
+  File "/opt/conda/lib/python3.9/site-packages/readimc/_txt_file.py", line 124, in read_acquisition
+    raise IOError(
+OSError: TXT file '6380_Islet_ROI_046_46.txt' corrupted: inconsistent acquisition image data size
+Error reading acquisition 5 from file /sctmp/nsteen/tmpwi3mx_38/6314_Islet/6314_Islet.mcd: MCD file '6314_Islet.mcd' corrupted: invalid acquisition image data offsets
+Error reading acquisition 21 from file /sctmp/nsteen/tmpo3il6h1y/6229_Islet/6229_Islet.mcd: MCD file '6229_Islet.mcd' corrupted: invalid acquisition image data offsets
+Error reading acquisition 39 from file /sctmp/nsteen/tmpo3il6h1y/6229_Islet/6229_Islet.mcd: MCD file '6229_Islet.mcd' corrupted: invalid acquisition image data offsets
+Error reading acquisition 77 from file /sctmp/nsteen/tmpo3il6h1y/6229_Islet/6229_Islet.mcd: MCD file '6229_Islet.mcd' corrupted: invalid acquisition image data offsets
+Error reading acquisition 8 from file /sctmp/nsteen/tmp2y72225w/6151_Islet/6151_Islet.mcd: MCD file '6151_Islet.mcd' corrupted: inconsistent acquisition image data size
+Recovering from file /home/processing/raw/Islet/6151_Islet.zip/6151_Islet/6151_Islet_ROI_008_8.txt
+Error reading file /sctmp/nsteen/tmpxu383jx5/6151_Islet/6151_Islet_ROI_008_8.txt: TXT file '6151_Islet_ROI_008_8.txt' corrupted: inconsistent acquisition image data size
+Traceback (most recent call last):
+  File "/opt/conda/lib/python3.9/site-packages/steinbock/preprocessing/imc.py", line 357, in _try_preprocess_mcd_images_from_disk
+    img = f_mcd.read_acquisition(acquisition)
+  File "/opt/conda/lib/python3.9/site-packages/readimc/_mcd_file.py", line 129, in read_acquisition
+    raise IOError(
+OSError: MCD file '6151_Islet.mcd' corrupted: inconsistent acquisition image data size
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/opt/conda/lib/python3.9/site-packages/steinbock/preprocessing/imc.py", line 320, in _try_preprocess_txt_image_from_disk
+    img = f.read_acquisition()
+  File "/opt/conda/lib/python3.9/site-packages/readimc/_txt_file.py", line 124, in read_acquisition
+    raise IOError(
+OSError: TXT file '6151_Islet_ROI_008_8.txt' corrupted: inconsistent acquisition image data size
+Error reading acquisition 12 from file /sctmp/nsteen/tmp_a58_2x4/6123_Islet/6123_Islet.mcd: MCD file '6123_Islet.mcd' corrupted: invalid acquisition image data offsets
+Error reading acquisition 1 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_001_1.txt
+Error reading acquisition 2 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_002_2.txt
+Error reading acquisition 3 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_003_3.txt
+Error reading acquisition 4 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_004_4.txt
+Error reading acquisition 5 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_005_5.txt
+Error reading acquisition 6 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_006_6.txt
+Error reading acquisition 7 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_007_7.txt
+Error reading acquisition 8 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_008_8.txt
+Error reading acquisition 9 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_009_9.txt
+Error reading acquisition 10 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_010_10.txt
+Error reading acquisition 11 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_011_11.txt
+Error reading acquisition 12 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_012_12.txt
+Error reading acquisition 13 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_013_13.txt
+Error reading acquisition 14 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_014_14.txt
+Error reading acquisition 15 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_015_15.txt
+Error reading acquisition 16 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_016_16.txt
+Error reading acquisition 17 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_017_17.txt
+Error reading acquisition 18 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_018_18.txt
+Error reading acquisition 19 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_019_19.txt
+Error reading acquisition 20 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_020_20.txt
+Error reading acquisition 21 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_021_21.txt
+Error reading acquisition 22 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_022_22.txt
+Error reading acquisition 23 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_023_23.txt
+Error reading acquisition 24 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_024_24.txt
+Error reading acquisition 25 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_025_25.txt
+Error reading acquisition 26 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_026_26.txt
+Error reading acquisition 27 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_027_27.txt
+Error reading acquisition 28 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_028_28.txt
+Error reading acquisition 29 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_029_29.txt
+Error reading acquisition 30 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_030_30.txt
+Error reading acquisition 31 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_031_31.txt
+Error reading acquisition 32 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_032_32.txt
+Error reading acquisition 33 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_033_33.txt
+Error reading acquisition 34 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_034_34.txt
+Error reading acquisition 35 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_035_35.txt
+Error reading acquisition 36 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_036_36.txt
+Error reading acquisition 37 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_037_37.txt
+Error reading acquisition 38 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_038_38.txt
+Error reading acquisition 39 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_039_39.txt
+Error reading acquisition 40 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_040_40.txt
+Error reading acquisition 41 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_041_41.txt
+Error reading acquisition 42 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_042_42.txt
+Error reading acquisition 43 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_043_43.txt
+Error reading acquisition 44 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_044_44.txt
+Error reading acquisition 45 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_045_45.txt
+Error reading acquisition 46 from file /sctmp/nsteen/tmp_l0p_j22/6055_Islet/6055_Islet.mcd: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+Recovering from file /home/processing/raw/Islet/6055_Islet.zip/6055_Islet/6055_Islet_ROI_046_46.txt
+Error reading file /sctmp/nsteen/tmpn8i43qi8/6055_Islet/6055_Islet_ROI_046_46.txt: TXT file '6055_Islet_ROI_046_46.txt' corrupted: inconsistent acquisition image data size
+Traceback (most recent call last):
+  File "/opt/conda/lib/python3.9/site-packages/steinbock/preprocessing/imc.py", line 357, in _try_preprocess_mcd_images_from_disk
+    img = f_mcd.read_acquisition(acquisition)
+  File "/opt/conda/lib/python3.9/site-packages/readimc/_mcd_file.py", line 102, in read_acquisition
+    raise IOError(
+OSError: MCD file '6055_Islet.mcd' corrupted: invalid acquisition image data offsets
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/opt/conda/lib/python3.9/site-packages/steinbock/preprocessing/imc.py", line 320, in _try_preprocess_txt_image_from_disk
+    img = f.read_acquisition()
+  File "/opt/conda/lib/python3.9/site-packages/readimc/_txt_file.py", line 124, in read_acquisition
+    raise IOError(
+OSError: TXT file '6055_Islet_ROI_046_46.txt' corrupted: inconsistent acquisition image data size
+Error reading acquisition 46 from file /sctmp/nsteen/tmpafkt4w8_/6547_Immune/6547_Immune.mcd: MCD file '6547_Immune.mcd' corrupted: inconsistent acquisition image data size
+Recovering from file /home/processing/raw/Immune/6547_Immune.zip/6547_Immune/6547_Immune_ROI_046_46.txt
+Error reading file /sctmp/nsteen/tmp893jcura/6547_Immune/6547_Immune_ROI_046_46.txt: TXT file '6547_Immune_ROI_046_46.txt' corrupted: inconsistent acquisition image data size
+Traceback (most recent call last):
+  File "/opt/conda/lib/python3.9/site-packages/steinbock/preprocessing/imc.py", line 357, in _try_preprocess_mcd_images_from_disk
+    img = f_mcd.read_acquisition(acquisition)
+  File "/opt/conda/lib/python3.9/site-packages/readimc/_mcd_file.py", line 129, in read_acquisition
+    raise IOError(
+OSError: MCD file '6547_Immune.mcd' corrupted: inconsistent acquisition image data size
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/opt/conda/lib/python3.9/site-packages/steinbock/preprocessing/imc.py", line 320, in _try_preprocess_txt_image_from_disk
+    img = f.read_acquisition()
+  File "/opt/conda/lib/python3.9/site-packages/readimc/_txt_file.py", line 124, in read_acquisition
+    raise IOError(
+OSError: TXT file '6547_Immune_ROI_046_46.txt' corrupted: inconsistent acquisition image data size
+Error reading acquisition 61 from file /sctmp/nsteen/tmpyg1r_4h2/6522_Immune/6522_Immune.mcd: MCD file '6522_Immune.mcd' corrupted: inconsistent acquisition image data size
+Recovering from file /home/processing/raw/Immune/6522_Immune.zip/6522_Immune/6522_Immune_ROI_061_61.txt
+Error reading file /sctmp/nsteen/tmpg38g3xbv/6522_Immune/6522_Immune_ROI_061_61.txt: TXT file '6522_Immune_ROI_061_61.txt' corrupted: inconsistent acquisition image data size
+Traceback (most recent call last):
+  File "/opt/conda/lib/python3.9/site-packages/steinbock/preprocessing/imc.py", line 357, in _try_preprocess_mcd_images_from_disk
+    img = f_mcd.read_acquisition(acquisition)
+  File "/opt/conda/lib/python3.9/site-packages/readimc/_mcd_file.py", line 129, in read_acquisition
+    raise IOError(
+OSError: MCD file '6522_Immune.mcd' corrupted: inconsistent acquisition image data size
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/opt/conda/lib/python3.9/site-packages/steinbock/preprocessing/imc.py", line 320, in _try_preprocess_txt_image_from_disk
+    img = f.read_acquisition()
+  File "/opt/conda/lib/python3.9/site-packages/readimc/_txt_file.py", line 124, in read_acquisition
+    raise IOError(
+OSError: TXT file '6522_Immune_ROI_061_61.txt' corrupted: inconsistent acquisition image data size
+Error reading acquisition 32 from file /sctmp/nsteen/tmp6k4r8m21/6520_Immune/6520_Immune.mcd: MCD file '6520_Immune.mcd' corrupted: inconsistent acquisition image data size
+Recovering from file /home/processing/raw/Immune/6520_Immune.zip/6520_Immune/6520_Immune_ROI_032_32.txt
+Error reading file /sctmp/nsteen/tmp413czc2i/6520_Immune/6520_Immune_ROI_032_32.txt: TXT file '6520_Immune_ROI_032_32.txt' corrupted: inconsistent acquisition image data size
+Traceback (most recent call last):
+  File "/opt/conda/lib/python3.9/site-packages/steinbock/preprocessing/imc.py", line 357, in _try_preprocess_mcd_images_from_disk
+    img = f_mcd.read_acquisition(acquisition)
+  File "/opt/conda/lib/python3.9/site-packages/readimc/_mcd_file.py", line 129, in read_acquisition
+    raise IOError(
+OSError: MCD file '6520_Immune.mcd' corrupted: inconsistent acquisition image data size
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/opt/conda/lib/python3.9/site-packages/steinbock/preprocessing/imc.py", line 320, in _try_preprocess_txt_image_from_disk
+    img = f.read_acquisition()
+  File "/opt/conda/lib/python3.9/site-packages/readimc/_txt_file.py", line 124, in read_acquisition
+    raise IOError(
+OSError: TXT file '6520_Immune_ROI_032_32.txt' corrupted: inconsistent acquisition image data size
+Error reading acquisition 72 from file /sctmp/nsteen/tmp5_4t3g21/6483_Immune/6483_Immune.mcd: MCD file '6483_Immune.mcd' corrupted: invalid acquisition image data offsets
+Error reading acquisition 59 from file /sctmp/nsteen/tmpi9ogqs0h/6437_Immune/6437_Immune.mcd: MCD file '6437_Immune.mcd' corrupted: inconsistent acquisition image data size
+Recovering from file /home/processing/raw/Immune/6437_Immune.zip/6437_Immune/6437_Immune_ROI_059_59.txt
+Error reading file /sctmp/nsteen/tmpslsaknk7/6437_Immune/6437_Immune_ROI_059_59.txt: TXT file '6437_Immune_ROI_059_59.txt' corrupted: inconsistent acquisition image data size
+Traceback (most recent call last):
+  File "/opt/conda/lib/python3.9/site-packages/steinbock/preprocessing/imc.py", line 357, in _try_preprocess_mcd_images_from_disk
+    img = f_mcd.read_acquisition(acquisition)
+  File "/opt/conda/lib/python3.9/site-packages/readimc/_mcd_file.py", line 129, in read_acquisition
+    raise IOError(
+OSError: MCD file '6437_Immune.mcd' corrupted: inconsistent acquisition image data size
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/opt/conda/lib/python3.9/site-packages/steinbock/preprocessing/imc.py", line 320, in _try_preprocess_txt_image_from_disk
+    img = f.read_acquisition()
+  File "/opt/conda/lib/python3.9/site-packages/readimc/_txt_file.py", line 124, in read_acquisition
+    raise IOError(
+OSError: TXT file '6437_Immune_ROI_059_59.txt' corrupted: inconsistent acquisition image data size
+Error reading acquisition 27 from file /sctmp/nsteen/tmpe25yw45i/6422_Immune/6422_Immune.mcd: MCD file '6422_Immune.mcd' corrupted: invalid acquisition image data offsets
+Error reading acquisition 73 from file /sctmp/nsteen/tmpd2b6v9wa/6301_Immune/6301_Immune.mcd: MCD file '6301_Immune.mcd' corrupted: inconsistent acquisition image data size
+Recovering from file /home/processing/raw/Immune/6301_Immune.zip/6301_Immune/6301_Immune_ROI_073_73.txt
+Error reading acquisition 34 from file /sctmp/nsteen/tmpex2bw_ub/6289_Immune/6289_Immune.mcd: MCD file '6289_Immune.mcd' corrupted: inconsistent acquisition image data size
+Recovering from file /home/processing/raw/Immune/6289_Immune.zip/6289_Immune/6289_Immune_ROI_034_34.txt
+Error reading file /sctmp/nsteen/tmpe6j_43g8/6289_Immune/6289_Immune_ROI_034_34.txt: TXT file '6289_Immune_ROI_034_34.txt' corrupted: inconsistent acquisition image data size
+Traceback (most recent call last):
+  File "/opt/conda/lib/python3.9/site-packages/steinbock/preprocessing/imc.py", line 357, in _try_preprocess_mcd_images_from_disk
+    img = f_mcd.read_acquisition(acquisition)
+  File "/opt/conda/lib/python3.9/site-packages/readimc/_mcd_file.py", line 129, in read_acquisition
+    raise IOError(
+OSError: MCD file '6289_Immune.mcd' corrupted: inconsistent acquisition image data size
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/opt/conda/lib/python3.9/site-packages/steinbock/preprocessing/imc.py", line 320, in _try_preprocess_txt_image_from_disk
+    img = f.read_acquisition()
+  File "/opt/conda/lib/python3.9/site-packages/readimc/_txt_file.py", line 124, in read_acquisition
+    raise IOError(
+OSError: TXT file '6289_Immune_ROI_034_34.txt' corrupted: inconsistent acquisition image data size
+Error reading acquisition 46 from file /sctmp/nsteen/tmpu49k4mts/6285_Immune/6285_Immune.mcd: MCD file '6285_Immune.mcd' corrupted: inconsistent acquisition image data size
+Recovering from file /home/processing/raw/Immune/6285_Immune.zip/6285_Immune/6285_Immune_ROI_046_46.txt
+Error reading acquisition 76 from file /sctmp/nsteen/tmpnfv7uawr/6234_Immune/6234_Immune.mcd: MCD file '6234_Immune.mcd' corrupted: inconsistent acquisition image data size
+Recovering from file /home/processing/raw/Immune/6234_Immune.zip/6234_Immune/6234_Immune_ROI_076_76.txt
+Error reading acquisition 14 from file /sctmp/nsteen/tmp_z56rb9p/6228_Immune/6228_Immune.mcd: MCD file '6228_Immune.mcd' corrupted: inconsistent acquisition image data size
+Recovering from file /home/processing/raw/Immune/6228_Immune.zip/6228_Immune/6228_Immune_ROI_014_14.txt
+Error reading file /sctmp/nsteen/tmpp5yslk_i/6228_Immune/6228_Immune_ROI_014_14.txt: TXT file '6228_Immune_ROI_014_14.txt' corrupted: inconsistent acquisition image data size
+Traceback (most recent call last):
+  File "/opt/conda/lib/python3.9/site-packages/steinbock/preprocessing/imc.py", line 357, in _try_preprocess_mcd_images_from_disk
+    img = f_mcd.read_acquisition(acquisition)
+  File "/opt/conda/lib/python3.9/site-packages/readimc/_mcd_file.py", line 129, in read_acquisition
+    raise IOError(
+OSError: MCD file '6228_Immune.mcd' corrupted: inconsistent acquisition image data size
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/opt/conda/lib/python3.9/site-packages/steinbock/preprocessing/imc.py", line 320, in _try_preprocess_txt_image_from_disk
+    img = f.read_acquisition()
+  File "/opt/conda/lib/python3.9/site-packages/readimc/_txt_file.py", line 124, in read_acquisition
+    raise IOError(
+OSError: TXT file '6228_Immune_ROI_014_14.txt' corrupted: inconsistent acquisition image data size
+Error reading acquisition 36 from file /sctmp/nsteen/tmph_t4pd6m/6224_Immune/6224_Immune.mcd: MCD file '6224_Immune.mcd' corrupted: inconsistent acquisition image data size
+Recovering from file /home/processing/raw/Immune/6224_Immune.zip/6224_Immune/6224_Immune_ROI_036_36.txt
+Error reading acquisition 40 from file /sctmp/nsteen/tmppfdgqdzg/6208_Immune/6208_Immune.mcd: MCD file '6208_Immune.mcd' corrupted: invalid acquisition image data offsets
+Error reading acquisition 1 from file /sctmp/nsteen/tmpl783gb2y/6150_Immune/6150_Immune.mcd: MCD file '6150_Immune.mcd' corrupted: invalid acquisition image data offsets
+Error reading acquisition 58 from file /sctmp/nsteen/tmpl783gb2y/6150_Immune/6150_Immune.mcd: MCD file '6150_Immune.mcd' corrupted: invalid acquisition image data offsets
+Error reading acquisition 11 from file /sctmp/nsteen/tmp8u8iwlej/6147_Immune/6147_Immune.mcd: MCD file '6147_Immune.mcd' corrupted: inconsistent acquisition image data size
+Recovering from file /home/processing/raw/Immune/6147_Immune.zip/6147_Immune/6147_Immune_ROI_011_11.txt
+Error reading file /sctmp/nsteen/tmp6bvsbg1z/6147_Immune/6147_Immune_ROI_011_11.txt: TXT file '6147_Immune_ROI_011_11.txt' corrupted: inconsistent acquisition image data size
+Traceback (most recent call last):
+  File "/opt/conda/lib/python3.9/site-packages/steinbock/preprocessing/imc.py", line 357, in _try_preprocess_mcd_images_from_disk
+    img = f_mcd.read_acquisition(acquisition)
+  File "/opt/conda/lib/python3.9/site-packages/readimc/_mcd_file.py", line 129, in read_acquisition
+    raise IOError(
+OSError: MCD file '6147_Immune.mcd' corrupted: inconsistent acquisition image data size
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/opt/conda/lib/python3.9/site-packages/steinbock/preprocessing/imc.py", line 320, in _try_preprocess_txt_image_from_disk
+    img = f.read_acquisition()
+  File "/opt/conda/lib/python3.9/site-packages/readimc/_txt_file.py", line 124, in read_acquisition
+    raise IOError(
+OSError: TXT file '6147_Immune_ROI_011_11.txt' corrupted: inconsistent acquisition image data size
+Error reading acquisition 1 from file /sctmp/nsteen/tmppwvsn2sh/6063_Immune/6063_Immune.mcd: MCD file '6063_Immune.mcd' corrupted: invalid acquisition image data size
+Recovering from file /home/processing/raw/Immune/6063_Immune.zip/6063_Immune/6063_Immune_ROI_001_1.txt
+Not cleaning up /home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmp_b2n_wzt.01_Preprocessing.py
+Waiting at most 5 seconds for missing files.
+MissingOutputException in line 259 of /home/nsteen/scripts/T1D_analysis/workflow/Snakefile:
+Job Missing files after 5 seconds. This might be due to filesystem latency. If that is the case, consider to increase the wait time with --latency-wait:
+/scratch/nsteen/processing/txt_output/01_Preprocessing.out completed successfully, but some output files are missing. 0
+Shutting down, this might take some time.
+Exiting because a job execution failed. Look above for error message

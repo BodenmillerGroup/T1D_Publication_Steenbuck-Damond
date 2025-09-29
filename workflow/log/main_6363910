@@ -1,0 +1,39 @@
+Building DAG of jobs...
+Using shell: /usr/bin/bash
+Provided cluster nodes: 100
+Job stats:
+job                          count    min threads    max threads
+-------------------------  -------  -------------  -------------
+CellCategories_cells_05_r        1             48             48
+QualityControl_cells_04_r        2              8              8
+targets                          1              1              1
+total                            4              1             48
+
+Select jobs to execute...
+
+[Sun Nov  5 19:21:28 2023]
+rule QualityControl_cells_04_r:
+    input: /home/nsteen/scripts/T1D_analysis/analysis/04_QualityControl_cells_Immune.Rmd, /home/nsteen/scripts/T1D_analysis/docs/03_TransformCorrect_cells_Immune.html
+    output: /home/nsteen/scripts/T1D_analysis/docs/04_QualityControl_cells_Immune.html
+    jobid: 2
+    benchmark: benchmark/04_QualityControl_cells_Immune.txt
+    reason: Missing output files: /home/nsteen/scripts/T1D_analysis/docs/04_QualityControl_cells_Immune.html
+    wildcards: panel=Immune
+    threads: 8
+    resources: mem_mb=247000, disk_mb=1000, tmpdir=/sctmp/nsteen, time=5:00:00
+
+Submitted job 2 with external jobid 'Submitted batch job 6363914'.
+
+[Sun Nov  5 19:21:28 2023]
+rule QualityControl_cells_04_r:
+    input: /home/nsteen/scripts/T1D_analysis/analysis/04_QualityControl_cells_Islet.Rmd, /home/nsteen/scripts/T1D_analysis/docs/03_TransformCorrect_cells_Islet.html
+    output: /home/nsteen/scripts/T1D_analysis/docs/04_QualityControl_cells_Islet.html
+    jobid: 7
+    benchmark: benchmark/04_QualityControl_cells_Islet.txt
+    reason: Missing output files: /home/nsteen/scripts/T1D_analysis/docs/04_QualityControl_cells_Islet.html
+    wildcards: panel=Islet
+    threads: 8
+    resources: mem_mb=247000, disk_mb=1000, tmpdir=/sctmp/nsteen, time=5:00:00
+
+Submitted job 7 with external jobid 'Submitted batch job 6363915'.
+slurmstepd: error: *** JOB 6363910 ON u20-compute-m9 CANCELLED AT 2023-11-06T08:04:05 ***

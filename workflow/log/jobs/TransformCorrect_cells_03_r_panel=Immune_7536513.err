@@ -1,0 +1,29 @@
+Building DAG of jobs...
+Using shell: /usr/bin/bash
+Provided cores: 48
+Rules claiming more threads will be scaled down.
+Select jobs to execute...
+
+[Mon Dec 18 12:37:56 2023]
+rule TransformCorrect_cells_03_r:
+    input: /home/nsteen/scripts/T1D_analysis/analysis/03_TransformCorrect_cells_Immune.Rmd, /home/nsteen/scripts/T1D_analysis/docs/02_SpilloverCompensation_cells_Immune.html
+    output: /home/nsteen/scripts/T1D_analysis/docs/03_TransformCorrect_cells_Immune.html
+    jobid: 0
+    benchmark: benchmark/03_TransformCorrect_cells_Immune.txt
+    reason: Forced execution
+    wildcards: panel=Immune
+    threads: 48
+    resources: mem_mb=376000, disk_mb=1000, tmpdir=/sctmp/nsteen, time=36:00:00
+
+Rscript --vanilla -e 'rmarkdown::render("/home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmpom37t82o.03_TransformCorrect_cells_Immune.Rmd", output_file="/home/nsteen/scripts/T1D_analysis/docs/03_TransformCorrect_cells_Immune.html", quiet=TRUE, knit_root_dir = "/home/nsteen/scripts/T1D_analysis", params = list(rmd="/home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmpom37t82o.03_TransformCorrect_cells_Immune.Rmd"))'
+Activating singularity image /data/nsteen/singularity/sandbox
+Hard k-means centroids initialization
+0%   10   20   30   40   50   60   70   80   90   100%
+[----|----|----|----|----|----|----|----|----|----|
+**************************************************|
+0%   10   20   30   40   50   60   70   80   90   100%
+[----|----|----|----|----|----|----|----|----|----|
+**************************************************|
+0%   10   20   30   40   50   60   70   80   90   100%
+[----|----|----|----|----|----|----|----|----|----|
+**************************************************|

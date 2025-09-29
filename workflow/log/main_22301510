@@ -1,0 +1,57 @@
+Building DAG of jobs...
+Using shell: /usr/bin/bash
+Provided cluster nodes: 100
+Job stats:
+job                                 count    min threads    max threads
+--------------------------------  -------  -------------  -------------
+CellCategories_cells_05_r               1              8              8
+CellCategories_cells_06_r               1              8              8
+CellCategories_cells_08_Islet_r         1             48             48
+ImportData_cells_01_r                   1              8              8
+QualityControl_cells_04_r               1              8              8
+SpilloverCompensation_cells_02_r        1              8              8
+TransformCorrect_cells_03_r             1              8              8
+targets                                 1              1              1
+total                                   8              1             48
+
+Select jobs to execute...
+
+[Mon Jul 14 08:27:31 2025]
+rule ImportData_cells_01_r:
+    input: /home/nsteen/scripts/T1D_analysis/analysis/01_ImportData_cells_Islet.Rmd, /scratch/nsteen/processing/txt_output/05_ImageRegistration.out
+    output: /home/nsteen/scripts/T1D_analysis/docs/01_ImportData_cells_Islet.html
+    jobid: 7
+    benchmark: /home/nsteen/scripts/T1D_analysis/benchmark/01_ImportData_cells_Islet.txt
+    reason: Missing output files: /home/nsteen/scripts/T1D_analysis/docs/01_ImportData_cells_Islet.html; Updated input files: /home/nsteen/scripts/T1D_analysis/analysis/01_ImportData_cells_Islet.Rmd, /scratch/nsteen/processing/txt_output/05_ImageRegistration.out
+    wildcards: panel=Islet
+    threads: 8
+    resources: mem_mb=170000, disk_mb=1000, tmpdir=/sctmp/nsteen, time=5:00:00
+
+Submitted job 7 with external jobid 'Submitted batch job 22301511'.
+[Mon Jul 14 09:21:55 2025]
+Finished job 7.
+1 of 8 steps (12%) done
+Select jobs to execute...
+
+[Mon Jul 14 09:21:55 2025]
+rule SpilloverCompensation_cells_02_r:
+    input: /home/nsteen/scripts/T1D_analysis/analysis/02_SpilloverCompensation_cells_Islet.Rmd, /home/nsteen/scripts/T1D_analysis/docs/01_ImportData_cells_Islet.html
+    output: /home/nsteen/scripts/T1D_analysis/docs/02_SpilloverCompensation_cells_Islet.html
+    jobid: 6
+    benchmark: /home/nsteen/scripts/T1D_analysis/benchmark/02_SpilloverCompensation_cells_Islet.txt
+    reason: Input files updated by another job: /home/nsteen/scripts/T1D_analysis/docs/01_ImportData_cells_Islet.html
+    wildcards: panel=Islet
+    threads: 8
+    resources: mem_mb=80000, disk_mb=1000, tmpdir=/sctmp/nsteen, time=5:00:00
+
+Submitted job 6 with external jobid 'Submitted batch job 22301525'.
+[Mon Jul 14 09:24:04 2025]
+Error in rule SpilloverCompensation_cells_02_r:
+    jobid: 6
+    output: /home/nsteen/scripts/T1D_analysis/docs/02_SpilloverCompensation_cells_Islet.html
+    cluster_jobid: Submitted batch job 22301525
+
+Error executing rule SpilloverCompensation_cells_02_r on cluster (jobid: 6, external: Submitted batch job 22301525, jobscript: /home/nsteen/scripts/T1D_analysis/.snakemake/tmp.2pvzfssj/SpilloverCompensation_cells_02_r.6). For error details see the cluster log and the log files of the involved rule(s).
+Shutting down, this might take some time.
+Exiting because a job execution failed. Look above for error message
+Complete log: .snakemake/log/2025-07-14T082730.392984.snakemake.log

@@ -1,0 +1,134 @@
+Building DAG of jobs...
+Using shell: /usr/bin/bash
+Provided cluster nodes: 100
+Job stats:
+job                                 count    min threads    max threads
+--------------------------------  -------  -------------  -------------
+CellCategories_cells_05_r               1             48             48
+ImportData_cells_01_r                   2              8              8
+QualityControl_cells_04_r               2              8              8
+SpilloverCompensation_cells_02_r        2              8              8
+TransformCorrect_cells_03_r             2             48             48
+targets                                 1              1              1
+total                                  10              1             48
+
+Select jobs to execute...
+
+[Fri Nov  3 12:19:46 2023]
+rule ImportData_cells_01_r:
+    input: /home/nsteen/scripts/T1D_analysis/analysis/01_ImportData_cells_Islet.Rmd, /home/nsteen/scripts/T1D_analysis/analysis/helpers.R, /scratch/nsteen/processing/txt_output/04_Measurements.out
+    output: /home/nsteen/scripts/T1D_analysis/docs/01_ImportData_cells_Islet.html
+    jobid: 10
+    benchmark: benchmark/01_import_Islet.txt
+    reason: Missing output files: /home/nsteen/scripts/T1D_analysis/docs/01_ImportData_cells_Islet.html; Updated input files: /home/nsteen/scripts/T1D_analysis/analysis/helpers.R
+    wildcards: panel=Islet
+    threads: 8
+    resources: mem_mb=120000, disk_mb=1000, tmpdir=/sctmp/nsteen, time=5:00:00
+
+Submitted job 10 with external jobid 'Submitted batch job 6314212'.
+
+[Fri Nov  3 12:19:46 2023]
+rule ImportData_cells_01_r:
+    input: /home/nsteen/scripts/T1D_analysis/analysis/01_ImportData_cells_Immune.Rmd, /home/nsteen/scripts/T1D_analysis/analysis/helpers.R, /scratch/nsteen/processing/txt_output/04_Measurements.out
+    output: /home/nsteen/scripts/T1D_analysis/docs/01_ImportData_cells_Immune.html
+    jobid: 5
+    benchmark: benchmark/01_import_Immune.txt
+    reason: Missing output files: /home/nsteen/scripts/T1D_analysis/docs/01_ImportData_cells_Immune.html; Updated input files: /home/nsteen/scripts/T1D_analysis/analysis/helpers.R
+    wildcards: panel=Immune
+    threads: 8
+    resources: mem_mb=120000, disk_mb=1000, tmpdir=/sctmp/nsteen, time=5:00:00
+
+Submitted job 5 with external jobid 'Submitted batch job 6314213'.
+[Fri Nov  3 17:14:20 2023]
+Finished job 10.
+1 of 10 steps (10%) done
+Select jobs to execute...
+
+[Fri Nov  3 17:14:20 2023]
+rule SpilloverCompensation_cells_02_r:
+    input: /home/nsteen/scripts/T1D_analysis/analysis/02_SpilloverCompensation_cells_Islet.Rmd, /home/nsteen/scripts/T1D_analysis/docs/01_ImportData_cells_Islet.html
+    output: /home/nsteen/scripts/T1D_analysis/docs/02_SpilloverCompensation_cells_Islet.html
+    jobid: 9
+    benchmark: benchmark/02_SpilloverCompensation_cells_Islet.txt
+    reason: Input files updated by another job: /home/nsteen/scripts/T1D_analysis/docs/01_ImportData_cells_Islet.html
+    wildcards: panel=Islet
+    threads: 8
+    resources: mem_mb=80000, disk_mb=1000, tmpdir=/sctmp/nsteen, time=5:00:00
+
+Submitted job 9 with external jobid 'Submitted batch job 6318414'.
+[Fri Nov  3 17:25:50 2023]
+Finished job 5.
+2 of 10 steps (20%) done
+Select jobs to execute...
+
+[Fri Nov  3 17:25:50 2023]
+rule SpilloverCompensation_cells_02_r:
+    input: /home/nsteen/scripts/T1D_analysis/analysis/02_SpilloverCompensation_cells_Immune.Rmd, /home/nsteen/scripts/T1D_analysis/docs/01_ImportData_cells_Immune.html
+    output: /home/nsteen/scripts/T1D_analysis/docs/02_SpilloverCompensation_cells_Immune.html
+    jobid: 4
+    benchmark: benchmark/02_SpilloverCompensation_cells_Immune.txt
+    reason: Input files updated by another job: /home/nsteen/scripts/T1D_analysis/docs/01_ImportData_cells_Immune.html
+    wildcards: panel=Immune
+    threads: 8
+    resources: mem_mb=80000, disk_mb=1000, tmpdir=/sctmp/nsteen, time=5:00:00
+
+Submitted job 4 with external jobid 'Submitted batch job 6318676'.
+[Fri Nov  3 17:53:32 2023]
+Finished job 9.
+3 of 10 steps (30%) done
+Select jobs to execute...
+
+[Fri Nov  3 17:53:32 2023]
+rule TransformCorrect_cells_03_r:
+    input: /home/nsteen/scripts/T1D_analysis/analysis/03_TransformCorrect_cells_Islet.Rmd, /home/nsteen/scripts/T1D_analysis/docs/02_SpilloverCompensation_cells_Islet.html
+    output: /home/nsteen/scripts/T1D_analysis/docs/03_TransformCorrect_cells_Islet.html
+    jobid: 8
+    benchmark: benchmark/03_TransformCorrect_cells_Islet.txt
+    reason: Missing output files: /home/nsteen/scripts/T1D_analysis/docs/03_TransformCorrect_cells_Islet.html; Input files updated by another job: /home/nsteen/scripts/T1D_analysis/docs/02_SpilloverCompensation_cells_Islet.html
+    wildcards: panel=Islet
+    threads: 48
+    resources: mem_mb=376000, disk_mb=1000, tmpdir=/sctmp/nsteen, time=36:00:00
+
+Submitted job 8 with external jobid 'Submitted batch job 6319058'.
+[Fri Nov  3 18:31:34 2023]
+Finished job 4.
+4 of 10 steps (40%) done
+Select jobs to execute...
+
+[Fri Nov  3 18:31:34 2023]
+rule TransformCorrect_cells_03_r:
+    input: /home/nsteen/scripts/T1D_analysis/analysis/03_TransformCorrect_cells_Immune.Rmd, /home/nsteen/scripts/T1D_analysis/docs/02_SpilloverCompensation_cells_Immune.html
+    output: /home/nsteen/scripts/T1D_analysis/docs/03_TransformCorrect_cells_Immune.html
+    jobid: 3
+    benchmark: benchmark/03_TransformCorrect_cells_Immune.txt
+    reason: Missing output files: /home/nsteen/scripts/T1D_analysis/docs/03_TransformCorrect_cells_Immune.html; Input files updated by another job: /home/nsteen/scripts/T1D_analysis/docs/02_SpilloverCompensation_cells_Immune.html
+    wildcards: panel=Immune
+    threads: 48
+    resources: mem_mb=376000, disk_mb=1000, tmpdir=/sctmp/nsteen, time=36:00:00
+
+Submitted job 3 with external jobid 'Submitted batch job 6319560'.
+[Sat Nov  4 05:36:39 2023]
+Finished job 8.
+5 of 10 steps (50%) done
+Select jobs to execute...
+
+[Sat Nov  4 05:36:39 2023]
+rule QualityControl_cells_04_r:
+    input: /home/nsteen/scripts/T1D_analysis/analysis/04_QualityControl_cells_Islet.Rmd, /home/nsteen/scripts/T1D_analysis/docs/03_TransformCorrect_cells_Islet.html
+    output: /home/nsteen/scripts/T1D_analysis/docs/04_QualityControl_cells_Islet.html
+    jobid: 7
+    benchmark: benchmark/04_QualityControl_cells_Islet.txt
+    reason: Missing output files: /home/nsteen/scripts/T1D_analysis/docs/04_QualityControl_cells_Islet.html; Input files updated by another job: /home/nsteen/scripts/T1D_analysis/docs/03_TransformCorrect_cells_Islet.html
+    wildcards: panel=Islet
+    threads: 8
+    resources: mem_mb=247000, disk_mb=1000, tmpdir=/sctmp/nsteen, time=5:00:00
+
+Submitted job 7 with external jobid 'Submitted batch job 6326804'.
+[Sat Nov  4 05:45:00 2023]
+Error in rule QualityControl_cells_04_r:
+    jobid: 7
+    output: /home/nsteen/scripts/T1D_analysis/docs/04_QualityControl_cells_Islet.html
+    cluster_jobid: Submitted batch job 6326804
+
+Error executing rule QualityControl_cells_04_r on cluster (jobid: 7, external: Submitted batch job 6326804, jobscript: /home/nsteen/scripts/T1D_analysis/.snakemake/tmp.7cgky2g8/QualityControl_cells_04_r.7). For error details see the cluster log and the log files of the involved rule(s).
+slurmstepd: error: *** JOB 6314210 ON u20-computeibmgpu-vesta20 CANCELLED AT 2023-11-04T12:19:46 DUE TO TIME LIMIT ***

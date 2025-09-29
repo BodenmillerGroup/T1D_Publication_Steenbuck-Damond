@@ -1,0 +1,47 @@
+Building DAG of jobs...
+Using shell: /usr/bin/bash
+Provided cores: 8
+Rules claiming more threads will be scaled down.
+Select jobs to execute...
+
+[Fri Dec 15 16:31:36 2023]
+rule ImportData_cells_01_r:
+    input: /home/nsteen/scripts/T1D_analysis/analysis/01_ImportData_cells_Immune.Rmd, /home/nsteen/scripts/T1D_analysis/analysis/helpers.R, /scratch/nsteen/processing/txt_output/05_ImageRegistration.out
+    output: /home/nsteen/scripts/T1D_analysis/docs/01_ImportData_cells_Immune.html
+    jobid: 0
+    benchmark: benchmark/01_import_Immune.txt
+    reason: Forced execution
+    wildcards: panel=Immune
+    threads: 8
+    resources: mem_mb=120000, disk_mb=1000, tmpdir=/sctmp/nsteen, time=5:00:00
+
+Rscript --vanilla -e 'rmarkdown::render("/home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmpq8kxwez7.01_ImportData_cells_Immune.Rmd", output_file="/home/nsteen/scripts/T1D_analysis/docs/01_ImportData_cells_Immune.html", quiet=TRUE, knit_root_dir = "/home/nsteen/scripts/T1D_analysis", params = list(rmd="/home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmpq8kxwez7.01_ImportData_cells_Immune.Rmd"))'
+Activating singularity image /data/nsteen/singularity/sandbox
+
+Quitting from lines 446-469 [read-data] (/sctmp/nsteen/Rtmpv7ecxl/tmpq8kxwez7.01_ImportData_cells_Immune.Rmd)
+Error in `reducer$value.cache[[as.character(idx)]] <- values`:
+! wrong args for environment subassignment
+Backtrace:
+  1. imcRtools::read_steinbock(...)
+  2. imcRtools:::.steinbock_read_regionprops(...)
+  4. BiocParallel::bplapply(...)
+  5. BiocParallel:::.bpinit(...)
+  7. BiocParallel:::bploop.lapply(...)
+  8. BiocParallel:::.bploop_impl(...)
+  9. BiocParallel:::.collect_result(manager, reducer, progress, BPPARAM)
+ 11. BiocParallel:::.reducer_add(reducer, njob, value)
+Execution halted
+Not cleaning up /home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmpq8kxwez7.01_ImportData_cells_Immune.Rmd
+[Fri Dec 15 20:02:06 2023]
+Error in rule ImportData_cells_01_r:
+    jobid: 0
+    output: /home/nsteen/scripts/T1D_analysis/docs/01_ImportData_cells_Immune.html
+
+RuleException:
+CalledProcessError in line 40 of /home/nsteen/scripts/T1D_analysis/workflow/Snakefile:
+Command ' singularity  exec --home /home/nsteen/scripts/T1D_analysis --bind /scratch/nsteen/processing:/home/processing,/scratch/nsteen/T1D_preprocessing:/scratch/nsteen/T1D_preprocessing,/data/nsteen:/data/nsteen /data/nsteen/singularity/sandbox bash -c 'set -euo pipefail;  Rscript --vanilla -e '\''rmarkdown::render("/home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmpq8kxwez7.01_ImportData_cells_Immune.Rmd", output_file="/home/nsteen/scripts/T1D_analysis/docs/01_ImportData_cells_Immune.html", quiet=TRUE, knit_root_dir = "/home/nsteen/scripts/T1D_analysis", params = list(rmd="/home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmpq8kxwez7.01_ImportData_cells_Immune.Rmd"))'\'''' returned non-zero exit status 1.
+  File "/home/nsteen/scripts/T1D_analysis/workflow/Snakefile", line 40, in __rule_ImportData_cells_01_r
+  File "/home/nsteen/data/conda/envs/snakemake_cluster/lib/python3.10/concurrent/futures/thread.py", line 58, in run
+Shutting down, this might take some time.
+Exiting because a job execution failed. Look above for error message
+slurmstepd: error: Detected 22 oom-kill event(s) in StepId=7496852.batch. Some of your processes may have been killed by the cgroup out-of-memory handler.

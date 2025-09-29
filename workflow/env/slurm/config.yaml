@@ -1,0 +1,24 @@
+# Cluster submission
+jobname: "{rule}.{jobid}"
+jobs: 100
+cluster: >-
+    sbatch
+    --ntasks 1
+    --cpus-per-task {threads}
+    --mem {resources.mem_mb}
+    --time {resources.time}
+    -o /home/nsteen/scripts/T1D_analysis/workflow/log/jobs/{rule}_{wildcards}_%j.out
+    -e /home/nsteen/scripts/T1D_analysis/workflow/log/jobs/{rule}_{wildcards}_%j.err
+# Define default resources
+default-resources:
+    - mem_mb=3850
+    - time="1:00:00"
+
+# Others
+reason: True                        # Reason why a rule or job was executed.
+show-failed-logs: True              # This flag specifies that failed log files should be displayed.
+printshellcmds: True                #This flag will print shell commands for each rule when they are executed.
+
+# Singularity
+use-singularity: True
+singularity-args: "--bind /home/nsteen/scripts/T1D_analysis:/home/nsteen/scripts/T1D_analysis,/scratch/nsteen/processing:/home/processing,/scratch/nsteen/T1D_preprocessing:/scratch/nsteen/T1D_preprocessing,/data/nsteen:/data/nsteen"

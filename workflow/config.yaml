@@ -1,0 +1,4 @@
+# Paths
+data_dir: "/scratch/nsteen/"                            # Data directory (Images, Masks, SCEs)
+home_dir: "/home/nsteen/scripts/T1D_analysis/"          # Path of home directory (Scripts & Docs)
+container_dir: "/home/nsteen/data/singularity/sandbox/" # Path of Singularity Sandbox

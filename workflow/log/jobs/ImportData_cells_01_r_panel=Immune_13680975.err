@@ -1,0 +1,20 @@
+Building DAG of jobs...
+Using shell: /usr/bin/bash
+Provided cores: 8
+Rules claiming more threads will be scaled down.
+Select jobs to execute...
+
+[Wed Mar 20 12:48:32 2024]
+rule ImportData_cells_01_r:
+    input: /home/nsteen/scripts/T1D_analysis/analysis/01_ImportData_cells_Immune.Rmd, /home/nsteen/scripts/T1D_analysis/analysis/helpers.R, /scratch/nsteen/processing/txt_output/05_ImageRegistration.out
+    output: /home/nsteen/scripts/T1D_analysis/docs/01_ImportData_cells_Immune.html
+    jobid: 0
+    benchmark: /home/nsteen/scripts/T1D_analysis/benchmark/01_ImportData_cells_Immune.txt
+    reason: Forced execution
+    wildcards: panel=Immune
+    threads: 8
+    resources: mem_mb=170000, disk_mb=1000, tmpdir=/sctmp/nsteen, time=5:00:00
+
+Rscript --vanilla -e 'rmarkdown::render("/home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmphs6kdkej.01_ImportData_cells_Immune.Rmd", output_file="/home/nsteen/scripts/T1D_analysis/docs/01_ImportData_cells_Immune.html", quiet=TRUE, knit_root_dir = "/home/nsteen/scripts/T1D_analysis", params = list(rmd="/home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmphs6kdkej.01_ImportData_cells_Immune.Rmd"))'
+Activating singularity image /home/nsteen/data/singularity/sandbox/
+slurmstepd: error: *** JOB 13680975 ON u20-computeib-hpc11 CANCELLED AT 2024-03-20T12:50:35 ***

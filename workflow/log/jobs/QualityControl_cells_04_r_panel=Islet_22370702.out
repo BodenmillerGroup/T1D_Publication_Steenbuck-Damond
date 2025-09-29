@@ -1,0 +1,90 @@
+1/95                                           
+2/95 [seed-set-by-workflowr]                   
+3/95                                           
+4/95 [setup]                                   
+5/95                                           
+6/95 [packages]                                
+7/95                                           
+8/95 [settings]                                
+9/95                                           
+10/95 [load-data]                               
+11/95                                           
+12/95 [packages2]                               
+13/95                                           
+14/95 [row-order]                               
+15/95                                           
+16/95 [select-assays]                           
+17/95                                           
+18/95 [factor_column]                           
+19/95                                           
+20/95 [subset-spe]                              
+21/95                                           
+22/95 [images-per-condition]                    
+23/95                                           
+24/95 [cells-per-condition]                     
+25/95                                           
+26/95 [cells-per-image]                         
+27/95                                           
+28/95 [density-plots]                           
+29/95                                           
+30/95 [90-percentile]                           
+31/95                                           
+32/95 [heatmap-case-stage]                      
+33/95                                           
+34/95 [calculate-mean-expr]                     
+35/95                                           
+36/95 [dittoheatmap-not-scaled]                 
+37/95                                           
+38/95 [dittoheatmap-centered-scaled]            
+39/95                                           
+40/95 [packages3]                               
+41/95                                           
+42/95 [select-assay2]                           
+43/95                                           
+44/95 [run-UMAP]                                
+45/95                                           
+46/95 [save-spe1]                               
+47/95                                           
+48/95 [plot-dimred]                             
+49/95                                           
+50/95 [plot-dimred-distance]                    
+51/95                                           
+52/95 [plot-dimred-shannon]                     
+53/95                                           
+54/95 [plot-dimred-channels]                    
+55/95                                           
+56/95 [pca-sample]                              
+57/95                                           
+58/95 [calculate-pca-association]               
+59/95                                           
+60/95 [visualize-pca]                           
+61/95                                           
+62/95 [snr]                                     
+63/95                                           
+64/95 [cell-area-plot]                          
+65/95                                           
+66/95 [cell-area-filter]                        
+67/95                                           
+68/95 [packages4]                               
+69/95                                           
+70/95 [image-settings]                          
+71/95                                           
+72/95 [load-images]                             
+73/95                                           
+74/95 [cytomapper-plot-cells]                   
+75/95                                           
+76/95 [cytomapper-plot-counts1]                 
+77/95                                           
+78/95 [cytomapper-plot-counts2]                 
+79/95                                           
+80/95 [cytomapper-plot-pixels]                  
+81/95                                           
+82/95 [save-images]                             
+83/95                                           
+84/95 [load-images-full]                        
+85/95                                           
+86/95 [spillover-matrix]                        
+87/95                                           
+88/95 [spillover-compensation]                  
+89/95                                           
+90/95 [spillover-plot]                          

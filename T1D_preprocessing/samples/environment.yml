@@ -1,0 +1,11 @@
+name: samples_env
+channels:
+ - conda-forge
+ - bioconda
+ - defaults
+dependencies:
+ - r-base=4.2.3
+ - r-data.table=1.14
+ - r-dplyr=1.1
+ - r-pracma
+ - r-ggplot2

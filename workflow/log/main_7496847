@@ -1,0 +1,76 @@
+Building DAG of jobs...
+Using shell: /usr/bin/bash
+Provided cluster nodes: 100
+Job stats:
+job                                 count    min threads    max threads
+--------------------------------  -------  -------------  -------------
+CellCategories_cells_05_r               2             48             48
+CellCategories_cells_06_r               1             48             48
+ImportData_cells_01_r                   1              8              8
+QualityControl_cells_04_r               2              8              8
+SpilloverCompensation_cells_02_r        2              8              8
+TransformCorrect_cells_03_r             2             48             48
+targets                                 1              1              1
+total                                  11              1             48
+
+Select jobs to execute...
+
+[Fri Dec 15 16:31:10 2023]
+rule SpilloverCompensation_cells_02_r:
+    input: /home/nsteen/scripts/T1D_analysis/analysis/02_SpilloverCompensation_cells_Islet.Rmd, /home/nsteen/scripts/T1D_analysis/docs/01_ImportData_cells_Islet.html
+    output: /home/nsteen/scripts/T1D_analysis/docs/02_SpilloverCompensation_cells_Islet.html
+    jobid: 12
+    benchmark: benchmark/02_SpilloverCompensation_cells_Islet.txt
+    reason: Missing output files: /home/nsteen/scripts/T1D_analysis/docs/02_SpilloverCompensation_cells_Islet.html; Updated input files: /home/nsteen/scripts/T1D_analysis/docs/01_ImportData_cells_Islet.html
+    wildcards: panel=Islet
+    threads: 8
+    resources: mem_mb=80000, disk_mb=1000, tmpdir=/sctmp/nsteen, time=5:00:00
+
+Submitted job 12 with external jobid 'Submitted batch job 7496851'.
+
+[Fri Dec 15 16:31:10 2023]
+rule ImportData_cells_01_r:
+    input: /home/nsteen/scripts/T1D_analysis/analysis/01_ImportData_cells_Immune.Rmd, /home/nsteen/scripts/T1D_analysis/analysis/helpers.R, /scratch/nsteen/processing/txt_output/05_ImageRegistration.out
+    output: /home/nsteen/scripts/T1D_analysis/docs/01_ImportData_cells_Immune.html
+    jobid: 5
+    benchmark: benchmark/01_import_Immune.txt
+    reason: Missing output files: /home/nsteen/scripts/T1D_analysis/docs/01_ImportData_cells_Immune.html; Updated input files: /home/nsteen/scripts/T1D_analysis/analysis/helpers.R, /home/nsteen/scripts/T1D_analysis/analysis/01_ImportData_cells_Immune.Rmd, /scratch/nsteen/processing/txt_output/05_ImageRegistration.out
+    wildcards: panel=Immune
+    threads: 8
+    resources: mem_mb=120000, disk_mb=1000, tmpdir=/sctmp/nsteen, time=5:00:00
+
+Submitted job 5 with external jobid 'Submitted batch job 7496852'.
+[Fri Dec 15 17:19:32 2023]
+Finished job 12.
+1 of 11 steps (9%) done
+Select jobs to execute...
+
+[Fri Dec 15 17:19:32 2023]
+rule TransformCorrect_cells_03_r:
+    input: /home/nsteen/scripts/T1D_analysis/analysis/03_TransformCorrect_cells_Islet.Rmd, /home/nsteen/scripts/T1D_analysis/docs/02_SpilloverCompensation_cells_Islet.html
+    output: /home/nsteen/scripts/T1D_analysis/docs/03_TransformCorrect_cells_Islet.html
+    jobid: 11
+    benchmark: benchmark/03_TransformCorrect_cells_Islet.txt
+    reason: Missing output files: /home/nsteen/scripts/T1D_analysis/docs/03_TransformCorrect_cells_Islet.html; Input files updated by another job: /home/nsteen/scripts/T1D_analysis/docs/02_SpilloverCompensation_cells_Islet.html
+    wildcards: panel=Islet
+    threads: 48
+    resources: mem_mb=376000, disk_mb=1000, tmpdir=/sctmp/nsteen, time=36:00:00
+
+Submitted job 11 with external jobid 'Submitted batch job 7498393'.
+[Fri Dec 15 17:19:52 2023]
+Error in rule TransformCorrect_cells_03_r:
+    jobid: 11
+    output: /home/nsteen/scripts/T1D_analysis/docs/03_TransformCorrect_cells_Islet.html
+    cluster_jobid: Submitted batch job 7498393
+
+Error executing rule TransformCorrect_cells_03_r on cluster (jobid: 11, external: Submitted batch job 7498393, jobscript: /home/nsteen/scripts/T1D_analysis/.snakemake/tmp.h4t1v5qd/TransformCorrect_cells_03_r.11). For error details see the cluster log and the log files of the involved rule(s).
+[Fri Dec 15 20:02:12 2023]
+Error in rule ImportData_cells_01_r:
+    jobid: 5
+    output: /home/nsteen/scripts/T1D_analysis/docs/01_ImportData_cells_Immune.html
+    cluster_jobid: Submitted batch job 7496852
+
+Error executing rule ImportData_cells_01_r on cluster (jobid: 5, external: Submitted batch job 7496852, jobscript: /home/nsteen/scripts/T1D_analysis/.snakemake/tmp.h4t1v5qd/ImportData_cells_01_r.5). For error details see the cluster log and the log files of the involved rule(s).
+Shutting down, this might take some time.
+Exiting because a job execution failed. Look above for error message
+Complete log: .snakemake/log/2023-12-15T163108.453681.snakemake.log

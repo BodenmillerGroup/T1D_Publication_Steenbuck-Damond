@@ -1,0 +1,64 @@
+Building DAG of jobs...
+Using shell: /usr/bin/bash
+Provided cluster nodes: 100
+Job stats:
+job                                count    min threads    max threads
+-------------------------------  -------  -------------  -------------
+CellCategories_cells_05_r              1              8              8
+CellCategories_cells_06_r              1              8              8
+CellCategories_cells_08_Islet_r        1             48             48
+QualityControl_cells_04_r              1              8              8
+targets                                1              1              1
+total                                  5              1             48
+
+Select jobs to execute...
+
+[Wed Jul 23 17:11:41 2025]
+rule QualityControl_cells_04_r:
+    input: /home/nsteen/scripts/T1D_analysis/analysis/04_QualityControl_cells_Islet.Rmd, /home/nsteen/scripts/T1D_analysis/docs/03_TransformCorrect_cells_Islet.html
+    output: /home/nsteen/scripts/T1D_analysis/docs/04_QualityControl_cells_Islet.html
+    jobid: 4
+    benchmark: /home/nsteen/scripts/T1D_analysis/benchmark/04_QualityControl_cells_Islet.txt
+    reason: Missing output files: /home/nsteen/scripts/T1D_analysis/docs/04_QualityControl_cells_Islet.html; Updated input files: /home/nsteen/scripts/T1D_analysis/analysis/04_QualityControl_cells_Islet.Rmd, /home/nsteen/scripts/T1D_analysis/docs/03_TransformCorrect_cells_Islet.html
+    wildcards: panel=Islet
+    threads: 8
+    resources: mem_mb=376000, disk_mb=1000, tmpdir=/sctmp/nsteen, time=96:00:00
+
+
+        Rscript --vanilla -e '
+            rmarkdown::render(
+                input = "/home/nsteen/scripts/T1D_analysis/analysis/04_QualityControl_cells_Islet.Rmd",
+                output_file = "/home/nsteen/scripts/T1D_analysis/docs/04_QualityControl_cells_Islet.html",
+                quiet = FALSE,
+                knit_root_dir = "/home/nsteen/scripts/T1D_analysis/analysis",
+                params = list(rmd="/home/nsteen/scripts/T1D_analysis/analysis/04_QualityControl_cells_Islet.Rmd")
+            )'
+        
+Submitted job 4 with external jobid 'Submitted batch job 22541451'.
+[Fri Jul 25 01:45:13 2025]
+Finished job 4.
+1 of 5 steps (20%) done
+Select jobs to execute...
+
+[Fri Jul 25 01:45:13 2025]
+rule CellCategories_cells_05_r:
+    input: /home/nsteen/scripts/T1D_analysis/analysis/05_CellCategories_cells_Islet.Rmd, /home/nsteen/scripts/T1D_analysis/docs/04_QualityControl_cells_Islet.html
+    output: /home/nsteen/scripts/T1D_analysis/docs/05_CellCategories_cells_Islet.html
+    jobid: 3
+    benchmark: /home/nsteen/scripts/T1D_analysis/benchmark/05_CellCategories_cells_Islet.txt
+    reason: Missing output files: /home/nsteen/scripts/T1D_analysis/docs/05_CellCategories_cells_Islet.html; Input files updated by another job: /home/nsteen/scripts/T1D_analysis/docs/04_QualityControl_cells_Islet.html
+    wildcards: panel=Islet
+    threads: 8
+    resources: mem_mb=350000, disk_mb=1000, tmpdir=/sctmp/nsteen, time=24:00:00
+
+Submitted job 3 with external jobid 'Submitted batch job 22582091'.
+[Fri Jul 25 01:48:03 2025]
+Error in rule CellCategories_cells_05_r:
+    jobid: 3
+    output: /home/nsteen/scripts/T1D_analysis/docs/05_CellCategories_cells_Islet.html
+    cluster_jobid: Submitted batch job 22582091
+
+Error executing rule CellCategories_cells_05_r on cluster (jobid: 3, external: Submitted batch job 22582091, jobscript: /home/nsteen/scripts/T1D_analysis/.snakemake/tmp.04wr8l5x/CellCategories_cells_05_r.3). For error details see the cluster log and the log files of the involved rule(s).
+Shutting down, this might take some time.
+Exiting because a job execution failed. Look above for error message
+Complete log: .snakemake/log/2025-07-23T171139.384072.snakemake.log

@@ -1,0 +1,58 @@
+Building DAG of jobs...
+Using shell: /usr/bin/bash
+Provided cluster nodes: 100
+Job stats:
+job                                 count    min threads    max threads
+--------------------------------  -------  -------------  -------------
+CellCategories_cells_05_r               1              8              8
+CellCategories_cells_06_r               1              8              8
+CellCategories_cells_08_Islet_r         1             48             48
+CellSegmentation_03_py                  1              8              8
+ImportData_cells_01_r                   1              8              8
+IsletSegmentation_02_py                 1              8              8
+Measurements_04_py                      1              8              8
+Preprocessing_01_py                     1              8              8
+QualityControl_cells_04_r               1              8              8
+Registration_05_py                      1              8              8
+SpilloverCompensation_cells_02_r        1              8              8
+TransformCorrect_cells_03_r             1              8              8
+targets                                 1              1              1
+total                                  13              1             48
+
+Select jobs to execute...
+
+[Wed Jul  9 15:12:02 2025]
+rule Preprocessing_01_py:
+    input: /scratch/nsteen/T1D_preprocessing/processing/01_Preprocessing.py, /scratch/nsteen/T1D_preprocessing/processing/helper_functions.py
+    output: /scratch/nsteen/processing/txt_output/01_Preprocessing.out
+    jobid: 12
+    reason: Missing output files: /scratch/nsteen/processing/txt_output/01_Preprocessing.out; Updated input files: /scratch/nsteen/T1D_preprocessing/processing/01_Preprocessing.py, /scratch/nsteen/T1D_preprocessing/processing/helper_functions.py
+    threads: 8
+    resources: mem_mb=120000, disk_mb=1000, tmpdir=/sctmp/nsteen, time=24:00:00
+
+Submitted job 12 with external jobid 'Submitted batch job 22176135'.
+[Wed Jul  9 17:49:28 2025]
+Finished job 12.
+1 of 13 steps (8%) done
+Select jobs to execute...
+
+[Wed Jul  9 17:49:32 2025]
+rule IsletSegmentation_02_py:
+    input: /scratch/nsteen/T1D_preprocessing/processing/02_IsletSegmentation.py, /scratch/nsteen/processing/txt_output/01_Preprocessing.out
+    output: /scratch/nsteen/processing/txt_output/02_IsletSegmentation.out
+    jobid: 11
+    reason: Missing output files: /scratch/nsteen/processing/txt_output/02_IsletSegmentation.out; Input files updated by another job: /scratch/nsteen/processing/txt_output/01_Preprocessing.out
+    threads: 8
+    resources: mem_mb=120000, disk_mb=1000, tmpdir=/sctmp/nsteen, time=24:00:00
+
+Submitted job 11 with external jobid 'Submitted batch job 22177845'.
+[Wed Jul  9 18:15:34 2025]
+Error in rule IsletSegmentation_02_py:
+    jobid: 11
+    output: /scratch/nsteen/processing/txt_output/02_IsletSegmentation.out
+    cluster_jobid: Submitted batch job 22177845
+
+Error executing rule IsletSegmentation_02_py on cluster (jobid: 11, external: Submitted batch job 22177845, jobscript: /home/nsteen/scripts/T1D_analysis/.snakemake/tmp.zjw75g02/IsletSegmentation_02_py.11). For error details see the cluster log and the log files of the involved rule(s).
+Shutting down, this might take some time.
+Exiting because a job execution failed. Look above for error message
+Complete log: .snakemake/log/2025-07-09T151025.673872.snakemake.log

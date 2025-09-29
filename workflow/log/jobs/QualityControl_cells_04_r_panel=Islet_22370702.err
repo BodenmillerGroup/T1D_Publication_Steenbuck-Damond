@@ -1,0 +1,64 @@
+Building DAG of jobs...
+Using shell: /usr/bin/bash
+Provided cores: 8
+Rules claiming more threads will be scaled down.
+Select jobs to execute...
+
+[Wed Jul 16 09:30:35 2025]
+rule QualityControl_cells_04_r:
+    input: /home/nsteen/scripts/T1D_analysis/analysis/04_QualityControl_cells_Islet.Rmd, /home/nsteen/scripts/T1D_analysis/docs/03_TransformCorrect_cells_Islet.html
+    output: /home/nsteen/scripts/T1D_analysis/docs/04_QualityControl_cells_Islet.html
+    jobid: 0
+    benchmark: /home/nsteen/scripts/T1D_analysis/benchmark/04_QualityControl_cells_Islet.txt
+    reason: Forced execution
+    wildcards: panel=Islet
+    threads: 8
+    resources: mem_mb=247000, disk_mb=1000, tmpdir=/sctmp/nsteen, time=12:00:00
+
+
+        Rscript --vanilla -e '
+            rmarkdown::render(
+                input = "/home/nsteen/scripts/T1D_analysis/analysis/04_QualityControl_cells_Islet.Rmd",
+                output_file = "/home/nsteen/scripts/T1D_analysis/docs/04_QualityControl_cells_Islet.html",
+                quiet = FALSE,
+                knit_root_dir = "/home/nsteen/scripts/T1D_analysis/analysis",
+                params = list(rmd="/home/nsteen/scripts/T1D_analysis/analysis/04_QualityControl_cells_Islet.Rmd")
+            )'
+        
+Activating singularity image /home/nsteen/data/singularity/sandbox/
+
+
+processing file: /sctmp/nsteen/RtmpzJryab/04_QualityControl_cells_Islet.Rmd
+Error:
+! subscript contains invalid names
+Backtrace:
+  1. cytomapper::getImages(images, image_list2)
+  2. cytomapper::getImages(images, image_list2)
+  4. x[i]
+  5. S4Vectors:::subset_along_ROWS(x, i, drop = drop)
+  7. S4Vectors::extractROWS(x, i)
+  8. S4Vectors::normalizeSingleBracketSubscript(i, x, as.NSBS = TRUE)
+ 10. S4Vectors::NSBS(...)
+ 11. S4Vectors:::.subscript_error("subscript contains invalid ", what)
+
+Quitting from lines 1464-1527 [spillover-plot] (/sctmp/nsteen/RtmpzJryab/04_QualityControl_cells_Islet.Rmd)
+Execution halted
+[Wed Jul 16 12:25:05 2025]
+Error in rule QualityControl_cells_04_r:
+    jobid: 0
+    output: /home/nsteen/scripts/T1D_analysis/docs/04_QualityControl_cells_Islet.html
+    shell:
+        
+        Rscript --vanilla -e '
+            rmarkdown::render(
+                input = "/home/nsteen/scripts/T1D_analysis/analysis/04_QualityControl_cells_Islet.Rmd",
+                output_file = "/home/nsteen/scripts/T1D_analysis/docs/04_QualityControl_cells_Islet.html",
+                quiet = FALSE,
+                knit_root_dir = "/home/nsteen/scripts/T1D_analysis/analysis",
+                params = list(rmd="/home/nsteen/scripts/T1D_analysis/analysis/04_QualityControl_cells_Islet.Rmd")
+            )'
+        
+        (one of the commands exited with non-zero exit code; note that snakemake uses bash strict mode!)
+
+Shutting down, this might take some time.
+Exiting because a job execution failed. Look above for error message

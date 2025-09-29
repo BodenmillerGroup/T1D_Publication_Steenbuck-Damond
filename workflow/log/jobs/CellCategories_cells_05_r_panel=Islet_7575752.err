@@ -1,0 +1,64 @@
+Building DAG of jobs...
+Using shell: /usr/bin/bash
+Provided cores: 48
+Rules claiming more threads will be scaled down.
+Select jobs to execute...
+
+[Thu Dec 21 18:15:44 2023]
+rule CellCategories_cells_05_r:
+    input: /home/nsteen/scripts/T1D_analysis/analysis/05_CellCategories_cells_Islet.Rmd, /home/nsteen/scripts/T1D_analysis/docs/04_QualityControl_cells_Islet.html
+    output: /home/nsteen/scripts/T1D_analysis/docs/05_CellCategories_cells_Islet.html
+    jobid: 0
+    benchmark: benchmark/05_CellCategories_cells_Islet.txt
+    reason: Forced execution
+    wildcards: panel=Islet
+    threads: 48
+    resources: mem_mb=350000, disk_mb=1000, tmpdir=/sctmp/nsteen, time=24:00:00
+
+Rscript --vanilla -e 'rmarkdown::render("/home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmpjc29fw03.05_CellCategories_cells_Islet.Rmd", output_file="/home/nsteen/scripts/T1D_analysis/docs/05_CellCategories_cells_Islet.html", quiet=TRUE, knit_root_dir = "/home/nsteen/scripts/T1D_analysis", params = list(rmd="/home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmpjc29fw03.05_CellCategories_cells_Islet.Rmd"))'
+Activating singularity image /data/nsteen/singularity/sandbox
+Error in parse_block(g[-1], g[1], params.src, markdown_mode) : 
+  Duplicate chunk label 'celltypes-leiden-harmony', which has been used for the chunk:
+clust_method <- "Leiden1"
+clust_assay <- "harmony_batch"
+
+if (!clust_assay %in% assay_sel)
+  stop("The selected assay is not in the assays selected for clustering")
+
+clust_name <- paste(clust_method, clust_assay, sep = "_")
+print(clust_name)
+
+## Define which clusters correspond to which cell types
+#clust_alpha <- c(3, 4, 5, 13, 19, 20, 21, 23, 24, 27, 31, 32, 33)
+#clust_beta  <- c(1, 6, 8, 9, 11, 12, 14, 15, 18, 28, 29, 34, 35)
+#clust_delta <- c(2, 22)
+#clust_gamma <- c(16)
+#clust_epsil <- c(10)
+#clust_other <- c(7, 17, 25, 26, 30, 36)
+
+### First clustering:
+clust_beta <- c(1, 3, 6, 8, 12, 14, 17, 23, 27, 35, 37)
+clust_delta <- c(2, 21)
+clust_alpha <- c(4, 5, 11, 16, 18, 19, 20, 22, 24, 26, 31, 32, 34, 36)
+clust_epsil <- c(9)
+clust_gamma <- c(13)
+clust_other <- c(7, 10, 15, 25, 28, 29, 30, 33)
+
+
+all_clust <- sort(c(clust_beta, clust_alpha, clust_delta,
+                    clust_gamma, clust_ep
+Calls: <Anonymous> ... process_file -> split_file -> lapply -> FUN -> parse_block
+Execution halted
+Not cleaning up /home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmpjc29fw03.05_CellCategories_cells_Islet.Rmd
+[Thu Dec 21 18:15:48 2023]
+Error in rule CellCategories_cells_05_r:
+    jobid: 0
+    output: /home/nsteen/scripts/T1D_analysis/docs/05_CellCategories_cells_Islet.html
+
+RuleException:
+CalledProcessError in line 104 of /home/nsteen/scripts/T1D_analysis/workflow/Snakefile:
+Command ' singularity  exec --home /home/nsteen/scripts/T1D_analysis --bind /scratch/nsteen/processing:/home/processing,/scratch/nsteen/T1D_preprocessing:/scratch/nsteen/T1D_preprocessing,/data/nsteen:/data/nsteen /data/nsteen/singularity/sandbox bash -c 'set -euo pipefail;  Rscript --vanilla -e '\''rmarkdown::render("/home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmpjc29fw03.05_CellCategories_cells_Islet.Rmd", output_file="/home/nsteen/scripts/T1D_analysis/docs/05_CellCategories_cells_Islet.html", quiet=TRUE, knit_root_dir = "/home/nsteen/scripts/T1D_analysis", params = list(rmd="/home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmpjc29fw03.05_CellCategories_cells_Islet.Rmd"))'\'''' returned non-zero exit status 1.
+  File "/home/nsteen/scripts/T1D_analysis/workflow/Snakefile", line 104, in __rule_CellCategories_cells_05_r
+  File "/home/nsteen/data/conda/envs/snakemake_cluster/lib/python3.10/concurrent/futures/thread.py", line 58, in run
+Shutting down, this might take some time.
+Exiting because a job execution failed. Look above for error message

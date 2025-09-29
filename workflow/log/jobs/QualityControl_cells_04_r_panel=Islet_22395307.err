@@ -1,0 +1,32 @@
+Building DAG of jobs...
+Using shell: /usr/bin/bash
+Provided cores: 8
+Rules claiming more threads will be scaled down.
+Select jobs to execute...
+
+[Thu Jul 17 08:09:49 2025]
+rule QualityControl_cells_04_r:
+    input: /home/nsteen/scripts/T1D_analysis/analysis/04_QualityControl_cells_Islet.Rmd, /home/nsteen/scripts/T1D_analysis/docs/03_TransformCorrect_cells_Islet.html
+    output: /home/nsteen/scripts/T1D_analysis/docs/04_QualityControl_cells_Islet.html
+    jobid: 0
+    benchmark: /home/nsteen/scripts/T1D_analysis/benchmark/04_QualityControl_cells_Islet.txt
+    reason: Forced execution
+    wildcards: panel=Islet
+    threads: 8
+    resources: mem_mb=376000, disk_mb=1000, tmpdir=/sctmp/nsteen, time=36:00:00
+
+
+        Rscript --vanilla -e '
+            rmarkdown::render(
+                input = "/home/nsteen/scripts/T1D_analysis/analysis/04_QualityControl_cells_Islet.Rmd",
+                output_file = "/home/nsteen/scripts/T1D_analysis/docs/04_QualityControl_cells_Islet.html",
+                quiet = FALSE,
+                knit_root_dir = "/home/nsteen/scripts/T1D_analysis/analysis",
+                params = list(rmd="/home/nsteen/scripts/T1D_analysis/analysis/04_QualityControl_cells_Islet.Rmd")
+            )'
+        
+Activating singularity image /home/nsteen/data/singularity/sandbox/
+
+
+processing file: /sctmp/nsteen/RtmpWm6Mgc/04_QualityControl_cells_Islet.Rmd
+slurmstepd: error: *** JOB 22395307 ON u20-chii000-402 CANCELLED AT 2025-07-18T20:10:12 DUE TO TIME LIMIT ***

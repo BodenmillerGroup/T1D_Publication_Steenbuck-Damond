@@ -1,0 +1,35 @@
+Building DAG of jobs...
+Using shell: /usr/bin/bash
+Provided cores: 8
+Rules claiming more threads will be scaled down.
+Select jobs to execute...
+
+[Thu Jul 10 08:40:16 2025]
+rule IsletSegmentation_02_py:
+    input: /scratch/nsteen/T1D_preprocessing/processing/02_IsletSegmentation.py, /scratch/nsteen/processing/txt_output/01_Preprocessing.out
+    output: /scratch/nsteen/processing/txt_output/02_IsletSegmentation.out
+    jobid: 0
+    reason: Forced execution
+    threads: 8
+    resources: mem_mb=120000, disk_mb=1000, tmpdir=/sctmp/nsteen, time=24:00:00
+
+python /home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmpjorufovd.02_IsletSegmentation.py
+Activating singularity image /home/nsteen/data/singularity/sandbox/
+Matplotlib created a temporary config/cache directory at /sctmp/nsteen/matplotlib-0y_gyj9l because the default path (/home/nsteen/.config/matplotlib) is not a writable directory; it is highly recommended to set the MPLCONFIGDIR environment variable to a writable directory, in particular to speed up the import of Matplotlib and to better support multiprocessing.
+Traceback (most recent call last):
+  File "/home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmpjorufovd.02_IsletSegmentation.py", line 73, in <module>
+    import helpers
+ModuleNotFoundError: No module named 'helpers'
+Not cleaning up /home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmpjorufovd.02_IsletSegmentation.py
+[Thu Jul 10 08:40:23 2025]
+Error in rule IsletSegmentation_02_py:
+    jobid: 0
+    output: /scratch/nsteen/processing/txt_output/02_IsletSegmentation.out
+
+RuleException:
+CalledProcessError in line 255 of /home/nsteen/scripts/T1D_analysis/workflow/Snakefile:
+Command ' singularity  exec --home /home/nsteen/scripts/T1D_analysis --bind /home/nsteen/scripts/T1D_analysis:/home/nsteen/scripts/T1D_analysis,/scratch/nsteen/processing:/home/processing,/scratch/nsteen/T1D_preprocessing:/scratch/nsteen/T1D_preprocessing,/data/nsteen:/data/nsteen --bind /home/nsteen/data/conda/envs/snakemake_cluster/lib/python3.10/site-packages:/mnt/snakemake /home/nsteen/data/singularity/sandbox/ bash -c 'set -euo pipefail;  python /home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmpjorufovd.02_IsletSegmentation.py'' returned non-zero exit status 1.
+  File "/home/nsteen/scripts/T1D_analysis/workflow/Snakefile", line 255, in __rule_IsletSegmentation_02_py
+  File "/home/nsteen/data/conda/envs/snakemake_cluster/lib/python3.10/concurrent/futures/thread.py", line 58, in run
+Shutting down, this might take some time.
+Exiting because a job execution failed. Look above for error message

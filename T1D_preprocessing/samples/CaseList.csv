@@ -1,0 +1,96 @@
+CaseNb,CaseID,Batch,PancreasRegion,Group,GroupCode,DonorType,AAbStatus,GADA+, IA2A+,mIAA+,ZnT8A+,NumberAAb,Age,DiabetesDuration,Gender,Race,BMI,HbA1c,C_peptide,HLA_Transplant,CauseOfDeath
+2,6044,2,Tail,sAAb+,1,AAbPos,GADA+,1,0,0,0,1,41.4,NA,Male,Hispanic_Latino,27.4,NA,13.55,"A*/, B*/, DR*01/15, DQ*01/01",Trauma
+3,6090,4,Tail,sAAb+,1,AAbPos,GADA+,1,0,0,0,1,2.2,NA,Male,Hispanic_Latino,18.8,NA,5.34,"A*02/24, B*07/40, DR*04/15, DQ*06/08",Head Trauma
+4,6123,3,Body,sAAb+,1,AAbPos,GADA+,1,0,0,0,1,23.2,NA,Female,Caucasian,17.6,5.4,2.01,"A*02/24, B*35/51, DR*08/11, DQ*04/07",Head Trauma
+5,6147,4,Body,sAAb+,1,AAbPos,GADA+,1,0,0,0,1,23.8,NA,Female,Caucasian,32.9,5.5,3.19,"A*02/02, B*39/44, DR*04/08, DQ*04/07",Head Trauma
+6,6151,2,Body,sAAb+,1,AAbPos,GADA+,1,0,0,0,1,30,NA,Male,Caucasian,24.2,NA,5.49,"A*02/24, B*44/44, DR*01/07, DQ*02/05",Anoxia
+7,6171,1,Body,sAAb+,1,AAbPos,GADA+,1,0,0,0,1,4.4,NA,Female,Caucasian,14.8,NA,8.95,"A*02/31, B*08/13, DR*17/17, DQ*02/02",Anoxia
+8,6181,3,Body,sAAb+,1,AAbPos,GADA+,1,0,0,0,1,31.9,NA,Male,Caucasian,21.9,NA,0.06,"A*03/11, B*35/51, DR*01/04, DQ*08/05",Head Trauma
+9,6301,1,Body,sAAb+,1,AAbPos,GADA+,1,0,0,0,1,26,NA,Male,African_American,32.1,5.5,3.92,"A*23/-, B*07/-, DR*11/13, DQ*03/06",Head Trauma
+10,6303,4,Body,sAAb+,1,AAbPos,GADA+,1,0,0,0,1,22,NA,Male,Caucasian,31.9,5.4,3.03,"A*01/11, B*44/17, DR*17/07, DQ*02/02",Head Trauma
+11,6310,2,Tail,sAAb+,1,AAbPos,GADA+,1,0,0,0,1,28,NA,Female,Hispanic_Latino,22.4,NA,10.54,"A*03/30, B*08/57, DR*07/01",Anoxia
+12,6314,3,Tail,sAAb+,1,AAbPos,GADA+,1,0,0,0,1,21,NA,Male,Caucasian,23.8,NA,1.49,"A*02/24, B*07/35, DR*103/04",Head Trauma
+13,6347,2,Body,sAAb+,1,AAbPos,mIAA+*,0,0,1,0,1,8.5,NA,Male,Caucasian,19.5,NA,3.26,"A*02/32, B*27/61, DR*01/15, DQ*05/06",Head Trauma
+14,6397,1,Body,sAAb+,1,AAbPos,GADA+,1,0,0,0,1,21.2,NA,Female,Caucasian,29.6,6,12.77,"A*02/-, B*51/62, DR*13/15, DQ*-/-",Head Trauma
+15,6400,3,Body,sAAb+,1,AAbPos,GADA+,1,0,0,0,1,25.2,NA,Male,Hispanic_Latino,22.2,5.5,4.17,"A*26/31, B*08/62, DR*04/13, DQ*07/08",Head Trauma
+16,6421,4,Body,sAAb+,1,AAbPos,GADA+,1,0,0,0,1,6.73,NA,Male,Hispanic_Latino,17.9,5.6,1.84,"A*02/03, B*27/62, DR*01/-, DQ*05/-",Head Trauma
+17,6433,1,Body,sAAb+,1,AAbPos,GADA+,1,0,0,0,1,24,NA,Male,Hispanic_Latino,30.8,5.3,4.44,"A*30/68, B*08/45, DR*04/12, DQ*03/03",Head Trauma
+18,6437,4,Body,sAAb+,1,AAbPos,GADA+,1,0,0,0,1,24.73,NA,Male,Caucasian,24.17,5.7,6.23,"A*01/23, B*08/18, DR*11/17, DQ*-/-",Head Trauma
+19,6483,2,Body,sAAb+,1,AAbPos,GADA+,1,0,0,0,1,30.5,NA,Female,Caucasian,20.8,5.5,2.21,"A*01/03, B*08/27, DR*17/07, DQ*02/02",Head Trauma
+20,6494,3,Tail,sAAb+,1,AAbPos,mIAA+*,0,0,1,0,1,8.8,NA,Male,African_American,14.9,4.9,5.83,"A*23/--, B*45/72, DR*12/13, DQ*05/*07",Head Trauma
+21,6496,2,Tail,sAAb+,1,AAbPos,GADA+,1,0,0,0,1,26.1,NA,Male,African_American,46.1,5.7,1.48,"A*02/24, B*44/45, DR*15/16, DQ*05/06",Respiratory Distress/Failure
+22,6517,1,Body,sAAb+,1,AAbPos,GADA+,1,0,0,0,1,22.1,NA,Male,Caucasian,26.6,5.6,9.74,"A*03/32, B*38/52, DR*14/15, DQ*05/06",Cerebrovascular/Stroke
+23,6518,3,Body,sAAb+,1,AAbPos,GADA+,1,0,0,0,1,21.9,NA,Male,Caucasian,23.8,6,10.93,"A*24/68, B*27/60, DR*01/01:03, DQ*05/05",Other: Sepsis
+24,6532,4,Body,sAAb+,1,AAbPos,GADA+,1,0,0,0,1,20.04,NA,Male,Hispanic_Latino,23.9,5.9,22.12,"A*02/24, B*13/51, DR*07/11, DQ*02/07",Head Trauma
+25,6538,2,Body,sAAb+,1,AAbPos,GADA+,1,0,0,0,1,19.1,NA,Male,Caucasian,32.9,5.8,11.33,"A*01/02, B*07/08, DR*17/08, DQ*02/04",Head Trauma
+26,HDL011,3,Tail,sAAb+,1,AAbPos,GADA+,1,0,0,0,1,8,NA,Female,African_American,12,NA,1.33,"A*03/33, B*38/53, DR*08/13, DQ*07/06",Cerebrovascular/Stroke
+27,6197,1,Body,mAAb+,2,AAbPos,GADA+ IA2A+,1,1,0,0,2,22,NA,Male,African_American,28.2,5.5,17.48,"A*02/24, B*42/45, DR*07/18, DQ*02/04",Head Trauma
+29,6388,4,Tail,mAAb+,2,AAbPos,GADA+ mIAA+*,1,0,1,0,2,25.2,NA,Female,Hispanic_Latino,26,5.7,1.38,"A*02/-, B*35/65, DR*01/04, DQ*05/07",Anoxia
+30,6424,2,Body,mAAb+,2,AAbPos,GADA+ mIAA+*,1,0,1,0,2,17.7,NA,Male,Caucasian,51.4,5.8,6.97,"A*30/68, B*08/35, DR*17/04, DQ*02/08",Head Trauma
+31,6429,3,Body,mAAb+,2,AAbPos,GADA+ mIAA+*,1,0,1,0,2,22.1,NA,Male,African_American,19.6,5.5,2.25,"A*01/02, B*44/81, DR*103/17, DQ*02/05",Head Trauma
+32,6450,1,Body,mAAb+,2,AAbPos,GADA+ ZnT8A+,1,0,0,1,2,22,NA,Female,Caucasian,24.4,5.7,5.47,"A*01/33, B*08/65, DR*17/-, DQ*02/-",Anoxia
+33,6505,2,Body,mAAb+,2,AAbPos,GADA+ mIAA+*,1,0,1,0,2,20.6,NA,Female,Hispanic_Latino,22.4,5.1,20.8,"A*02/03, B*35/44, DR*04/07, DQ*02/08",Anoxia
+34,6512,3,Tail,mAAb+,2,AAbPos,IA2A+ mIAA+* ZnT8A+,0,1,1,1,3,30.6,NA,Female,Caucasian,38.8,5.2,3.2,"A*24/32, B*44/44, DR*04/07, DQ*02/07",Cerebrovascular/Stroke
+35,6521,4,Body,mAAb+,2,AAbPos,GADA+ IA2A+ ZnT8A+,1,1,0,1,3,19.77,NA,Male,Hispanic_Latino,24.1,5.8,7.44,"A*02/02, B*08/44, DR*04/17, DQ*02/08",Head Trauma
+36,6549,1,Tail,mAAb+,2,AAbPos,GADA+mIAA+,1,0,1,0,2,4.2,NA,Male,Caucasian,19,6.2,1.17,"A*02/02, B*60/57, DR*04/07, DQ*08/09",Cerebrovascular/Stroke
+37,CV02,3,Tail,mAAb+,2,AAbPos,GADA+ ZnT8A+,1,0,0,1,2,15.9,NA,Male,Caucasian,22,5.1,16.18,"A*02/11, B*27/61, DR*04/11, DQ*07/07",Anoxia
+38,6209,2,Tail,RecentOnset,3,T1D,IA2A+ mIAA+* ZnT8A+,0,1,1,1,3,5,0.25,Female,Caucasian,15.9,NA,0.1,"A*/, B*/, DR*/, DQ*/","DKA, cerebral edema"
+39,6224,1,Body,RecentOnset,3,T1D,negative,0,0,0,0,0,21,1.5,Female,Caucasian,22.8,NA,0.03,"A*02/11, B*39/51, DR*01/04, DQ*na/na",Anoxia
+40,6228,4,Body,RecentOnset,3,T1D,GADA+ IA2A+ ZnT8A+,1,1,0,1,3,13,0,Male,Caucasian,17.36,13.3,0.1,"A*23/68, B*60/44, DR*17/04, DQ*02/08",Anoxia
+41,6324,1,Body,RecentOnset,3,T1D,GADA+ mIAA+*,1,0,1,0,2,29,2,Male,Hispanic_Latino,26.2,10.2,0,"A*11/24, B*18/52, DR*11/15, DQ*07/06",Anoxia
+42,6362,3,Body,RecentOnset,3,T1D,GADA+,1,0,0,0,1,24.9,0,Male,Caucasian,28.5,10,0.38,"A*03/11, B*18/35, DR*103/17, DQ*02/05",Head Trauma
+43,6380,2,Tail,RecentOnset,3,T1D,negative,0,0,0,0,0,11.6,0,Female,African_American,14.6,13.5,0.22,"A*33/68, B*71/53, DR*17/13, DQ*02/06","DKA, cerebral edema"
+44,6396,4,Tail,RecentOnset,3,T1D,negative,0,0,0,0,0,17.1,2,Female,Caucasian,22.6,13.4,0.06,"A*23/24, B*44/49, DR*07/17, DQ*02/-","DKA, cerebral edema"
+45,6405,3,Body,RecentOnset,3,T1D,GADA+ IA2A+ ZnT8A+,1,1,0,1,3,29.1,0.6,Female,Hispanic_Latino,42.5,7,1.84,"A*30/31, B*18/61, DR*04/17, DQ*02/08",Cerebrovascular/Stroke
+46,6414,4,Body,RecentOnset,3,T1D,GADA+ mIAA+* ZnT8A+,1,0,1,1,3,23.1,0.43,Male,African_American,28.4,14,0.16,"A*01/23, B*07/08, DR*17/09, DQ*02/-",Anoxia
+47,6449,2,Other,RecentOnset,3,T1D,IA2A+ mIAA+* ZnT8A+,0,1,1,1,3,24,2,Male,Caucasian,23,10.2,0.03,"A*01/24, B*39/57, DR*01/01, DQ*05/05",Head Trauma
+48,6456,1,Tail,RecentOnset,3,T1D,GADA+ ZnT8A+,1,0,0,1,2,30.5,0,Female,African_American,30.1,6.8,10.33,"A*02/23, B*64/82, DR*04/13, DQ*08/06",Head Trauma
+49,6469,3,Body,RecentOnset,3,T1D,GADA+,1,0,0,0,1,27.1,1.5,Female,Caucasian,26.9,7.4,0.66,"A*24/30, B*71/49, DR*04/04, DQ*08/08",Anoxia
+50,6520,2,Body,RecentOnset,3,T1D,GADA+ IA2A+ ZnT8A+,1,1,0,1,3,21.6,0,Male,Caucasian,29.3,11.9,0.37,"A*02/31, B*35/60, DR*04/13, DQ*08/06",Cerebrovascular/Stroke
+51,6526,4,Tail,RecentOnset,3,T1D,IA2A+ mIAA+*,0,1,1,0,2,29.74,1,Male,Hispanic_Latino,23,6.6,0.07,"A*02/32, B*50/62, DR*04/13, DQ*08/06",Anoxia
+52,6533,1,Body,RecentOnset,3,T1D,IA2A+ mIAA+* ZnT8A+,0,1,1,1,3,3.8,0,Female,Caucasian,17.7,11.4,0.17,"A*01/02, B*08/62, DR*04/17, DQ*02/08",Anoxia
+53,6534,3,Tail,RecentOnset,3,T1D,IA2A+,0,1,0,0,1,4.2,0,Female,Caucasian,22.6,NA,0.05,"A*02/24, B*27/27, DR*01/04, DQ*05/08",Anoxia
+54,6247,1,Body,RecentOnset,3,T1D,mIAA+*,0,0,1,0,1,24,0.6,Male,Caucasian,24.3,NA,0.47,"A*24/68, B*44/60, DR*04/11, DQ*/",Head Trauma (MVA)
+55,6367,2,Tail,RecentOnset,3,T1D,negative,0,0,0,0,0,24,2,Male,Caucasian,25.7,8.8,0.39,"A*02/29, B*18/44, DR*04/07, DQ*02/08",Anoxia
+56,6550,4,Body,RecentOnset,3,T1D,GADA+ ZnT8A+,1,0,0,1,2,25.06,0,Male,Caucasian,16.4,14,0.001,"A*33/68, B*08/50, DR*17/--, DQ*02/--",Anoxia
+57,6551,3,Body,RecentOnset,3,T1D,GADA+ IA2A+ mIAA+* ZnT8A+,1,1,1,1,4,20.7,0.58,Male,Caucasian,23.1,6.4,0.11,"A*02/29, B*44/57, DR*04/07, DQ*02/07",Anoxia
+58,6036,4,Body,Pancreatitis,5,Pancreatitis_Other,mIAA+*,0,0,1,0,1,49.2,34,Female,African_American,25.5,,0.025,"A*68/68, B*14/14, DR*07/07, DQ*02/02",Anoxia
+59,6043,3,Taul,Pancreatitis,5,Pancreatitis_Other,negative,0,0,0,0,0,26.7,NA,Male,Caucasian,45.7,NA,NA,NA,NA
+60,6061,1,Body,Pancreatitis,5,Pancreatitis_T1D,mIAA+*,0,0,1,0,1,28.1,23,Male,Caucasian,22.1,NA,NA,NA,NA
+61,6150,2,Tail,Pancreatitis,5,Pancreatitis_T1D,mIAA+*,0,0,1,0,1,41.2,35,Male,Caucasian,25.5,NA,NA,NA,NA
+62,6225,4,Body,Pancreatitis,5,Pancreatitis_Other,negative,0,0,0,0,0,21,NA,Male,Caucasian,23.7,5.6,9.19,"A*01/11, B*08/27, DR*12/17, DQ*02/07",Cerebrovascular/Stroke
+63,6506,3,Tail,Pancreatitis,5,Pancreatitis_T1D,IA2A+ mIAA+* ZnT8A+,0,1,1,1,3,28.9,8,Male,Caucasian,24.6,NA,NA,NA,NA
+64,6522,4,Tail,Pancreatitis,5,Pancreatitis_Other,mIAA+*,0,0,1,0,1,24.05,5,Female,Caucasian,28.2,9.3,0.09,"A*01/--, B*08/44, DR*04/17, DQ*02/08",Anoxia
+65,6063,1,Body,LongDuration,4,T1D,mIAA+*,0,0,1,0,1,4.4,3,Male,Caucasian,23.8,NA,NA,NA,Anoxia
+66,6264,1,Body,LongDuration,4,T1D,negative,0,0,0,0,0,12,9,Female,Caucasian,22,8.9,NA,NA,DKA
+67,6145,1,Body,LongDuration,4,T1D,GADA+ZnT8+mIAA*+,1,0,1,1,3,18,11,Male,Caucasian,23.1,NA,NA,NA,Head Trauma
+68,6285,1,Body,LongDuration,4,T1D,GADA+  IA-2A+  mIAA*+,1,1,1,0,3,22,15,Female,Caucasian,21.8,NA,NA,NA,NA
+69,6135,2,Tail,LongDuration,4,T1D,GADA+mIAA+,1,0,1,0,2,43.5,21,Male,Caucasian,28.7,NA,NA,NA,Anoxia
+70,6514,2,Tail,LongDuration,4,T1D,NA,NA,NA,NA,NA,NA,8,6,Female,African_American,16.4,8.8,NA,NA,Epilepsy
+71,6328,2,Body,LongDuration,4,T1D,GADA+mIAA+,1,0,1,0,2,39,20,Male,Hispanic_Latino,24,8.7,`<0.02`,NA,Anoxia
+72,6422,2,Body,LongDuration,4,T1D,mIAA+*,0,0,1,0,1,22.8,21,Male,Caucasian,25.1,7.1,`<0.02`,NA,Anoxia
+73,6510,4,Body,LongDuration,4,T1D,GADA+mIAA*+,1,0,1,0,2,30.7,18,Male,African_American,27.5,7.9,`<0.02`,"A*02/02, B*19/58, DR*17/04, DQ*02/08",Anoxia
+74,6208,3,Body,LongDuration,4,T1D,negative,0,0,0,0,0,32.6,16,Female,Caucasian,23.4,NA,NA,"A*01/68, B*08/44, DR*17/04, DQ*02/08",Anoxia
+75,6418,3,Body,LongDuration,4,T1D,GADA+IA-2A+mIAA*+ZnT8A+,1,1,1,1,4,24.9,11,Male,Caucasian,26.4,7.5,<`<0.02`,A*02/32 B*51/62 DR*04/11 DQ*07/08,Anoxia
+76,6519,4,Tail,LongDuration,4,T1D,IA-2A+mIAA+*,0,1,1,0,2,14.93,10,Male,Caucasian,20,8.4,`<0.02`,"A*02/24, B*62/04, DR*04/04, DQ*08/08",Anoxia
+77,6321,4,Body,LongDuration,4,T1D,IA-2A+mIAA+*ZnT8A+,0,1,1,1,3,27,16,Female,Caucasian,20.3,8.1,<0.02,A*02/-        B*62/44   DR*04/11   DQ*08/-,Anoxia
+78,6458,4,Tail,LongDuration,4,T1D,GADA+mIAA+*,1,0,1,0,2,13,6,Female,African_American,21.5,14.2,0.02,"A*01/68, B*08/15, DR*03/13, DQ*02/06",Anoxia
+79,6420,1,Body,NoDiabetes,0,NoDiabetes,negative,0,0,0,0,0,11.5,NA,Male,Caucasian,15.4,5.2,1.27,NA,Anoxia
+80,6509,1,Other,NoDiabetes,0,NoDiabetes,negative,0,0,0,0,0,18.7,NA,Male,Caucasian,25.8,5.4,2.21,NA,Head Trauma
+81,6234,1,Body,NoDiabetes,0,NoDiabetes,negative,0,0,0,0,0,20,NA,Female,Caucasian,25.6,5.8,6.89,NA,Head Trauma
+82,6488,1,Body,NoDiabetes,0,NoDiabetes,negative,0,0,0,0,0,4.6,NA,Female,Caucasian,16.8,5.6,5.21,NA,Head Trauma
+83,6447,2,Tail,NoDiabetes,0,NoDiabetes,negative,0,0,0,0,0,8,NA,Male,Caucasian,16.3,5.1,4.61,NA,Head Trauma
+84,6289,2,Body,NoDiabetes,0,NoDiabetes,negative,0,0,0,0,0,19,NA,Male,African_American,38.3,NA,8.05,NA,Head Trauma
+85,6229,2,Tail,NoDiabetes,0,NoDiabetes,negative,0,0,0,0,0,31,NA,Female,Caucasian,26.9,5.5,6.23,NA,Head Trauma
+86,6531,2,Tail,NoDiabetes,0,NoDiabetes,negative,0,0,0,0,0,19.3,NA,Female,Hispanic_Latino,30,5.5,26.53,NA,Head Trauma
+87,6034,3,Body,NoDiabetes,0,NoDiabetes,negative,0,0,0,0,0,32,NA,Female,Caucasian,25.2,NA,3.15,"A*03/-, B*07/62, DR*01/08, DQ*05/04",Head Trauma
+88,6048,3,Body,NoDiabetes,0,NoDiabetes,negative,0,0,0,0,0,30,NA,Male,Caucasian,20.6,NA,17.91,"A*03/31, B*07/47, DR*04/15, DQ*06/07",Cerebrovascular/Stroke
+89,6178,3,Body,NoDiabetes,0,NoDiabetes,negative,0,0,0,0,0,24.5,NA,Female,Caucasian,27.5,5,4.55,"A*02/24, B*27/44, DR*04/15, DQ*06/03",Anoxia
+90,6126,3,Tail,NoDiabetes,0,NoDiabetes,negative,0,0,0,0,0,25.2,NA,Male,Hispanic_Latino,25.1,NA,0.88,,Head Trauma
+91,6428,4,Other,NoDiabetes,0,NoDiabetes,negative,0,0,0,0,0,6.16,NA,Male,African_American,22.6,5.8,12.59,"A*02/31, B*62/61, DR*08/16, DQ*04/07",Anoxia
+92,6547,4,Body,NoDiabetes,0,NoDiabetes,negative,0,0,0,0,0,6.64,NA,Female,African_American,24.8,5.5,3.89,"A*01/03, B*08/63, DR*04/13, DQ*07/08",Anoxia
+93,6055,4,Body,NoDiabetes,0,NoDiabetes,negative,0,0,0,0,0,27,NA,Male,Caucasian,22.7,NA,0.59,"A*03/26, B*07/38, DR*103/-,  DQ*03/-",Anoxia
+94,6563,4,Tail,RecentOnset,3,T1D,IA-2A+,0,1,0,0,1,14.56,0,Female,Caucasian,25.5,9.6,1.04,"A*02/11, B*60/50, DR*07/08, DQ*02/04",Anoxia
+95,6553,4,Tail,sAAb+,1,AAbPos,mIAA+,0,0,1,0,1,12.34,NA,Female,Hispanic_Latino,24.8,8.4,4.62,"A*02/03, B*62/27, DR*17/04, DQ*02/08",Head Trauma
+96,6558,4,Tail,sAAb+,1,AAbPos,GADA+,1,0,0,0,1,21.69,NA,Female,African_American,27.8,4.4,8.03,"A*02/30, B*08/63, DR*17/07, DQ*02/--",Cerebrovascular/Stroke
+97,6562,4,Tail,sAAb+,1,AAbPos,GADA+,1,0,0,0,1,29.77,NA,Female,Caucasian,18.2,5.6,13.19,"A*24/32 B*60/62, DR*04/15, DQ*06/08",Head Trauma

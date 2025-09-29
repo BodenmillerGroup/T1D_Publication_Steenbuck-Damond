@@ -1,0 +1,50 @@
+Building DAG of jobs...
+Using shell: /usr/bin/bash
+Provided cores: 48
+Rules claiming more threads will be scaled down.
+Select jobs to execute...
+
+[Fri Dec 22 12:13:33 2023]
+rule CellCategories_cells_05_r:
+    input: /home/nsteen/scripts/T1D_analysis/analysis/05_CellCategories_cells_Islet.Rmd, /home/nsteen/scripts/T1D_analysis/docs/04_QualityControl_cells_Islet.html
+    output: /home/nsteen/scripts/T1D_analysis/docs/05_CellCategories_cells_Islet.html
+    jobid: 0
+    benchmark: benchmark/05_CellCategories_cells_Islet.txt
+    reason: Forced execution
+    wildcards: panel=Islet
+    threads: 48
+    resources: mem_mb=350000, disk_mb=1000, tmpdir=/sctmp/nsteen, time=24:00:00
+
+Rscript --vanilla -e 'rmarkdown::render("/home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmpt9pz1syl.05_CellCategories_cells_Islet.Rmd", output_file="/home/nsteen/scripts/T1D_analysis/docs/05_CellCategories_cells_Islet.html", quiet=TRUE, knit_root_dir = "/home/nsteen/scripts/T1D_analysis", params = list(rmd="/home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmpt9pz1syl.05_CellCategories_cells_Islet.Rmd"))'
+Activating singularity image /data/nsteen/singularity/sandbox
+ - point 10001 of 90980
+ - point 20000 of 90980
+ - point 30000 of 90980
+ - point 40000 of 90980
+ - point 50000 of 90980
+ - point 60000 of 90980
+ - point 70000 of 90980
+ - point 80000 of 90980
+ - point 90000 of 90980
+ - point 10000 of 90980
+ - point 20000 of 90980
+ - point 30000 of 90980
+ - point 40000 of 90980
+ - point 50000 of 90980
+ - point 60000 of 90980
+ - point 70000 of 90980
+ - point 80000 of 90980
+ - point 90000 of 90980
+ - point 10000 of 90980
+ - point 20000 of 90980
+ - point 30000 of 90980
+ - point 40000 of 90980
+ - point 50000 of 90980
+ - point 60000 of 90980
+ - point 70000 of 90980
+ - point 80000 of 90980
+ - point 90000 of 90980
+Not cleaning up /home/nsteen/scripts/T1D_analysis/.snakemake/scripts/tmpt9pz1syl.05_CellCategories_cells_Islet.Rmd
+[Fri Dec 22 14:05:14 2023]
+Finished job 0.
+1 of 1 steps (100%) done

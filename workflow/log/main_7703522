@@ -1,0 +1,26 @@
+Building DAG of jobs...
+Using shell: /usr/bin/bash
+Provided cluster nodes: 100
+Job stats:
+job                          count    min threads    max threads
+-------------------------  -------  -------------  -------------
+CellCategories_cells_06_r        1             48             48
+CellCategories_cells_08_r        1             48             48
+targets                          1              1              1
+total                            3              1             48
+
+Select jobs to execute...
+
+[Mon Jan  8 15:35:43 2024]
+rule CellCategories_cells_06_r:
+    input: /home/nsteen/scripts/T1D_analysis/analysis/06_CellTypesIslet_cells_Islet.Rmd, /home/nsteen/scripts/T1D_analysis/docs/05_CellCategories_cells_Islet.html
+    output: /home/nsteen/scripts/T1D_analysis/docs/06_CellTypesIslet_cells_Islet.html
+    jobid: 2
+    benchmark: benchmark/06_CellTypesIslet_cells_Islet.txt
+    reason: Updated input files: /home/nsteen/scripts/T1D_analysis/analysis/06_CellTypesIslet_cells_Islet.Rmd
+    wildcards: panel=Islet
+    threads: 48
+    resources: mem_mb=247000, disk_mb=1000, tmpdir=/sctmp/nsteen, time=24:00:00
+
+Submitted job 2 with external jobid 'Submitted batch job 7703523'.
+slurmstepd: error: *** JOB 7703522 ON u20-compute-l20 CANCELLED AT 2024-01-08T15:44:18 ***
