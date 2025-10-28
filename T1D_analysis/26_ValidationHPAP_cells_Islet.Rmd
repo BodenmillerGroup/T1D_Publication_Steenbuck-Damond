@@ -1,0 +1,882 @@
+---
+title: "26_ValidationHPAP_cells_Islet"
+author: "Nathan Steenbuck"
+date: "Created: 05 Aug, 2025; Compiled: `r format(Sys.time(), '%d %b, %Y')`"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+cur_user <- Sys.info()[["user"]]
+script_name <- "26_ValidationHPAP_cells_Islet.Rmd"
+
+if (cur_user == "ubuntu") {
+  source(file.path("/", "mnt", "central_nas", "projects", 
+    "type1_diabetes", "nathan", "T1D_Vol", "T1D_analysis", 
+    "analysis", "helpers.R")) 
+  #n_cores <- future::availableCores() - 1
+  n_cores <- 2
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  knitr::opts_knit$set(root_dir = paths$home_data)
+  do_print <- FALSE
+} else {
+  source(file.path("/", "home", "nsteen", "scripts", "T1D_analysis", "analysis", "helpers.R"))
+  n_cores <- 8
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  paths$folder_script <- paths$cluster_folder_script
+  paths$folder_in <- paths$cluster_folder_in
+  paths$folder_out <- paths$cluster_home 
+  knitr::opts_knit$set(root_dir = paths$cluster_home)
+  do_print <- TRUE
+}
+
+seed <- 123456
+set.seed(seed)
+options <- furrr::furrr_options(seed = seed)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## Paths and settings
+
+```{r settings}
+# Paths
+if (!dir.exists(paths$folder_script)) dir.create(paths$folder_script)
+plotsave_param$path <- paths$folder_script
+plotsave_param_large$path <- paths$folder_script
+
+# Misc settings
+today <- gsub("-", "", Sys.Date())
+```
+
+## Libraries
+
+```{r}
+suppressMessages(library(Seurat))
+suppressMessages(library(stringr))
+suppressMessages(library(parallel))
+suppressMessages(library(readr))
+suppressMessages(library(DESeq2))
+suppressMessages(library(beeswarm))
+suppressMessages(library(limma))
+suppressMessages(library(edgeR))
+suppressMessages(library(GenomicFeatures))
+suppressMessages(library(data.table))
+```
+
+# A1: Perform DeSeq2 Analysis
+## A1.1: Step 1: Make Pseudobulk Matrices
+```{r pseudobulk-matrices}
+#Read in final HPAP object
+data <- readRDS(file.path(paths$folder_script, "hpap_islet_scRNAseq.rds"))
+
+colnames(data@meta.data) <- c("orig.ident", "nCount_RNA", "nFeature_RNA", "percent.mt", "seurat_clusters", 
+                             "library", "sex", "condition", "tissue_source", "chemistry", "cell_type", "cell_type_grouped")
+
+Idents(data) <- data@meta.data$cell_type
+
+#Pull out list of all cell types
+unique_cell_types <- unique(data$cell_type)
+
+DefaultAssay(data) <- 'RNA'
+#Pull out gene expression counts
+gex.counts <- GetAssayData(data,slot='counts')
+
+##Pull out sample barcodes
+sample_bcs <- list()
+samples <- c('HPAP-019','HPAP-020','HPAP-021','HPAP-022','HPAP-023','HPAP-024','HPAP-026','HPAP-028','HPAP-029','HPAP-032','HPAP-034','HPAP-035','HPAP-036','HPAP-037','HPAP-038','HPAP-039','HPAP-040','HPAP-042','HPAP-043','HPAP-044','HPAP-045','HPAP-047','HPAP-049','HPAP-050','HPAP-051','HPAP-052','HPAP-053','HPAP-054','HPAP-055','HPAP-056','HPAP-057','HPAP-058','HPAP-059','HPAP-061','HPAP-063','HPAP-064','HPAP-065','HPAP-070','HPAP-071','HPAP-072','HPAP-074','HPAP-075','HPAP-077','HPAP-079','HPAP-080','HPAP-081','HPAP-082','HPAP-083','HPAP-084','HPAP-085','HPAP-087','HPAP-088','HPAP-090','HPAP-091','HPAP-092','HPAP-099','HPAP-100','HPAP-101','HPAP-103','HPAP-104','HPAP-105','HPAP-106','HPAP-107','HPAP-108','HPAP-109')
+for (sample in samples){
+    sample_bcs[[sample]] <- row.names(data[[]][data[[]]$library == sample,])
+}
+
+#Write function that will save sample gene expression count matrices for each unique cell type
+##Note: Since we ran SoupX with the roundToInt flag, counts are SoupX corrected but still integers for DESeq's negative binomial model
+data_matrices <- data
+
+get_per_sample_gex_SUMS <- function(cell.type, mtx.fp){
+    print(cell.type)
+    #Pull out rows of gex.counts where barcode Ident matches cell.type
+    bcs <- names(Idents(data_matrices)[Idents(data_matrices) == cell.type])
+    counts <- gex.counts[,colnames(gex.counts) %in% bcs]
+    print(dim(counts))
+
+    #Initialize the sample gex matrix
+    counts.df <- as.data.frame(rep(0,length(row.names(gex.counts))))
+    row.names(counts.df) <- row.names(gex.counts)
+    colnames(counts.df) <- c('temp')
+
+    #Loop through samples and calculate sum of gex values
+    for (sample in samples){
+        sample_cols <- colnames(counts) %in% sample_bcs[[sample]]
+        counts.cut <- counts[,sample_cols]
+        
+        #If only one barcode, this becomes a vector which is an issue
+        if (typeof(counts.cut) == 'double'){
+            sum.counts <- counts.cut
+        #If there are no barcodes, this will return NA (just return 0 for everything)
+        } else if(length(colnames(counts.cut)) == 0){
+            sum.counts <- rep(0,length(row.names(counts)))
+        } else {
+            sum.counts <- rowSums(counts.cut)
+        }
+        counts.df <- cbind(counts.df,as.data.frame(sum.counts))
+     }
+    fin.counts.df <- counts.df[,-c(1)]
+    colnames(fin.counts.df) <- samples
+    head(fin.counts.df)
+
+    #Export cell type specific gene by sample matrices
+    mtx.fp <- file.path(paths$folder_script, "deseq", sprintf('%s_sample_gex_total_counts.txt',cell.type))
+    write.table(fin.counts.df,mtx.fp,sep='\t',quote=FALSE)
+}
+
+#Run function to make matrices
+for (cell.type in unique_cell_types){
+    fp <- sprintf('~/%s_pseudobulk.txt',cell.type)
+    get_per_sample_gex_SUMS(cell.type, fp)
+}
+```
+
+## A1.2: Step 2: Make TPM Matrices
+We want to normalize for gene size. Need to extract gene sizes from Gencode v38 publicly available annotations
+Pull out gene exon info and calculate effective length
+```{r tpm-matrices}
+suppressMessages(txdb <- makeTxDbFromGFF(file.path(paths$folder_script, "gencode.v38.annotation.gtf"),format='gtf')) #This gtffile can be downloaded from Gencode
+exons.list.per.gene <- exonsBy(txdb,by='gene') #Collect the exons per gene_id
+
+#Reduce all the exons to a set of non overlapping exons, calculate their lengths (widths) and sum them
+exonic.gene.sizes <- sum(width(GenomicRanges::reduce(exons.list.per.gene)))
+
+#This creates a separate gene info table so we can add gene names to exonic sizes later
+gene.info <- rtracklayer::import(file.path(paths$folder_script, "gencode.v38.annotation.gtf"))
+gene.info <- as.data.frame(gene.info) |> filter(type == "gene")
+gene.info <- gene.info[, c('gene_id', 'gene_name', 'gene_type', 'seqnames', 'start', 'end', 'strand', 'source', 'level')]
+colnames(gene.info) <- c('gene_id', 'gene_name', 'gene_type', 'chrom', 'start', 'end', 'strand', 'source', 'level')
+
+#Add the effective lengths to the original gene.info dataframe
+temp_df <- gene.info
+rownames(temp_df) <- gene.info$gene_id
+temp_df2 <- as.data.frame(exonic.gene.sizes)
+temp_df2$gene_id <- rownames(temp_df2)
+new_df <- merge(temp_df,temp_df2, by='gene_id', all=TRUE)
+
+#Remove duplicate rows from gene info df
+fin.gene.info <- new_df[!duplicated(new_df$gene_name),]
+write.table(fin.gene.info, file.path(paths$folder_script, "gene_info_withExonicGeneSizes.tsv"), quote=FALSE, col.names=TRUE, row.names=FALSE, sep='\t')
+
+#Now that we have extracted  gene sizes, can make our TPM matrices
+#Read in psedobulk gex matrices from above 
+dir <- file.path(paths$folder_script, "deseq")
+files <- list.files(dir, pattern ='sample_gex_total_counts.txt')
+cells <- gsub('_sample_gex_total_counts.txt','', files)
+
+make_tpm <- function(raw_counts, gene_sizes){
+  rpk <- raw_counts / gene_sizes
+  tpm <- rpk
+  for (i in 1:ncol(rpk)){
+      tpm[,i] <- rpk[,i]/(sum(rpk[,i])/1e6)
+      }
+  return(tpm)
+}
+
+for (x in files){
+    # x <- files[1]
+    cell <- cells[which(files == x)]
+    raw_counts <- read.table(file.path(dir, x), row.names=1)
+
+    raw_counts <- subset(raw_counts ,rownames(raw_counts) %in% fin.gene.info$gene_name)
+    gene_sizes <- fin.gene.info$exonic.gene.sizes[match(rownames(raw_counts), fin.gene.info$gene_name )]
+
+    tpm_mat <- make_tpm(raw_counts, gene_sizes)
+    write.table(tpm_mat, file.path(paths$folder_script, "deseq", paste0(cell, '_TPM_per_sample.txt')), sep='\t', quote=FALSE)
+}
+```
+
+## A1.3: Step 3: Run DESeq
+
+Run DESeq2 using pseudobulk counts and metadata from HPAP donor summary file.
+Run per cell-type.
+
+### A1.3.1: Prepare Metadata.
+```{r deseq-analysis}
+meta <- readxl::read_excel(file.path(paths$folder_script, "Donor_Summary_193.xlsx"))
+meta <- meta[which(meta$donor_ID %in% data@meta.data$library),]
+meta$library <- gsub('-', '.', meta$donor_ID)
+
+#Add some metadata columns from Seurat object to HPAP metadata (mostly for how it is formatted)
+diabetes_status  <- data@meta.data[,c('library', 'sex', 'condition', 'chemistry', 'tissue_source')]
+rownames(diabetes_status) <- NULL
+meta2 <- merge(meta, diabetes_status, by.x = 'donor_ID', by.y='library')
+
+#Scale age and BMI since they are numeric covariates- helps with DESeq model fitting
+meta2$scaled_bmi <- scale(meta2$bmi)
+meta2$scaled_age_years <- scale(meta2$age_years)
+
+#Get list of pseudobulk files
+files <- list.files(file.path(paths$folder_script, "deseq"), pattern='_sample_gex_total_counts.txt')
+#Create outdir for results
+outdir <- file.path(paths$folder_script, "deseq", "results")
+dir.create(outdir)
+
+#Remove file suffixes to get cell type names
+cells <- gsub('_sample_gex_total_counts.txt','', files) 
+
+#Need sample diabetes status for filtering counts
+nd  <- unique(data@meta.data[which(data@meta.data$condition == 'ND'),]$library)
+aab  <- unique(data@meta.data[which(data@meta.data$condition == 'AAB+'),]$library)
+t1d  <- unique(data@meta.data[which(data@meta.data$condition == 'T1D'),]$library)
+t2d  <- unique(data@meta.data[which(data@meta.data$condition == 'T2D'),]$library)
+
+t1d <- gsub('-', '.', t1d)
+t2d <- gsub('-', '.', t2d)
+aab <- gsub('-', '.', aab)
+nd <- gsub('-', '.', nd)
+```
+
+### A1.3.2: DESeq2
+
+```{r deseq2}
+### Example code for running T1D vs. non-diabetic. Can perform pairwise tests for all other conditions as well.
+test <- for (x in files) {
+    # x <- files[3]
+    cell <- gsub('_sample_gex_total_counts.txt', '', x)
+    raw_counts <- read.table(file.path(dir, x), row.names=1)
+    raw_counts <- raw_counts[,(colSums(raw_counts != 0) > 0)]
+    meta_cell <- subset(meta2, library %in% colnames(raw_counts))
+
+    raw_counts <- raw_counts[,which(colnames(raw_counts) %in% meta2$library)]
+
+    t1d_raw_counts <- raw_counts[which(colnames(raw_counts)%in% t1d)]
+    nd_raw_counts <- raw_counts[which(colnames(raw_counts)%in% nd)]
+
+    n_nd <- floor(ncol(nd_raw_counts)/2)  #Here I am calculating half the sample size for each condition, rounded down. I will use this as a minimum number of samples to meet gene count thresholds
+    n_t1d <- floor(ncol(t1d_raw_counts)/2)
+    
+    #The  next few lines of code subset the count matrix to only include genes where at least half the samples per condition have greater than 5 counts
+    ##Genes must meet this criteria in both conditions (see intersect below). This helps avoid significance due to one condition largely having 0 counts
+    nd_genes_to_keep <- c()
+        for (i in 1:nrow(nd_raw_counts)) {
+          if (sum(nd_raw_counts[i, ] >= 5) >= n_nd) {
+            nd_genes_to_keep <- c(nd_genes_to_keep, rownames(nd_raw_counts[i, ]))
+          }
+        }
+
+    t1d_genes_to_keep <- c()
+        for (i in 1:nrow(t1d_raw_counts)) {
+          if (sum(t1d_raw_counts[i, ] >= 5) >= n_t1d) {
+            t1d_genes_to_keep <- c(t1d_genes_to_keep, rownames(t1d_raw_counts[i, ]))
+          }
+        }
+
+    nd_t1d <- intersect(nd_genes_to_keep, t1d_genes_to_keep)
+
+        if ('T1D' %in% data@meta.data$condition){
+            print(cell)
+            print('All conditions found!')
+            counts <- raw_counts[which(rownames(raw_counts) %in% nd_t1d),] #Subsets full count matrix to only genes that met our filtering criteria
+
+            my_design <- as.formula ('~ condition + scaled_bmi + sex + scaled_age_years + chemistry + tissue_source')
+            # aggreagte by donor
+            meta_cell2 <- meta_cell |> distinct(library, condition, scaled_bmi, sex.x, scaled_age_years, chemistry, tissue_source) |> 
+              dplyr::rename("sex" = sex.x)
+
+            dds <- DESeqDataSetFromMatrix(round(counts), colData = meta_cell2, design = my_design) #colData is where design columns are found
+            dds <- estimateSizeFactors(dds)
+            dds <- estimateDispersions(dds)
+
+            ### Pairwise Wald test: conditon vs control  
+            dds <- nbinomWaldTest(dds)
+            tests <- c('T1D') #Conditions to test compared to control
+                for (y in tests){
+                    res <- results(dds, contrast=c('condition',y,'ND'))
+                    res <- as.data.frame(res)
+                    res <- res[order(res$pvalue),]
+                    outfile <- paste0( cell, '.deseq.WaldTest.', y , '.tsv')
+                    # write.table(res,paste0('~/hpap/deseq/results/', outfile) , sep='\t', quote=FALSE)  
+                    write.table(res, file.path(paths$folder_script, "deseq", "results", outfile) , sep='\t', quote=FALSE) 
+                    res
+                }     
+        }
+}  |> bind_rows()
+```
+
+### A1.3.3: Collect Results
+
+```{r deseq2-results}
+full_results <- purrr::map(cells, function(x) {
+    res <- as_tibble(read.table(file.path(paths$folder_script, "deseq", "results", paste0(x, '.deseq.WaldTest.T1D.tsv')), 
+                      header=TRUE), rownames = "gene") |> mutate(cell_type = x)
+}) |> bind_rows()
+
+beta_cells_results <- full_results |> filter(cell_type == "Beta")
+```
+
+## A1.4: Volcano-Plots 
+
+### A1.4.1: Overview of different GO-sets.
+```{r}
+# Main ER-stress Markers:
+main_markers <- c("ATF6", "DDIT3", "HSPA5", "XBP1", "ERN1")
+
+# GOBP POS https://www.gsea-msigdb.org/gsea/msigdb/human/geneset/GOBP_POSITIVE_REGULATION_OF_RESPONSE_TO_ENDOPLASMIC_RETICULUM_STRESS.html
+pos_genes <- c("BCL2L11","BCAP31","STUB1","AGR2","SERINC3","RNF183","DAB2IP","DDIT3","ERN1","FCGR2B","ATF6","SIRT1","BBC3","UBQLN2","UBQLN1","APP","ATXN3","NCK1","NFE2L2","RNFT1","PIK3R1","PMAIP1","TMEM33","PTPN1","PTPN2","BAK1","BAX","SGTA","BOK","WFS1","XBP1","BAG6","TMX1","NCK2","RNFT2","CAV1","USP13","TMEM259","RNF185","ATXN3L","HERPUD1")
+
+# Marciniak: CHOP-ER-stress response.
+chop_response_er_stress <- sort(c("PPAN","ERO1A","CHKA","POLR1A","PARD6A","RAD1","MTM1","SOAT2","CA6","WFS1","CDCA7","LONP1","CLCN3",
+                                  "PTRH2","STBD1","AMPD3","ETS2","KITLG","ADH7","PPP1R15A","DDIT3","PTX3"))
+
+# GOBP NEG: 
+neg_genes <- c("BCL2L11","BCAP31","STUB1","AGR2","SERINC3","RNF183","DAB2IP","DDIT3","ERN1","FCGR2B","ATF6","SIRT1","BBC3","UBQLN2","UBQLN1","APP","ATXN3","NCK1","NFE2L2","RNFT1","PIK3R1","PMAIP1","TMEM33","PTPN1","PTPN2","BAK1","BAX","SGTA","BOK","WFS1","XBP1","BAG6","TMX1","NCK2","RNFT2","CAV1","USP13","TMEM259","RNF185","ATXN3L","HERPUD1")
+
+beta_cells_results |> 
+  filter(gene %in% unique(c(main_markers, chop_response_er_stress)))
+
+## Negative genes.
+test3 <- beta_cells_results |> 
+  filter(gene %in% unique(neg_genes))
+test3
+```
+
+### Plots.
+```{r}
+fn <- file.path(paths$folder_script, paste0("volcano_beta_cells.png"))
+lab_italics <- paste0("italic('", beta_cells_results$gene, "')")
+selectLab_italics = paste0(
+    "italic('", beta_cells_results$gene[beta_cells_results$gene %in% c(main_markers, "IAPP", "CD74", "INS", "HLA-B")], "')"
+  )
+
+png(fn, width = 1200, height = 1000)
+EnhancedVolcano::EnhancedVolcano(beta_cells_results,
+  lab = lab_italics,
+  x = 'log2FoldChange',
+  y = 'padj',
+  ylim = c(0, 12),
+  selectLab = selectLab_italics,
+  title = 'Control vs T1D',
+    pCutoff = 0.05,
+    FCcutoff = 0,
+    drawConnectors = TRUE,
+    pointSize = 4.0,
+    labSize = 6.0,
+    labCol = 'black',
+    labFace = 'bold',
+    boxedLabels = TRUE,
+    parseLabels = TRUE,
+    colAlpha = 4/5,
+    legendPosition = 'top') + mytheme$large_new()
+dev.off()
+```
+
+MARCINIAK GENE SET:
+```{r}
+marciniak_genes <- c("PPAN","ERO1A","CHKA","POLR1A","PARD6A","RAD1","MTM1","SOAT2","CA6","WFS1","CDCA7","LONP1","CLCN3",
+                     "PTRH2","STBD1","AMPD3","ETS2","KITLG","ADH7","PPP1R15A","DDIT3","PTX3")
+
+# Volcano Plot
+fn <- file.path(paths$folder_script, paste0("volcano_marciniak_genes.png"))
+lab_italics <- paste0("italic('", beta_cells_results$gene, "')")
+selectLab_italics = paste0(
+  "italic('", beta_cells_results$gene[beta_cells_results$gene %in% c(marciniak_genes)], "')"
+)
+
+png(fn, width = 1200, height = 1000)
+EnhancedVolcano::EnhancedVolcano(beta_cells_results,
+  lab = lab_italics,
+  x = 'log2FoldChange',
+  y = 'padj',
+  ylim = c(0, 12),
+  selectLab = selectLab_italics,
+  title = 'Control vs T1D',
+  pCutoff = 0.05,
+  FCcutoff = 0,
+  drawConnectors = TRUE,
+  pointSize = 4.0,
+  labSize = 6.0,
+  labCol = 'black',
+  labFace = 'bold',
+  boxedLabels = TRUE,
+  parseLabels = TRUE,
+  colAlpha = 4/5,
+  legendPosition = 'top') + mytheme$large_new()
+dev.off()
+## Only 1 significantly dysregulated -> PARD6A downregulation.
+```
+
+Positive regulation of ER stress response genes:
+```{r positive-er-stress-response}
+pos_genes <- c("BCL2L11","BCAP31","STUB1","AGR2","SERINC3","RNF183","DAB2IP","DDIT3","ERN1","FCGR2B","ATF6","SIRT1","BBC3","UBQLN2","UBQLN1","APP","ATXN3","NCK1","NFE2L2","RNFT1","PIK3R1","PMAIP1","TMEM33","PTPN1","PTPN2","BAK1","BAX","SGTA","BOK","WFS1","XBP1","BAG6","TMX1","NCK2","RNFT2","CAV1","USP13","TMEM259","RNF185","ATXN3L","HERPUD1")
+# Pos genes.
+
+beta_cells_results |> 
+  filter(gene %in% unique(c(pos_genes)))
+
+## Volcano Plot
+fn <- file.path(paths$folder_script, paste0("volcano_pos_genes.png"))
+lab_italics <- paste0("italic('", beta_cells_results$gene, "')")
+selectLab_italics = paste0(
+  "italic('", beta_cells_results$gene[beta_cells_results$gene %in% unique(c(pos_genes, main_markers, "IAPP", "HLA-B", "CD74"))], "')"
+)
+
+keyvals.colour <- ifelse(beta_cells_results$padj < 0.05, palettes$colors[4], palettes$colors[5])
+names(keyvals.colour)[keyvals.colour == palettes$colors[5]] <- 'padj >= 0.05'
+names(keyvals.colour)[keyvals.colour == palettes$colors[4]] <- 'padj < 0.05'
+
+png(fn, width = 1200, height = 1000)
+EnhancedVolcano::EnhancedVolcano(beta_cells_results,
+  lab = lab_italics,
+  x = 'log2FoldChange',
+  y = 'padj',
+  axisLabSize = 8,
+  ylim = c(0, 12),
+  xlim = c(-3.5, 6),
+  selectLab = selectLab_italics,
+  title = NULL,
+  subtitle = NULL,
+  caption = NULL,
+  xlab = "log2 Fold Change",
+  ylab = "-log10(padj)",
+  pCutoff = 0.05,
+  FCcutoff = 0,
+  colCustom = keyvals.colour,
+  drawConnectors = TRUE,
+  # legendLabels = list("ns" = 'padj >= 0.05',"sig" = 'padj < 0.05'),
+  pointSize = 4.0,
+  labSize = 6.0,
+  labCol = 'black',
+  labFace = 'bold',
+  boxedLabels = TRUE,
+  parseLabels = TRUE,
+  max.overlaps = 25,
+  colAlpha = 4/5,
+  legendPosition = 'top') + mytheme$large_new() + 
+  theme(plot.margin = unit(c(0, 0, 0, 0), unit = "pt"))
+dev.off()
+```
+
+```{r}
+# GOBP_NEGATIVE_REGULATION_OF_RESPONSE_TO_ENDOPLASMIC_RETICULUM_STRESS: https://www.gsea-msigdb.org/gsea/msigdb/human/geneset/GOBP_NEGATIVE_REGULATION_OF_RESPONSE_TO_ENDOPLASMIC_RETICULUM_STRESS.html
+neg_genes <- c("AKT3", "NR1H3","LPCAT3","ABCA7","RACK1","CREB3","HYOU1","PARK7","CLU","LRRK2","ATF6B","CREBRF","UBXN2A","AKT1","AKT2","UFL1","PPP1R15A","ALOX5","SVIP","AQP11","GRINA","USP25","HSPA1A","HSPA5","PDX1","MIR199A1","MAGEA3","DNAJB9","NCK1","OPA1","PRKN","UBXN1","TXNDC12","BFAR","ATAD3A","SELENOS","PTPN1","BCL2L1","SGTA","DDRGK1","TMBIM6","NR1H2","WFS1","XBP1","NCK2","SYVN1","PPP1R15B","IKBKG","USP14","CREB3L1","HERPUD1")
+
+# Volcano plot
+fn <- file.path(paths$folder_script, paste0("volcano_neg_genes.png"))
+lab_italics <- paste0("italic('", beta_cells_results$gene, "')")
+selectLab_italics = paste0(
+  "italic('", beta_cells_results$gene[beta_cells_results$gene %in% c(neg_genes)], "')"
+)
+
+png(fn, width = 1200, height = 1000)
+EnhancedVolcano::EnhancedVolcano(beta_cells_results,
+  lab = lab_italics,
+  x = 'log2FoldChange',
+  y = 'padj',
+  ylim = c(0, 12),
+  selectLab = selectLab_italics,
+  title = 'Control vs T1D',
+  pCutoff = 0.05,
+  FCcutoff = 0,
+  drawConnectors = TRUE,
+  pointSize = 4.0,
+  labSize = 6.0,
+  labCol = 'black',
+  labFace = 'bold',
+  boxedLabels = TRUE,
+  parseLabels = TRUE,
+  max.overlaps = 25,
+  colAlpha = 4/5,
+  legendPosition = 'top') + mytheme$large_new()
+dev.off()
+```
+
+# A2: FGSEA.
+
+## A2.1: Get Entrez_IDs and rank
+
+- Rank as: sign(log2FoldChange) and -log10(padj).
+
+```{r entrez-ids}
+library(fgsea)
+library(org.Hs.eg.db) 
+hs <- org.Hs.eg.db
+my.symbols <- beta_cells_results$gene
+
+beta_cells2 <- select(hs, 
+       keys = my.symbols,
+       columns = c("ENTREZID", "SYMBOL"),
+       keytype = "SYMBOL") |> 
+       as_tibble() |> 
+       right_join(beta_cells_results, by = c("SYMBOL" = "gene"))
+
+set.seed(222)
+
+# RANK.
+input_df <- beta_cells2 |> 
+  mutate(logpadj = -log10(padj)) |> 
+  mutate(ranks = logpadj * sign(log2FoldChange)) |> 
+  arrange(desc(ranks)) |> 
+  # drop duplicates
+  distinct(SYMBOL, .keep_all = TRUE)
+
+ranks <- input_df$ranks
+names(ranks) <- input_df$SYMBOL
+```
+
+## A2.2: FGSEA HALLMARK GENE SET.
+
+RUN FOR HALLMARK GENE SET.
+```{r gsea-hallmark-gsea}
+## Download gene sets.
+gene_sets_df <- msigdbr::msigdbr(species = 'Homo sapiens', category = 'H')
+gene_sets <- gene_sets_df %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+set.seed(222)
+fgseaRes_H <- fgsea(gene_sets, ranks, scoreType = "std", eps = 0, minSize = 3, maxSize = 1000, nPermSimple = 100000)
+
+res_h <- fgseaRes_H |> 
+  as_tibble() |> 
+  arrange(padj) |> 
+  mutate(pathway = stringr::str_remove(pathway, "HALLMARK_"))
+
+top_hits <- res_h |> filter(padj < 0.05) |> pull(pathway)
+
+p <- res_h |> 
+  filter(pathway %in% top_hits | pathway == "UNFOLDED_PROTEIN_RESPONSE") |> 
+  mutate(logpadj = -log10(padj)) |> 
+  mutate(direction = ifelse(NES > 0, "Upregulated", "Downregulated")) |> 
+  # print
+  ggplot(aes(x = reorder(pathway, logpadj), y = logpadj, fill = direction)) +
+  geom_col() +
+  coord_flip() +
+  mytheme$standard_new() +
+  theme(axis.text = element_text(size = 10),
+        axis.title = element_text(size = 12)) +
+  labs(title = "Top Hallmark Pathways",
+       x = "Pathway",
+       y = "logpadj")
+
+fn <- "Top_Hallmark_pathways.png"
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+-> UPR was P = 0.98; IFNy/IFNa: 6.4*10-12 and 5.37*10-8, respectively.
+
+## A2.3: FGSEA KEGG MEDICUS GENE SET.
+
+Now for KEGG_MEDICUS:
+```{r}
+gene_sets_df <- msigdbr::msigdbr(species = 'Homo sapiens', category = 'C2', subcollection = "KEGG_MEDICUS")
+gene_sets <- gene_sets_df %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+gene_sets <- gene_sets[grepl("KEGG_MEDICUS_REFERENCE_", names(gene_sets))]
+
+set.seed(222)
+fgseaRes_KEGG <- fgsea(gene_sets, ranks, scoreType = "std", eps = 0, minSize = 3, maxSize = 1000, nPermSimple = 100000)
+
+## Make plot:
+res <- fgseaRes_KEGG |> 
+  as_tibble() |> 
+  arrange(padj)
+
+p <- res |> 
+  dplyr::slice_min(padj, n = 10) |> 
+  dplyr::mutate(pathway = stringr::str_remove(pathway, "KEGG_MEDICUS_REFERENCE_")) |> 
+  mutate(logpadj = -log10(padj)) |> 
+  mutate(direction = ifelse(NES > 0, "Upregulated", "Downregulated")) |> 
+  ggplot(aes(x = reorder(pathway, logpadj), y = logpadj, fill = direction)) +
+  geom_col() +
+  coord_flip() + 
+  mytheme$standard_new()+
+  theme(axis.text = element_text(size = 10),
+        axis.title = element_text(size = 12)) + 
+  labs(title = "Top 10 KEGG MEDICUS Pathways",
+       x = "Pathway",
+       y = "logpadj")
+
+fn <- "KEGG_MEDICUS_pathways.png"
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+## No DIRECT UPR/ER_STRESS PATHWAYS.
+```
+
+## A2.4: REACTOME
+
+```{r fgsea-reactome}
+gene_sets_df <- msigdbr::msigdbr(species = 'Homo sapiens', category = 'C2', subcollection = "REACTOME")
+gene_sets <- gene_sets_df %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+set.seed(222)
+fgseaRes_REACT <- fgsea(gene_sets, ranks, scoreType = "std", eps = 0, minSize = 3, maxSize = 1000, nPermSimple = 100000)
+
+res_REACT <- fgseaRes_REACT |> 
+  as_tibble() |> arrange(padj)
+
+p <- res_REACT |> 
+  dplyr::filter(NES > 0, padj < 0.1) |> 
+  dplyr::slice_min(padj, n = 5) |> 
+  dplyr::mutate(pathway = stringr::str_remove(pathway, "REACTOME_")) |> 
+  mutate(logpadj = -log10(padj)) |> 
+  mutate(direction = ifelse(NES > 0, "Upregulated", "Downregulated")) |> 
+  ggplot(aes(x = reorder(pathway, logpadj), y = logpadj, fill = direction)) +
+  geom_col() +
+  coord_flip() + 
+  mytheme$standard_new()+
+  theme(axis.text = element_text(size = 10),
+        axis.title = element_text(size = 12)) + 
+  labs(title = "Top 10 REACTOME Pathways",
+       x = "Pathway",
+       y = "NES")
+
+q <- res_REACT |> 
+  dplyr::filter(NES < 0, padj < 0.1) |> 
+  dplyr::slice_max(padj, n = 5) |> 
+  dplyr::mutate(pathway = stringr::str_remove(pathway, "REACTOME_")) |> 
+  mutate(logpadj = -log10(padj)) |> 
+  mutate(direction = ifelse(NES > 0, "Upregulated", "Downregulated")) |> 
+  ggplot(aes(x = reorder(pathway, logpadj), y = logpadj, fill = direction)) +
+  geom_col() +
+  coord_flip() +
+  # smaller text
+    mytheme$standard_new()+
+  theme(axis.text = element_text(size = 10),
+        axis.title = element_text(size = 12)) + 
+  labs(x = "Pathway",
+       y = "logpadj")
+
+fig <- p + q
+print(fig)
+fn <- "REACTOME_pathways.png"
+do.call(ggsave, c(list(fn, fig), plotsave_param_large))
+
+tests <- c("REACTOME_UNFOLDED_PROTEIN_RESPONSE_UPR", 
+    "REACTOME_CELLULAR_RESPONSE_TO_MITOCHONDRIAL_STRESS",
+    "REACTOME_CELLULAR_SENESCENCE", 
+    "REACTOME_OXIDATIVE_STRESS_INDUCED_SENESCENCE",
+    "REACTOME_CELLULAR_RESPONSE_TO_HYPOXIA",
+    "REACTOME_CELLULAR_RESPONSE_TO_CHEMICAL_STRESS",
+    "REACTOME_MITOCHONDRIAL_UNFOLDED_PROTEIN_RESPONSE_UPRMT",
+    "REACTOME_RESPONSE_OF_EIF2AK1_HRI_TO_HEME_DEFICIENCY",
+    "REACTOME_CELLULAR_RESPONSE_TO_STARVATION",
+    "REACTOME_HEME_SIGNALING",
+    "REACTOME_HSP90_CHAPERONE_CYCLE_FOR_STEROID_HORMONE_RECEPTORS_SHR_IN_THE_PRESENCE_OF_LIGAND")
+
+fgseaRes_REACT |> 
+  as_tibble() |> 
+  filter(pathway %in% tests) |> 
+  arrange(pval)
+
+# Enrichment as many RPL/RPS proteins are affected. Likely similar to translation inhibition.
+fgseaRes_REACT |> 
+  as_tibble() |> 
+  filter(pathway == "REACTOME_CELLULAR_RESPONSE_TO_STARVATION") |> 
+  pull(leadingEdge)
+
+# REACTOME_UNFOLDED_PROTEIN_RESPONSE_UPR: P = 0.79; padj = 0.93.
+```
+
+
+
+## A2.5: Go-term enrichment analysis.
+
+
+```{r go-term-enrichment}
+# GO-term enrichment analysis.
+gene_sets_df <- msigdbr::msigdbr(species = "Homo sapiens", category = "C5", subcategory = "GO:BP")
+gene_sets <- gene_sets_df %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+# FGSEA
+set.seed(222)
+fgseaRes_GO <- fgsea(gene_sets, ranks, scoreType = "std", eps = 0, minSize = 3, maxSize = 1000, nPermSimple = 100000)
+
+fgseaRes_GO |> 
+  as_tibble() |> 
+  arrange(padj)
+
+## top5:
+top5 <- fgseaRes_GO |> 
+  as_tibble() |> 
+  arrange(padj) |> 
+  filter(ES > 0) |> 
+  slice_min(padj, n = 5) |> pull(pathway)
+
+min5 <- fgseaRes_GO |> 
+  as_tibble() |> 
+  arrange(padj) |> 
+  filter(ES < 0) |> 
+  slice_min(padj, n = 5) |> 
+  pull(pathway)
+
+go_terms <- fgseaRes_GO |> 
+  as_tibble() |> 
+  filter(grepl("UNFOLDED", pathway) | pathway %in% top5 | pathway %in% min5) |> 
+  dplyr::mutate(pathway = stringr::str_remove(pathway, "GOBP_")) |> 
+  arrange(padj)  |> 
+  mutate(logpadj = -log10(padj)) |> 
+  mutate(direction = ifelse(NES > 0, "Upregulated", "Downregulated")) |> 
+  ggplot(aes(x = reorder(pathway, logpadj), y = logpadj, fill = direction)) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  geom_col() +
+  coord_flip() +
+  # smaller text
+  mytheme$standard_new()+
+  labs(x = "GO_BP Term",
+       y = "logpadj",
+       fill = "Direction") + 
+  theme(legend.position = "top") + 
+  theme(#axis.text = element_text(size = 10),
+        axis.title = element_text(size = 32),
+        legend.text = element_text(size = 32),
+        legend.title = element_text(size = 35))
+
+print(go_terms)
+fn <- "GOBP_UNFOLDED_PROTEIN_RESPONSE.png"
+do.call(ggsave, c(list(fn, go_terms), plotsave_param_large))
+
+saveRDS(go_terms, file.path(paths$home_git, "figures", "rev_supplfig3c.rds"))
+```
+
+
+
+# A3: Run TF activity.
+
+Next, to further show the absence of specific ER-stress TF activities, 
+we will analyze TF activities of the HPAP scRNA-seq dataset.
+
+## A3.1 Get curated TF regulons.
+
+Use curated collectri TF collection from Sophia via decoupleR.
+
+```{r get-collectri}
+gc()
+net <- decoupleR::get_collectri(organism = 'human', 
+                                split_complexes = FALSE)
+
+net
+```
+
+## A3.2 Run TF activities.
+
+Use a simple univariate LM in decoupleR.
+Use t-statistics from DESeq2 results as input.
+```{r run-ulm-decoupleR}
+# Run ulm
+deg <- input_df |> as.data.frame()
+rownames(deg) <- input_df$SYMBOL
+
+# Run ulm
+contrast_acts <- decoupleR::run_ulm(mat = deg[, 'stat', drop = FALSE], 
+                                    net = net, 
+                                    .source = 'source', 
+                                    .target = 'target',
+                                    .mor='mor',
+                                    minsize = 5)
+```
+
+## A3.3: Get results.
+
+Check results; especially STAT1 (IFN), beta-cell lineage TFs (PDX1/NKX6.1)
+and ATF6, XBP1.
+
+```{r check-contrast-acts}
+contrast_acts |> 
+  filter(source %in% unique(c(main_markers, pos_genes)))
+
+contrast_acts |> filter(source == "LONP1")
+
+interactions <- OmnipathR::import_all_interactions( 
+  resources = c('SIGNOR'),
+  organism = 9606
+  )
+```
+
+## A3.4: Plot Results.
+```{r}
+# Filter top TFs in both signs
+n_tfs <- 10
+f_contrast_acts <- contrast_acts %>%
+                   dplyr::mutate(rnk = NA)
+
+msk <- f_contrast_acts$score > 0
+
+f_contrast_acts[msk, 'rnk'] <- rank(-f_contrast_acts[msk, 'score'])
+f_contrast_acts[!msk, 'rnk'] <- rank(-abs(f_contrast_acts[!msk, 'score']))
+
+tfs <- f_contrast_acts %>%
+       dplyr::arrange(rnk) %>%
+       head(n_tfs) %>%
+       dplyr::pull(source)
+
+f_contrast_acts <- f_contrast_acts %>%
+                   filter(source %in% c(tfs, pos_genes, main_markers))
+
+colors <- rev(RColorBrewer::brewer.pal(n = 11, name = "RdBu")[c(2, 10)])
+
+p <- ggplot2::ggplot(data = f_contrast_acts, 
+                     mapping = ggplot2::aes(x = stats::reorder(source, score), 
+                                            y = score)) + 
+     ggplot2::geom_bar(mapping = ggplot2::aes(fill = score),
+                       color = "black",
+                       stat = "identity") +
+     ggplot2::scale_fill_gradient2(low = colors[1], 
+                                   mid = "whitesmoke", 
+                                   high = colors[2], 
+                                   midpoint = 0) + 
+     ggplot2::xlab("Transcription factors") + 
+     ggplot2::ylab("Activity score (ULM)") + 
+     theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+     mytheme$large_new()
+
+print(p)
+fn <- "TF_activity_plot.png"
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+saveRDS(p, file.path(paths$home_git, "figures", "rev_supplfig3d.rds"))
+```
+
+```{r}
+tf <- 'STAT1'
+
+df <- net %>%
+      dplyr::filter(source == tf) %>%
+      dplyr::arrange(target) %>%
+      dplyr::mutate(ID = target, color = "3") %>%
+      tibble::column_to_rownames('target')
+
+inter <- sort(dplyr::intersect(rownames(deg), rownames(df)))
+
+df <- df[inter, ]
+
+df[,c('logfc', 't_value', 'p_value')] <- deg[inter, c("log2FoldChange", "stat", "pvalue")]
+
+df <- df %>%
+  dplyr::mutate(color = dplyr::if_else(mor > 0 & t_value > 0, '1', color)) %>%
+  dplyr::mutate(color = dplyr::if_else(mor > 0 & t_value < 0, '2', color)) %>%
+  dplyr::mutate(color = dplyr::if_else(mor < 0 & t_value > 0, '2', color)) %>%
+  dplyr::mutate(color = dplyr::if_else(mor < 0 & t_value < 0, '1', color))
+
+colors <- rev(RColorBrewer::brewer.pal(n = 11, name = "RdBu")[c(2, 10)])
+
+p <- ggplot2::ggplot(data = df, 
+                     mapping = ggplot2::aes(x = logfc, 
+                                            y = -log10(p_value), 
+                                            color = color,
+                                            size = abs(mor))) + 
+     ggplot2::geom_point(size = 2.5, 
+                         color = "black") + 
+     ggplot2::geom_point(size = 1.5) +
+     ggplot2::scale_colour_manual(values = c(colors[2], colors[1], "grey")) +
+     ggrepel::geom_label_repel(mapping = ggplot2::aes(label = ID,
+                                                      size = 1)) + 
+     ggplot2::theme_minimal() +
+     ggplot2::theme(legend.position = "none") +
+     ggplot2::geom_vline(xintercept = 0, linetype = 'dotted') +
+     ggplot2::geom_hline(yintercept = 0, linetype = 'dotted') +
+     ggplot2::ggtitle(tf)
+
+p
+```

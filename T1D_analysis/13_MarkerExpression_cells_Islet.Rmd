@@ -1,0 +1,1400 @@
+---
+title: "13_MarkerExpression_cells_Islet"
+author: "Nathan Steenbuck, Nicolas Damond"
+date: "Created: 24 May, 2022; Compiled: `r format(Sys.time(), '%d %b, %Y')`"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+if (rstudioapi::isAvailable()) {
+  script_name <- basename(rstudioapi::getSourceEditorContext()$path)
+} else {
+  script_name <- knitr::current_input()
+}
+
+cur_user <- Sys.info()[["user"]]
+script_name <- "13_MarkerExpression_cells_Islet.Rmd"
+
+if (cur_user == "ubuntu") {
+  source(file.path("/", "mnt", "central_nas", "projects", "type1_diabetes", "nathan", 
+                   "T1D_Vol", "T1D_analysis", "analysis", "helpers.R"))
+  #n_cores <- future::availableCores() - 1
+  n_cores <- 4
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  knitr::opts_knit$set(root_dir = paths$home_data)
+  do_print <- FALSE
+} else {
+  source(file.path("/", "home", "nsteen", "scripts", "T1D_analysis", "analysis", "helpers.R"))
+  n_cores <- 8
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  paths$folder_script <- paths$cluster_folder_script
+  paths$folder_in <- paths$cluster_folder_in
+  paths$folder_out <- paths$cluster_home 
+  knitr::opts_knit$set(root_dir = paths$cluster_home)
+  do_print <- TRUE
+}
+
+seed <- 123456
+set.seed(seed)
+options <- furrr::furrr_options(seed = seed)
+paths$prev <- paste("08_SubclusteringBeta", paths$object_type, paths$panel_type, sep = "_")
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Rscript -e "rmarkdown::render('T1D_analysis/analysis/13_MarkerExpression_cells_Islet.Rmd')"
+
+
+# **Goal**
+
+Examine protein abundance. 
+The marker expression levels are plotted in function of cell types, donors, T1D stages and distance to islet edge.  
+
+Current data representations:
+* Heatmaps (annotated by cell type, donor and stage).
+* Cell type comparison (boxplots, violin plots, density plots).
+* Case and stage comparison (boxplots, violin plots, density plots).
+* Distance to islet edge (scatter plots).
+
+
+# **A0: Settings and Data**
+
+## Load packages
+
+```{r packages, results='hide'}
+suppressPackageStartupMessages(c(
+  library(data.table),
+  library(dplyr),
+  library(SpatialExperiment),
+  library(scuttle),
+  library(parallel),
+  library(patchwork),
+  library(tidyr),
+  library(emmeans)
+))
+```
+
+## Paths and settings
+
+```{r settings}
+# Paths
+if (!dir.exists(paths$folder_script)) dir.create(paths$folder_script)
+plotsave_param$path <- paths$folder_script
+plotsave_param_large$path <- paths$folder_script
+
+# Misc settings
+today <- gsub("-", "", Sys.Date())
+emm_options(lmerTest.limit = 10000)
+```
+
+##  Read in the data
+
+Load the SpatialExperiment (SPE) object saved at the previous step.
+
+```{r load-data}
+fn_spe <- file.path(paths$folder_out, paths$prev, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+spe <- readRDS(fn_spe)
+print(spe)
+```
+
+## Parameters
+
+**Note: this step has to be manually adapted**  
+
+- Define the assay(s) of interest.  
+- Define the markers to keep for marker expression analysis.  
+
+```{r parameters}
+# Censor value for counts scaling
+censor_val <- 0.999
+
+# Select assays and reduced dimensions
+assay_sel <- c("exprs", "scaled")
+writeLines(c("Assay:", assay_sel[assay_sel %in% assayNames(spe)]))
+
+# Variables to plot
+plot_variables <- c("donor_type", "case_id")
+names(plot_variables) <- c("stages", "cases")
+cat("\nVariables to plot:", plot_variables)
+plot_variables_stages <- plot_variables["stages"]
+
+# List of cell types to plot
+celltypes <- names(metadata(spe)$channels)
+names(celltypes) <- celltypes
+
+# Color palette
+palette_ct <- palettes$colors[seq_along(celltypes)]
+names(palette_ct) <- celltypes
+
+# All channels to display
+channels <- unique(unlist(metadata(spe)$channels))
+```
+
+## Subset the SCE
+
+Retain only celltypes of interest.
+That is, Beta, Alpha, Delta, Acinar, Ductal, Endothelial and islet.
+```{r subset-spe}
+sce_sub <- as(spe, "SingleCellExperiment")
+sce_sub <- sce_sub[channels, sce_sub$cell_type %in% celltypes]
+remove_panreatitis <- TRUE
+if (remove_panreatitis) {
+  sce_sub <- sce_sub[, sce_sub$donor_type != "Pancreatitis"]
+}
+sce_sub$donor_type <- factor(sce_sub$donor_type, levels = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration")) # , "Pancreatitis"))
+```
+
+
+# **A1: Prepare the data**
+
+## Functions
+
+Aggregate the expression ("counts") by cell type and case or stage.
+Then, perform arcsinh transformation and scaling (99% quantile).
+
+### Aggregate SPE objects.
+
+```{r function-aggregate-SPE}
+aggregate_val <- function(x, cluster_col, aggreg_col, .channels,
+                          stats = "mean", assay_type = "counts") {
+  x <- scuttle::aggregateAcrossCells(
+    x, ids = DataFrame(
+      SampleId = x[[cluster_col]], x[[aggreg_col]]),
+    subset.row = .channels, statistics = stats,
+    use.assay.type = assay_type, use.dimred = FALSE
+  )
+  colnames(x) <- paste(x[[cluster_col]], x[[aggreg_col]], sep = "_")
+  return(x)
+}
+```
+
+### Transform and scale counts
+
+```{r function-transform-counts}
+transf_counts <- function(x, censor_val = 0.99) {
+  assay(x, "exprs") <- asinh(assay(x, "counts"))
+  
+  quant <- apply(assay(x, "counts"), 1,
+                 quantile, probs = censor_val)
+  assay(x, "scaled") <- apply(assay(x, "counts"), 2, function(x) x / quant)
+  assay(x, "scaled")[assay(x, "scaled") > 1] <- 1
+  assay(x, "scaled")[assay(x, "scaled") < 0] <- 0
+  return(x)
+}
+```
+
+## Summarize 
+
+### By cell type and stage
+
+Average marker expression per cell type and **stage.**
+
+```{r summarize-celltype-stage}
+sce_ct_stage <- aggregate_val(
+  sce_sub, "cell_type", "donor_type", channels
+)
+sce_ct_stage <- transf_counts(sce_ct_stage, censor_val)
+```
+
+### By cell type and case
+
+Average marker expression per cell type and **case.**
+
+```{r summarize-celltype-case}
+sce_ct_case <- aggregate_val(
+  sce_sub, "cell_type", "case_id", channels
+)
+sce_ct_case <- transf_counts(sce_ct_case, censor_val)
+```
+
+### By cell type and Islet
+
+Average marker expression per cell type and Islet.
+For this we take the average of all cells across the **image_id**.
+One image may contain multiple islets, but this corrects for small islets, which skews averages.
+```{r summarize-celltype-case2}
+sce_ct_islet <- aggregate_val(
+  sce_sub, "cell_type", "image_id", channels)
+sce_ct_islet <- transf_counts(sce_ct_islet, censor_val)
+```
+
+## Aggregate whole-islets.
+-> Used for pseudotime-analysis of whole-islets.
+Assign cells based on distance into 4 bins.
+```{r infiltration-islets-prep}
+distances <- c("inside", "< 20 um", "20-40 um", "> 40 um")
+names(distances) <- RColorBrewer::brewer.pal(8, "Spectral")[c(1, 3, 4, 6)]
+print(distances)
+
+bins <- c(0, -20, -40)
+sce_sub$infiltration <- ifelse(
+  sce_sub$distance_to_islet > bins[1], distances[1],
+  ifelse(
+    sce_sub$distance_to_islet < bins[1] & sce_sub$distance_to_islet >= bins[2], distances[2],
+    ifelse(
+      sce_sub$distance_to_islet < bins[2] & sce_sub$distance_to_islet >= bins[3], distances[3],
+      distances[4])
+    ))
+sce_sub$infiltration <- factor(sce_sub$infiltration, levels = distances)
+```
+
+Aggregate and transform counts.
+```{r summarize-celltype-case3}
+sce_ct_islet_cat <- aggregate_val(
+  sce_sub, "infiltration", "image_id", rownames(sce_sub))
+sce_ct_islet_cat <- transf_counts(sce_ct_islet_cat, censor_val)
+```
+
+
+Subselect to Markers of interest. Select Whole-Islets & save.
+```{r markers-oi-islets}
+## Select only Islet -> sub-select to channels of interest and save.
+channels_oi <- c(# Beta
+                 "INS", "ProINS", "Cpep", "IAPP", "PCSK1", "PDX1", "NKX6_1", 
+                 # Islet
+                 "ARX", "CHGA", "SYP", "ECad", "NKX2_2", "FoxA2", "PAX6",
+                 # Inflammation.
+                 "HLA_ABC", "B2M", "ADAR", "HBP", "CD155", "XBP1", "NFkB", "MX1",
+                 # Alpha + Others
+                 "GCG", "ProGCG", "PCSK2", "SST", "VIM", "CAV1")
+                 # not included: "Ki67, PDL1, CD9, ERN1, TXNIP, WFS1, ATPIF1", AMY, KRT19, CFTR.
+islet_sce <- sce_ct_islet_cat[channels_oi, sce_ct_islet_cat$infiltration == "inside"]
+metadata(islet_sce)$channels <- channels_oi 
+
+fn <- file.path(paths$folder_script, paste0("sce_ct_islet_inside", "_", paths$object_type, "_", paths$panel_type, ".rds"))
+saveRDS(islet_sce, fn)
+
+# Add islet-sce to sces.
+# sces$Islet <- NULL
+# test_sces <- c(sces, list(islet_sce))
+# names(test_sces) <- c(names(sces), "Islet")
+
+# Save & Update.
+# fn_sces <- file.path(paths$folder_out, "12_CellTypeSCEs_cells_Islet", paste0("celltypes", "_", paths$panel_type, ".rds"))
+# saveRDS(test_sces, fn_sces)
+```
+
+
+# **A3: Visualize marker expression on heatmaps**
+
+```{r packages2, results='hide'}
+suppressPackageStartupMessages(c(
+  library(ggplot2),
+  library(viridis),
+  library(heatmaply),
+  library(dittoSeq),
+  library(ggridges)
+))
+```
+```{r save_rds, results='hide'}
+# save sce_ct_case
+fn_sce_ct_case <- file.path(paths$folder_script, paste0("sce_ct_case", "_", paths$object_type, "_", paths$panel_type, ".rds"))
+saveRDS(sce_ct_case, fn_sce_ct_case)
+# sce_ct_case <- readRDS(fn_sce_ct_case)
+
+# save sce_ct_stage
+fn_sce_ct_stage <- file.path(paths$folder_script, paste0("sce_ct_stage", "_", paths$object_type, "_", paths$panel_type, ".rds"))
+saveRDS(sce_ct_stage, fn_sce_ct_stage)
+# sce_ct_stage <- readRDS(fn_sce_ct_stage)
+
+# save sce_ct_islet:
+fn_sce_ct_islet <- file.path(paths$folder_script, paste0("sce_ct_islet", "_", paths$object_type, "_", paths$panel_type, ".rds"))
+saveRDS(sce_ct_islet, fn_sce_ct_islet)
+# sce_ct_islet <- readRDS(fn_sce_ct_islet)
+```
+
+## A3.1: Heatmaply
+
+### A3.1.1: Heatmaps by stage
+
+```{r heatmap-stages, warning=FALSE}
+plot_cols <- c("cell_type", "donor_type")
+
+hmlist <- list()
+purrr::iwalk(assay_sel, \(cur_assay, idx) {
+  hm <- makePerCellDF(sce_ct_stage, features = channels,
+                      assay.type = cur_assay,
+                      use.dimred = FALSE)[, c(plot_cols, channels)]
+
+  # Row-side colors
+  rowsidecol <- hm[, plot_cols]
+  hm <- hm[, !colnames(hm) %in% plot_cols]
+  rowsidepal <- transform(rowsidecol,
+                          cell_type = match(cell_type, names(palette_ct)),
+                          donor_type = match(donor_type, names(palettes$stages)))
+  rowsidepal <- transform(rowsidepal,
+                          cell_type = palette_ct[cell_type],
+                          donor_type = palettes$stages[donor_type])
+  
+  # Plot
+  fn <- paste0(paste(today, "Heatmap", "CellType", "Stage", cur_assay,
+                     sep = "_"), ".html")
+  hmlist[[idx]] <- heatmaply::heatmaply(
+    heatmaply::normalize(hm),
+    RowSideColors = rowsidepal,
+    main = paste("Cell types", "Stages", cur_assay, sep = " - "),
+    showticklabels = c(TRUE, FALSE),
+    file = file.path(paths$folder_script, fn))
+})
+htmltools::tagList(setNames(hmlist, NULL))
+```
+
+### A3.1.2: Heatmaps by case
+Remember: Heatmaps are either "exprs" or "scaled" data. 
+For visualization they are again scaled between 0 and 1.
+```{r heatmap-cases, warning=FALSE}
+plot_cols <- c("cell_type", "donor_type", "case_id")
+
+hmlist <- list()
+purrr::iwalk(assay_sel, \(cur_assay, idx) {
+  hm <- makePerCellDF(sce_ct_case, features = channels,
+                      assay.type = cur_assay,
+                      use.dimred = FALSE)[, c(plot_cols, channels)]
+
+  # Row-side colors
+  rowsidecol <- hm[, plot_cols]
+  hm <- hm[, !colnames(hm) %in% plot_cols]
+  rowsidepal <- transform(rowsidecol,
+                          cell_type = match(cell_type, names(palette_ct)),
+                          donor_type = match(donor_type, names(palettes$stages)),
+                          case_id = match(case_id, names(palettes$cases)))
+  rowsidepal <- transform(rowsidepal,
+                          cell_type = palette_ct[cell_type],
+                          donor_type = palettes$stages[donor_type],
+                          case_id = palettes$cases[case_id])
+  
+  # Plot
+  fn <- paste0(paste(today, "Heatmap", "CellType", "Case", cur_assay,
+                     sep = "_"), ".html")
+  hmlist[[idx]] <- heatmaply(
+    heatmaply::normalize(hm),
+    RowSideColors = rowsidepal,
+    main = paste("Cell type", "Cases", cur_assay, sep = " - "),
+    showticklabels = c(TRUE, FALSE),
+    file = file.path(paths$folder_script, fn))
+})
+htmltools::tagList(setNames(hmlist, NULL))
+```
+
+
+## A3.2: dittoHeatmap
+
+### A3.2.1: Heatmaps by stage
+                     
+```{r dittoheatmap-stages}
+purrr::walk(assay_sel, \(cur_assay) {
+  # Non-scaled
+  fn1 <- paste0(paste(today, "HeatmapDitto", "CellType", "Stage", cur_assay, 
+                      "NotScaled", sep = "_"), ".png")
+  
+  h1 <- list(object = sce_ct_stage, assay = cur_assay,
+             annot.by = c("cell_type", "donor_type"),
+             annotation_colors = list(cell_type = palette_ct,
+                                      donor_type = palettes$stages),
+             scale = "none", heatmap.colors = viridis(100),
+             #cluster_cols = TRUE,
+             main = paste("Cell type - Not scaled -", cur_assay),
+             plot_method = "plotly")
+  if (do_print) do.call(dittoHeatmap, h1)
+  do.call(dittoHeatmap, c(h1, filename = file.path(paths$folder_script, fn1)))
+  
+  # Centered and scaled
+  fn2 <- paste0(paste(today, "HeatmapDitto", "CellType", "Stage", cur_assay, 
+                      "CenteredScaled", sep = "_"), ".png")
+
+  h2 <- list(object = sce_ct_stage, assay = cur_assay,
+             annot.by = c("cell_type", "donor_type"),
+             annotation_colors = list(cell_type = palette_ct,
+                                      donor_type = palettes$stages),
+             #cluster_cols = TRUE,
+             heatmap.colors = colorRampPalette(c("dark blue", "white",
+                                                 "dark red"))(100),
+             breaks = seq(-3, 3, length.out = 101),
+             main = paste("Cell type - Centered and Scaled -", cur_assay))
+  if (do_print) do.call(dittoHeatmap, h2)
+  do.call(dittoHeatmap, c(h2, filename = file.path(paths$folder_script, fn2)))
+  remove(h1, h2)
+})
+```
+
+### A3.2.2: Heatmaps by case
+                     
+```{r dittoheatmap-cases}
+purrr::walk(assay_sel, \(cur_assay) {
+  # Non-scaled
+  fn1 <- paste0(paste(today, "HeatmapDitto", cur_assay, "CellType", "Case",
+                      "NotScaled", sep = "_"), ".png")
+  
+  h1 <- list(object = sce_ct_case, assay = cur_assay,
+             annot.by = c("cell_type", "donor_type", "case_id"),
+             annotation_colors = list(case_id = palettes$cases,
+                                      donor_type = palettes$stages,
+                                      cell_type = palette_ct),
+             scale = "none", heatmap.colors = viridis(100),
+             cluster_cols = TRUE,
+             main = paste("Cell type - Not scaled -", cur_assay),
+             plot_method = "plotly")
+  if (do_print) do.call(dittoHeatmap, h1)
+  do.call(dittoHeatmap, c(h1, filename = file.path(paths$folder_script, fn1)))
+  
+  # Centered and scaled
+  fn2 <- paste0(paste(today, "HeatmapDitto", cur_assay, "CellType", "Case",
+                      "CenteredScaled", sep = "_"), ".png")
+
+  h2 <- list(object = sce_ct_case, assay = cur_assay,
+             annot.by = c("cell_type", "donor_type", "case_id"),
+             annotation_colors = list(case_id = palettes$cases,
+                                      donor_type = palettes$stages,
+                                      cell_type = palette_ct),
+             cluster_cols = TRUE,
+             heatmap.colors = colorRampPalette(c("dark blue", "white",
+                                                 "dark red"))(100),
+             breaks = seq(-3, 3, length.out = 101),
+             main = paste("Cell type - Centered and Scaled -", cur_assay))
+  if (do_print) do.call(dittoHeatmap, h2)
+  do.call(dittoHeatmap, c(h2, filename = file.path(paths$folder_script, fn2)))
+  remove(h1, h2)
+})
+```
+
+# **A4: Marker expression across cell types**
+
+Marker expression is only plot by stage (by case is unreadable if too many cases).
+
+## A4.1: Prepare the data
+
+Convert SCE to melted data frame.
+
+```{r convert-sce-datatable-case}
+dat <- vector(mode = "list", length = length(assay_sel))
+names(dat) <- assay_sel
+
+for (i in seq_along(assay_sel)) {
+  dat[[i]] <- scuttle::makePerCellDF(
+    sce_ct_case,
+    exprs_values = assay_sel[i],
+    features = channels,
+    use.coldata = c("cell_type", plot_variables),
+    use_dimred = FALSE) |>
+    mutate(case_id = factor(case_id, levels = metadata(spe)$cases),
+           donor_type = factor(donor_type, levels = metadata(spe)$stages),
+           cell_type = factor(cell_type, levels = celltypes)) |>
+    arrange(cell_type, case_id, donor_type) |>
+    as.data.table()
+  
+  dat[[i]] <- melt.data.table(
+    dat[[i]],
+    id.vars = c("cell_type", plot_variables),
+    measure.vars = channels,
+    variable.name = "channel",
+    value.name = assay_sel[i]
+  )
+  dat[[i]][, case_id := as.factor(case_id)]
+}
+```
+
+## A4.2: Boxplots
+
+```{r boxplots-celltype, fig.width=15, fig.height=10}
+purrr::iwalk(assay_sel, \(cur_assay, idx) {
+  purrr::iwalk(plot_variables_stages, \(cur_variable, k) {
+    cur_dat <- dat[[idx]]
+    # Take mean of exprs/scaled for each marker
+    # per a) channel and b) 
+    cur_dat[, MeanExprs := mean(get(cur_assay)),
+            by = c(plot_variables[k], "cell_type", "channel")]
+    
+    p <- plot_boxes(cur_dat, x = "cell_type", y = cur_assay, 
+                    fill_by = "MeanExprs", color_by = plot_variables[k],
+                    facet_by = "channel", ncol = 10,
+                    title = paste(plot_variables[k], cur_assay, "Cell types")) +
+      scale_color_manual(values = palettes[[names(plot_variables[k])]])
+    
+    if (do_print) print(p)
+    fn <- paste0(paste(today, "Boxplot", "CellTypes", cur_assay,
+                       names(plot_variables[k]), sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param_large))
+  })
+})
+```
+
+## A4.3: Violin plots
+
+```{r violin-celltype, message=FALSE, warning=FALSE, fig.width=15, fig.height=10}
+purrr::iwalk(assay_sel, \(cur_assay, idx) {
+  purrr::iwalk(plot_variables_stages, \(cur_variable, k) {
+    cur_dat <- dat[[idx]]
+    cur_dat[, MeanExprs := mean(get(cur_assay)),
+            by = c(plot_variables_stages[k], "cell_type", "channel")]
+    
+    p <- plot_violin(cur_dat, x = "cell_type", y = cur_assay, 
+                     fill_by = "MeanExprs", color_by = plot_variables_stages[k],
+                     facet_by = "channel", ncol = 10,
+                     title = paste(plot_variables_stages[k], cur_assay,
+                                   "Cell types")) +
+      scale_color_manual(values = palettes[[names(plot_variables_stages[k])]])
+    
+    fn <- paste0(paste(today, "Violin", "CellTypes", cur_assay,
+                       names(plot_variables_stages[k]), sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param_large))
+    if (do_print) suppressMessages(print(p))
+  })
+})
+```
+
+## A4.4: Violin Plots, without LongDuration
+```{r violin-celltype-woLD}
+purrr::iwalk(assay_sel, \(cur_assay, idx) {
+  purrr::iwalk(plot_variables_stages, \(cur_variable, k) {
+    
+    cur_dat <- dat[[idx]] |> filter(!(cell_type == "Beta" & donor_type == "LongDuration"))
+    cur_dat[, MeanExprs := mean(get(cur_assay)),
+            by = c(plot_variables_stages[k], "cell_type", "channel")]
+    
+    p <- plot_violin(cur_dat, x = "cell_type", y = cur_assay, 
+                     fill_by = "MeanExprs", color_by = plot_variables_stages[k],
+                     facet_by = "channel", ncol = 10,
+                     title = paste(plot_variables_stages[k], cur_assay,
+                                   "Cell types")) +
+      scale_color_manual(values = palettes[[names(plot_variables_stages[k])]])
+    
+    fn <- paste0(paste(today, "Violin", "CellTypes_noLD", cur_assay,
+                       names(plot_variables_stages[k]), sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param_large))
+    if (do_print) suppressMessages(print(p))
+  })
+})
+```
+
+## A4.5: Figure: Violin Plots, without LongDuration
+Plot only ARX, GCG, PCSK2, ProGCG. 
+```{r violin-celltype-woLD-subset}
+features_oi <- c("ProGCG", "PCSK2", "GCG", "ARX")
+purrr::iwalk(assay_sel, \(cur_assay, idx) {
+  purrr::iwalk(plot_variables_stages, \(cur_variable, k) {
+    
+    cur_dat <- dat[[idx]] |> filter(!(cell_type == "Beta" & donor_type == "LongDuration"))
+    cur_dat <- cur_dat  |> filter(channel %in% features_oi)
+    cur_dat[, MeanExprs := mean(get(cur_assay)),
+            by = c(plot_variables_stages[k], "cell_type", "channel")]
+    
+    p <- plot_violin(cur_dat, x = "cell_type", y = cur_assay, 
+                     fill_by = "MeanExprs", color_by = plot_variables_stages[k],
+                     facet_by = "channel", ncol = 2,
+                     title = paste(plot_variables_stages[k], cur_assay,
+                                   "Cell types"), scales = "free_y") +
+      scale_color_manual(values = palettes[[names(plot_variables_stages[k])]])
+    
+    fn <- paste0(paste(today, "Violin", "CellTypes_noLD", cur_assay,
+                       names(plot_variables_stages[k]), "ARX", sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param))
+    if (do_print) suppressMessages(print(p))
+  })
+})
+```
+
+## A4.6: Density plots
+
+```{r density-celltypes, message=FALSE, warning=FALSE, fig.width=15, fig.height=10}
+purrr::iwalk(assay_sel, \(cur_assay, i) {
+  purrr::iwalk(plot_variables_stages, \(cur_variable, k) {
+    cur_dat <- dat[[i]] |> filter(!(cell_type == "Beta" & donor_type == "LongDuration"))
+    cur_dat <- subset(cur_dat, !is.infinite(cur_assay))
+    cur_dat[, MeanExprs := mean(get(cur_assay)),
+            by = c(plot_variables[k], "cell_type", "channel")]
+    
+    p <- plot_density(cur_dat, x = cur_assay, y = "cell_type", 
+                      fill_by = "MeanExprs", color_by = plot_variables[k],
+                      facet_by = "channel", ncol = 4,
+                      title = paste(plot_variables[k], cur_assay,
+                                    "Cell types")) +
+      scale_color_manual(values = palettes[[names(plot_variables[k])]])
+    
+    fn <- paste0(paste(today, "Density", "CellTypes", cur_assay,
+                       names(plot_variables[k]), sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param_large))
+    if (do_print) suppressMessages(print(p))
+  })
+})
+```
+
+```{r clean-env}
+## Remove unneeded objects
+remove(sce_sub, sce_ct_stage, dat); gc()
+# remove(spe)
+```
+
+
+# **A5: Marker expression by cell type**
+
+## A5.1: Read in the data
+
+Load the list containing one SPE object per cell type.
+
+```{r load-data2}
+# Load the SCE list
+fn_sces <- file.path(paths$folder_out, "12_CellTypeSCEs_cells_Islet", paste0(
+  "celltypes", "_", paths$panel_type, ".rds"))
+sces <- readRDS(fn_sces)
+```
+
+Convert SPEs to SCEs
+
+```{r convert-to-SCEs}
+# sces <- sce_sub[channels, sce_sub$cell_type %in% "Beta"]
+sces <- lapply(sces, as, "SingleCellExperiment")
+print(sces)
+```
+
+## A5.2: Aggregate the data
+
+Aggregate by cell type and case.
+
+```{r aggregate-sces-celltype-case}
+# sces_ct_cases <- aggregate_val(spe, "cell_type", "case_id", NULL)
+# sces_ct_cases <- transf_counts(sces_ct_cases, censor_val)
+sces_ct_cases <- lapply(sces, aggregate_val, "cell_type", "case_id", NULL)
+sces_ct_cases <- lapply(sces_ct_cases, transf_counts, censor_val)
+```
+
+Convert SCEs to melted data frame.
+
+```{r prepare-data-celltype-case}
+prepare_data <- function(cur_sce, cur_assay, variables) {
+  cur_channels <- metadata(cur_sce)$channels
+  # cur_channels <- channels
+  # cur_sce <- sces_ct_cases; assay <- "scaled"; variables <- plot_variables
+  cur_sce <- scuttle::makePerCellDF(
+    cur_sce,
+    features = unlist(cur_channels),
+    assay.type = cur_assay,
+    use.coldata = variables,
+    use_dimred = FALSE) |>
+    dplyr::mutate(case_id = factor(case_id, levels = metadata(cur_sce)$cases),
+                  donor_type = factor(donor_type, levels = metadata(cur_sce)$stages)) |>
+    dplyr::arrange(case_id, donor_type) |>
+    as.data.table()
+    # as_tibble()
+
+  cur_sce <- cur_sce |>
+    melt.data.table(
+      id.vars = variables,
+      measure.vars = cur_channels,
+      variable.name = "channel",
+      value.name = cur_assay
+    )
+  
+  # COMMENT OUT TO INCLUDE PANCREATITIS CASES
+  cur_sce <- cur_sce[cur_sce$donor_type != "Pancreatitis", ]
+  
+  return(cur_sce)
+}
+
+# Aggregate by cell type and case
+dat_ct_cases <- vector(mode = "list", length = length(assay_sel))
+names(dat_ct_cases) <- assay_sel
+
+purrr::walk(assay_sel, \(cur_assay) {
+  dat_ct_cases[[cur_assay]] <<- lapply(
+    sces_ct_cases, prepare_data, cur_assay, plot_variables)
+})
+
+# # Single cell data
+# dat <- vector(mode = "list", length = length(assay_sel))
+# names(dat) <- assay_sel
+# 
+# walk(assay_sel, \(cur_assay)
+#   dat[[cur_assay]] <- lapply(
+#     sces, prepare_data, cur_assay, plot_variables)
+# }
+```
+
+## A5.3: Boxplots
+
+```{r boxplots-celltype-case, fig.width=15, fig.height=10}
+purrr::walk(assay_sel, \(cur_assay) {
+  purrr::walk(celltypes, \(cur_celltype) {
+    purrr::walk2(plot_variables_stages, names(plot_variables_stages), \(cur_variable, name_cur_variable) {
+      
+      cur_dat <- dat_ct_cases[[cur_assay]][[cur_celltype]]
+      cur_dat[, MeanExprs := mean(get(cur_assay)),
+              by = c(cur_variable, "channel")]
+      
+      p <- plot_boxes(cur_dat, x = cur_variable, y = cur_assay, 
+                      fill_by = "MeanExprs",
+                      color_by = cur_variable,
+                      facet_by = "channel", ncol = 10,
+                      title = paste(cur_variable, cur_assay,
+                                    cur_celltype)) +
+        theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+        scale_color_manual(values = palettes[[name_cur_variable]])
+      
+      fn <- paste0(paste(today, "Boxplot", cur_celltype, cur_assay, 
+                         name_cur_variable, sep = "_"), ".png")
+      do.call(ggsave, c(list(fn, p), plotsave_param))
+      if (do_print) print(p)
+    })
+  })
+})
+```
+
+## A5.4: Violin plots
+
+```{r violin-casestage, message=FALSE, warning=FALSE, fig.width=15, fig.height=10}
+purrr::walk(assay_sel, \(cur_assay) {
+  purrr::walk(celltypes, \(cur_celltype) {
+    purrr::walk2(plot_variables_stages, names(plot_variables_stages), \(cur_variable, name_cur_variable) {
+      print(paste(cur_assay, cur_celltype, cur_variable))
+      cur_dat <- dat_ct_cases[[cur_assay]][[cur_celltype]]
+      cur_dat[, MeanExprs := mean(get(cur_assay)),
+              by = c(cur_variable, "channel")]
+      
+      p <- plot_violin(cur_dat, x = cur_variable,
+                       y = cur_assay, fill_by = "MeanExprs",
+                       color_by = cur_variable,
+                       facet_by = "channel", ncol = 10,
+                       title = paste(cur_variable, cur_assay,
+                                     cur_celltype)) +
+        theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+        scale_color_manual(values = palettes[[name_cur_variable]])
+      
+      fn <- paste0(paste(today, "Violin", cur_celltype, cur_assay,
+                         name_cur_variable, sep = "_"), ".png")
+      print(fn)
+      do.call(ggsave, c(list(fn, p), plotsave_param))
+      if (do_print) suppressMessages(print(p))
+    })
+  })
+})
+```
+
+## A5.5: Density plots
+
+```{r density-casestage, message=FALSE, warning=FALSE, fig.width=15, fig.height=10}
+purrr::walk(assay_sel, \(cur_assay) {
+  purrr::walk(celltypes, \(cur_celltype) {
+    purrr::walk2(plot_variables_stages, names(plot_variables_stages), \(cur_variable, name_cur_variable) {
+      
+      cur_dat <- dat_ct_cases[[cur_assay]][[cur_celltype]]
+      cur_dat <- subset(cur_dat, !is.infinite(cur_assay))
+      cur_dat[, MeanExprs := mean(get(cur_assay)),
+              by = c(cur_variable, "channel")]
+      
+      p <- plot_density(cur_dat, x = cur_assay, y = cur_variable, 
+                        fill_by = "MeanExprs",
+                        color_by = cur_variable,
+                        facet_by = "channel", ncol = 4,
+                        title = paste(cur_variable, cur_assay,
+                                      cur_celltype)) +
+        scale_color_manual(values = palettes[[name_cur_variable]])
+      
+      fn <- paste0(paste(today, "Density", cur_celltype, cur_assay,
+                         name_cur_variable, sep = "_"), ".png")
+      do.call(ggsave, c(list(fn, p), plotsave_param))
+      if (do_print) suppressMessages(print(p))
+    })
+  })
+})
+```
+
+## A5.6: Violin-Plots no LD
+Slide: Beta-cell expression markers. 
+```{r violin-casestage-woLD}
+cur_celltype <- "Beta"
+cur_variable <- "donor_type"
+name_cur_variable <- names(plot_variables_stages)[1]
+channels1 <- c("INS", "ProINS", "Cpep", "IAPP", "PCSK1", "PDX1", "NKX6_1", "CHGA", "SYP", "ECad")
+channels2 <- c("HLA_ABC", "B2M", "CD155", "WFS1", "ATPIF1", "NFkB", "TXNIP", "XBP1", "ERN1")
+ll <- list(channels1, channels2)
+names(ll) <- c("BetaMarkers", "FunctionalMarkers")
+## Keep: ProINS, Cpep, IAPP, PDX1, NKX6.1, SYP, E-CDH, HLA-ABC, B2M
+
+## Beta-cells only.
+purrr::walk2(ll, names(ll), \(channels, names_channels) {
+  purrr::walk(assay_sel, \(cur_assay) {
+    print(paste(cur_assay, cur_celltype, cur_variable))
+    cur_dat <- dat_ct_cases[[cur_assay]][[cur_celltype]]
+    cur_dat <- cur_dat |> filter(!(donor_type == "LongDuration")) |> 
+      filter(channel %in% channels)
+    cur_dat[, MeanExprs := mean(get(cur_assay)),
+            by = c(cur_variable, "channel")]
+    
+    p <- plot_violin(cur_dat, x = cur_variable,
+                     y = cur_assay, fill_by = "MeanExprs",
+                     color_by = cur_variable,
+                     facet_by = "channel", ncol = 5,
+                     title = paste(cur_variable, cur_assay,
+                                   cur_celltype), scales = "free_y") +
+      theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+      scale_color_manual(values = palettes[[name_cur_variable]])
+    
+    fn <- paste0(paste(today, "Violin", cur_celltype, cur_assay,
+                      name_cur_variable, names_channels, "figure", sep = "_"), ".png")
+    print(fn)
+    do.call(ggsave, c(list(fn, p), plotsave_param))
+    if (do_print) suppressMessages(print(p))
+  })
+})
+```
+
+# **A6: Co-expression in beta-cells
+## A6.1: Helper Functions
+Helper Functions to generate co-expression matrices and draw complex heatmaps.
+```{r helper_funcs}
+calc_coexpression <- function(data, title) {
+  data_wide <- data  |> as.data.frame()
+  rownames(data_wide) <- data_wide[, 1]
+  data_wide <- data_wide[, -c(1)]
+  
+  # Calculate the co-expression matrix (correlation between rows)
+  coexpr_matrix <- cor(t(data_wide), method = "spearman")  # or "spearman"
+}
+
+draw_complexheatmap <- function(coexpr_matrix, title) {
+# Generate the heatmap & save
+# plotsave_param
+  fn <- file.path(paths$folder_script, paste0(paste(today, title, sep = "_"), ".png"))
+  png(fn, width = 1200, height = 800)
+  p <- ComplexHeatmap::Heatmap(coexpr_matrix, name = "Co-expression", col = circlize::colorRamp2(c(-1, 0, 1), c("blue", "white", "red")),
+                                show_row_names = TRUE, show_column_names = TRUE,
+                                cluster_rows = TRUE, cluster_columns = TRUE,
+                                row_names_gp = grid::gpar(fontsize = 20, fontfamily = "Arial"),
+                                column_names_gp = grid::gpar(fontsize = 20, fontfamily = "Arial"), 
+                                heatmap_legend_param = list(legend_direction = "horizontal",
+                                                            title_position = "topcenter",
+                                                            title_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"),
+                                                            labels_gp = grid::gpar(fontsize = 30, fontfamily = "Arial")),                             
+                              row_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for rows
+                              column_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for columns
+                              row_names_side = "left",
+                              row_dend_side = "right")
+  ComplexHeatmap::draw(p, heatmap_legend_side = "top", 
+                        padding = unit(c(12, 12, 2, 2), "mm"))  # right and bottom padding
+  dev.off()
+}
+```
+
+## A6.2: Coexpression by donors 
+By Donors and across all stages.
+```{r co-expression-beta}
+### Sample-wide
+channels <- metadata(spe)$channels$Beta
+cur_assay <- "exprs"; cur_celltype <- "Beta"
+cur_dat <- dat_ct_cases[[cur_assay]][[cur_celltype]] |> 
+  filter(!(donor_type == "LongDuration")) |> 
+  filter(channel %in% channels)
+
+## Generate a correlation matrix
+data_wide <- cur_dat  |> tidyr::pivot_wider(id_cols = c(channel), names_from = case_id, values_from = exprs)
+
+# Calculate the co-expression matrix (correlation between rows)
+coexpr_matrix <- calc_coexpression(data_wide, title = NULL)
+draw_complexheatmap(coexpr_matrix, "coexpression_beta_sample")
+```
+
+```{r coexprs-samples-matrices}
+beta_df <- scuttle::makePerCellDF(sce_ct_islet, features = channels, assay.type = "exprs", use.dimred = FALSE) |> 
+  as_tibble() |> 
+  filter(cell_type == "Beta") |>
+  group_by(case_id, donor_type) |> 
+  summarise(across(all_of(channels), mean))
+
+ro_df <- beta_df |> filter(donor_type == "RecentOnset")  |> select(-c(ARX))
+ro_df <- ro_df  |> tidyr::pivot_longer(cols = c(all_of(channels[channels != "ARX"])), names_to = "channel", values_to = "MeanExprs")
+ro_df <- ro_df |> dplyr::distinct(channel, case_id, MeanExprs) |> tidyr::pivot_wider(id_cols = c(channel), names_from = case_id, values_from = MeanExprs)
+
+maab_df <- beta_df |> filter(donor_type == "mAAb+") |> select(-c(ARX))
+maab_df <- maab_df  |> tidyr::pivot_longer(cols = c(all_of(channels[channels != "ARX"])), names_to = "channel", values_to = "MeanExprs")
+maab_df <- maab_df |> dplyr::distinct(channel, case_id, MeanExprs) |> tidyr::pivot_wider(id_cols = c(channel), names_from = case_id, values_from = MeanExprs)
+
+nd_df <- beta_df |> filter(donor_type == "NoDiabetes")|> select(-c(ARX))
+nd_df <- nd_df  |> tidyr::pivot_longer(cols = c(all_of(channels[channels != "ARX"])), names_to = "channel", values_to = "MeanExprs")
+nd_df <- nd_df |> dplyr::distinct(channel, case_id, MeanExprs) |> tidyr::pivot_wider(id_cols = c(channel), names_from = case_id, values_from = MeanExprs)
+
+coexpr_matrix3_s <- calc_coexpression(ro_df, "coexpression_beta_maab_sample")
+coexpr_matrix2_s <- calc_coexpression(ro_df, "coexpression_beta_RO_sample")
+coexpr_matrix1_s <- calc_coexpression(nd_df, "coexpression_beta_ND_sample")
+
+draw_complexheatmap(coexpr_matrix3_s, "coexpression_beta_maab_sample")
+draw_complexheatmap(coexpr_matrix2_s, "coexpression_beta_RO_sample")
+draw_complexheatmap(coexpr_matrix1_s, "coexpression_beta_ND_sample")
+
+diffmap <- coexpr_matrix2_s - coexpr_matrix1_s
+draw_complexheatmap(diffmap, "coexpression_beta_diff_sample")
+```
+
+## A6.3: Coexpression by ROI.
+
+Get Co-Expression of Beta-cells per ROI.
+Plot Heatmap for:
+- ND. 
+- RecentOnset
+- Difference between the two.
+```{r corr_donor_type}
+## Get Beta-cell Islet expression value 
+beta_df <- scuttle::makePerCellDF(sce_ct_islet, features = channels, assay.type = "exprs", use.dimred = FALSE) |> 
+  as_tibble() |> 
+  filter(cell_type == "Beta") |>
+  select(case_id, donor_type, image_id, HbA1c, Cpep, all_of(channels))
+
+ro_df <- beta_df |> filter(donor_type == "RecentOnset")  |> select(-c(ARX))
+ro_df <- ro_df  |> tidyr::pivot_longer(cols = c(all_of(channels[channels != "ARX"])), names_to = "channel", values_to = "MeanExprs")
+ro_df <- ro_df |> dplyr::distinct(channel, image_id, MeanExprs) |> tidyr::pivot_wider(id_cols = c(channel), names_from = image_id, values_from = MeanExprs)
+
+nd_df <- beta_df |> filter(donor_type == "NoDiabetes") |> select(-c(ARX))
+nd_df <- nd_df  |> tidyr::pivot_longer(cols = c(all_of(channels[channels != "ARX"])), names_to = "channel", values_to = "MeanExprs")
+nd_df <- nd_df |> dplyr::distinct(channel, image_id, MeanExprs) |> tidyr::pivot_wider(id_cols = c(channel), names_from = image_id, values_from = MeanExprs)
+
+maa_df <- beta_df |> filter(donor_type == "mAAb+") |> select(-c(ARX))
+maa_df <- maa_df  |> tidyr::pivot_longer(cols = c(all_of(channels[channels != "ARX"])), names_to = "channel", values_to = "MeanExprs")
+maa_df <- maa_df |> dplyr::distinct(channel, image_id, MeanExprs) |> tidyr::pivot_wider(id_cols = c(channel), names_from = image_id, values_from = MeanExprs)
+
+coexpr_matrix3 <- calc_coexpression(ro_df, "coexpression_beta_maab")
+coexpr_matrix2 <- calc_coexpression(ro_df, "coexpression_beta_RO")
+coexpr_matrix1 <- calc_coexpression(nd_df, "coexpression_beta_ND")
+
+draw_complexheatmap(coexpr_matrix3, "coexpression_beta_maab")
+draw_complexheatmap(coexpr_matrix2, "coexpression_beta_RO")
+draw_complexheatmap(coexpr_matrix1, "coexpression_beta_ND")
+
+diffmap <- coexpr_matrix2 - coexpr_matrix1
+draw_complexheatmap(diffmap, "coexpression_beta_diff")
+```
+
+# **A7: Stats: Marker expression by cell type**
+
+Above we saw that associations are identified for:
+- Beta-cell markers (IAPP, ProINS, INS, Cpep, NKx6.1, PDX1), as well as HLA-ABC.
+- We predicted:
+y = b0 + b1*Stage(numeric) + e
+
+Second, we will try to ascertain if we can associate expression to beta-cell fraction. 
+y = b0 + b1*Fraction + e 
+
+Third, we will predict if we can use both Stage AND Fraction to predict expression.
+BUT: these are highly correlated. 
+
+y = b0 + b1*Fraction + b2*Stage(numeric) + e
+y = b0 + b1*Fraction + b2*Stage(numeric) + b3*Fraction*Stage(numeric) + e.
+
+Note: Stage and fraction are correlated!
+
+## A7.1: Stats-Test (Case-ID)
+By eye: differential expression in beta-cells in:
+beta-cell markers (IAPP, ProINS, INS, Cpep, NKx6.1, PDX1)
+Islet-marker have different profile: CHGA, PAX6, NKX2.2
+Functional marker: TXNIP, WFS1, B2M, HLA-ABC, NF-kB
+Calculate Stats for differential abundance across stages here.
+
+```{r stats-celltypes-beta-cells}
+## Test for beta-cells only from ND to RO.
+exprs_dat <- cur_dat
+
+## Get only beta-cells and remove pancreatitis + LD cases.
+dat_oi <-  exprs_dat  |>  
+  tibble::as_tibble() |> 
+  dplyr::filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"))  |> 
+  dplyr::mutate(donor_type = factor(donor_type, levels = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"))) |> 
+  dplyr::mutate(donor_type_num = as.numeric(donor_type)) |> 
+  filter(channel %in% channels)
+
+# Calculate association to stage.
+nd_ro <- dat_oi |> dplyr::filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"))
+
+## Calculate both for categorical and continuous donor type assumptionl
+results_cont <- nd_ro |>
+  tidyr::nest(data = -channel) |>
+  dplyr::mutate(test = purrr::map(data, ~lm(data = ., exprs ~ donor_type_num) |> broom::glance())) |> 
+  dplyr::mutate(test2 = purrr::map(data, ~lm(data = ., exprs ~ poly(donor_type_num, 2)) |> broom::glance())) |> 
+  tidyr::unnest(test) |>
+  tidyr::unnest(test2, names_sep = "_2") |>
+  dplyr::mutate(method = "cont")
+
+## Identify strongest associations.
+## Note, for visualization purposes we filter only by unadjusted p.value. 
+results_cont |> 
+  dplyr::mutate(p.adj = p.adjust(p.value, method = "fdr"),
+                test2_p.adj = p.adjust(test2_2p.value, method = "fdr")) |> 
+  dplyr::arrange(p.value) |> dplyr::select(channel, adj.r.squared, p.adj, 
+                                            "radj_2" = test2_2adj.r.squared, 
+                                            test2_p.adj) |> print(n = "all")
+```
+ 
+IAPP, HLA_ABC show the strongest association to stage. 
+ARX shows stronger association as well!
+-> Note: ProGCG, GCG, and PCSK2 are NOT associated. 
+
+In addition, CD155, ProINS, B2M (!!), WFS1, ATP1F1, Cpep, TXNIP.
+
+The classical islet markers NKX2_2, PAX6 are lowly associated.
+
+## A7.2: Stats test (not final) 
+Perform  tests between NoDiabetes and all other stages.
+Two-sided Wilcoxon test.
+```{r stats-pairwise}
+# Group 1: NoDiabetes, Group2: sAAb+, mAAb+, RecentOnset, LongDuration. 
+channels <- metadata(spe)$channels[["Beta"]]
+## Get only beta-cells and remove pancreatitis cases.
+
+dat_oi <-  exprs_dat  |>  
+  tibble::as_tibble() |> 
+  dplyr::filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"))  |> 
+  dplyr::mutate(donor_type = factor(donor_type, levels = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"))) |> 
+  dplyr::mutate(donor_type_num = as.numeric(donor_type)) |> 
+  filter(channel %in% channels)
+
+dat_oi  |> 
+  tidyr::nest(data = -channel) |> 
+  dplyr::mutate(test = purrr::map(data, \(x) {
+    pairwise.wilcox.test(x$exprs, x$donor_type, paired = FALSE, alternative = "two.sided") |> broom::tidy()})) |> 
+  tidyr::unnest(test)  |> 
+  dplyr::filter(grepl("NoDiabetes", group1) | grepl("NoDiabetes", group2))  |>
+  dplyr::mutate(p.adj = p.adjust(p.value, method = "fdr")) |>
+  dplyr::filter(p.value < 0.2)  |>
+  dplyr::arrange(p.value) |>
+  print(n = "all")
+```
+
+# **A8:Marker expression across cell types**
+
+Marker expression is only plot by **ISLET**.
+
+## A8.1: Prepare the data
+
+Convert SCE to melted data frame.
+
+```{r convert-sce-datatable-islet}
+dat <- vector(mode = "list", length = length(assay_sel))
+names(dat) <- assay_sel
+
+for (i in seq_along(assay_sel)) {
+  dat[[i]] <- scuttle::makePerCellDF(
+    sce_ct_islet,
+    # sce_ct_case,
+    exprs_values = assay_sel[i],
+    features = channels,
+    use.coldata = c("cell_type", plot_variables, "image_id", "distance_to_islet"),
+    use_dimred = FALSE) |>
+    mutate(case_id = factor(case_id, levels = metadata(spe)$cases),
+           donor_type = factor(donor_type, levels = metadata(spe)$stages),
+           cell_type = factor(cell_type, levels = celltypes)) |>
+    arrange(cell_type, case_id, donor_type) |>
+    as.data.table()
+  
+  dat[[i]] <- melt.data.table(
+    dat[[i]],
+    id.vars = c("cell_type", plot_variables, "image_id", "distance_to_islet"),
+    measure.vars = channels,
+    variable.name = "channel",
+    value.name = assay_sel[i]
+  )
+  dat[[i]][, case_id := as.factor(case_id)]
+}
+```
+
+Here-we still have one with grouped data per case.
+```{r convert-sce-datatable-case2}
+dat_case <- vector(mode = "list", length = length(assay_sel))
+names(dat_case) <- assay_sel
+
+for (i in seq_along(assay_sel)) {
+  dat_case[[i]] <- scuttle::makePerCellDF(
+    sce_ct_case,
+    exprs_values = assay_sel[i],
+    features = channels,
+    use.coldata = c("cell_type", plot_variables, "image_id", "distance_to_islet"),
+    use_dimred = FALSE) |>
+    mutate(case_id = factor(case_id, levels = metadata(spe)$cases),
+           donor_type = factor(donor_type, levels = metadata(spe)$stages),
+           cell_type = factor(cell_type, levels = celltypes)) |>
+    arrange(cell_type, case_id, donor_type) |>
+    as.data.table()
+  
+  dat_case[[i]] <- melt.data.table(
+    dat_case[[i]],
+    id.vars = c("cell_type", plot_variables, "image_id", "distance_to_islet"),
+    measure.vars = channels,
+    variable.name = "channel",
+    value.name = assay_sel[i]
+  )
+  dat_case[[i]][, case_id := as.factor(case_id)]
+}
+```
+
+## A8.2: Beta-cell expression changes (Fig 1 + Extended Figure 3))
+
+### A8.2.1: Prep data.
+
+Delete cases with less than 10 beta-cells (3 REC onset ones.)
+-> Checked makes no difference for the results.
+
+Figure 1e: Beta-cell expression marker changes.
+
+```{r helper-fig-1-e}
+library(ggpubr); library(rstatix)
+
+## Make figure with expressions (per case.)
+exprs_dat <- dat[["exprs"]]
+
+## To-del cases:
+to_del <- metadata(spe)$islet_compo |> 
+  as_tibble() |> 
+  mutate(case_id = stringr::str_extract(image_id, "([0-9]+)")) |> 
+  dplyr::group_by(case_id) |> 
+  summarise(n = sum(CellNb_Beta)) |> 
+  filter(n < 10) |> pull(case_id)
+```
+
+### A8.2.2: Key beta-cell markers (Fig 1)
+ 
+```{r fig-1-e}
+exprs_dat <- dat[["exprs"]]
+channels_oi <- c("IAPP", "ProINS", "HLA_ABC", "ECad")
+exprs_dat <- exprs_dat |> filter(!case_id %in% to_del)
+
+p <- plot_expression_violin(exprs_dat = exprs_dat, 
+                            channels_oi = channels_oi, 
+                            cell_types = "Beta", 
+                            facet_by = "channel", 
+                            y_label = expression(beta ~ "-cell expression"), 
+                            tip.length = 0.02)
+print(p)
+
+fig1f <- p
+plotsave_param_large2 <- plotsave_param_large
+plotsave_param_large2$width <- 500
+fn <- paste0(paste(today, "Boxplot_channels_beta_figure", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, fig1f), plotsave_param_large2))
+saveRDS(fig1f, file.path(paths$home_git, "figures", "fig1f.rds"))
+```
+
+### A8.2.2: Lineage markers (Extended Figure 3)
+
+Supplementary: Further Lineage-markers. 
+Include: NKX6.1, PDX1, PCSK1, CHGA.
+
+```{r supp-fig4c}
+exprs_dat <- dat[["exprs"]]
+exprs_dat <- exprs_dat |> filter(!case_id %in% to_del)
+channels_oi <- c("NKX6_1", "PDX1", "SYP", 
+                 "PCSK1","INS", "NKX2_2", 
+                 "CHGA", "PAX6", "Cpep"
+                 )
+p <- plot_expression_violin(exprs_dat = exprs_dat, 
+                            channels_oi = channels_oi, 
+                            cell_types = "Beta", 
+                            facet_by = "channel", 
+                            y_label = expression(beta ~ "-cell expression"))
+print(p)
+
+extfig3c <- p
+plotsave_param_large2 <- plotsave_param_large
+plotsave_param_large2$width <- 500
+fn <- paste0(paste(today, "Boxplot_channels_lineage_beta_figure", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, extfig3c), plotsave_param_large2))
+
+saveRDS(extfig3c, file.path(paths$home_git, "figures", "extfig3c.rds"))
+```
+
+### A8.2.2: Functional markers and others (Extended Figure 3)
+
+Supplementary: Show that ER-markers & MX1 have little association with stage.
+Include: INS, PCSK1, CHGA, ERN1, WFS1, MX1, XBP1, NFkB, CD9.
+
+```{r extfig3d}
+# "INS", "PCSK1", CHGA
+exprs_dat <- dat[["exprs"]]
+channels_oi <- c("IRE1a-P", "WFS1", "NFkB", 
+                 "XBP1", "MX1", "ADAR",
+                 "B2M", "TXNIP", "CD155")
+exprs_dat_input <- exprs_dat |> 
+  filter(!case_id %in% to_del) |> 
+  mutate(channel = ifelse(channel == "ERN1", "IRE1a-P", as.character(channel)))
+
+p <- plot_expression_violin(
+    exprs_dat = exprs_dat_input, 
+    channels_oi = channels_oi, 
+    cell_types = "Beta", 
+    facet_by = "channel", 
+    y_label = expression(beta ~ "-cell expression"))
+print(p)
+
+extfig3d <- p
+plotsave_param_large2 <- plotsave_param_large
+plotsave_param_large2$width <- 500
+fn <- paste0(paste(today, "Boxplot_channels_beta_suppl", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, extfig3d), plotsave_param_large2))
+
+saveRDS(extfig3d, file.path(paths$home_git, "figures", "extfig3d.rds"))
+```
+
+### A8.2.3: Unused: Visualize coexpressin of IAPP & HLA-ABC.
+Co-expression between HLA-ABC and IAPP.
+```{r iapp_hla_abc_co-expression}
+# Co-expression Plot IAPP vs HLA-ABC
+exprs_case <- dat_case[["exprs"]]
+exprs_case <- exprs_case |> 
+  tibble::as_tibble() |> 
+  filter(!case_id %in% to_del) |> 
+  filter(cell_type == "Beta") |> 
+  filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset")) |>
+  tidyr::drop_na(cell_type)
+
+p <- exprs_case  |> 
+  dplyr::filter(channel %in% c("IAPP", "HLA_ABC")) |> 
+  pivot_wider(names_from = channel, values_from = exprs) |>
+  ggplot(aes(x = IAPP, y = HLA_ABC, color = donor_type)) +
+  geom_point(size = 3, alpha = 0.5) +
+  scale_color_manual(values = palettes[["stages"]]) + 
+  geom_smooth(method = "lm") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(x = "IAPP expression", y = "HLA-ABC expression", color = "Stage") +
+  mytheme$standard() + 
+  theme(legend.position = "none") + 
+  stat_cor(method = "spearman", aes(color = donor_type), label.x = 0.5)
+
+q <- exprs_case  |> 
+  dplyr::filter(channel %in% c("IAPP", "TXNIP")) |> 
+  pivot_wider(names_from = channel, values_from = exprs) |>
+  ggplot(aes(x = IAPP, y = TXNIP, color = donor_type)) +
+  geom_point(size = 3, alpha = 0.5) +
+  scale_color_manual(values = palettes[["stages"]]) + 
+  geom_smooth(method = "lm") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(x = "IAPP expression", y = "TXNIP expression", color = "Stage") +
+  mytheme$standard() + 
+  theme(legend.position = "none") + 
+  stat_cor(method = "spearman", aes(color = donor_type), label.x = 0.5)
+
+print(p)
+fn <- paste0(paste(today, "Correlation_IAPP_HLA", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# Co-expression Plot IAPP vs HLA-ABC
+exprs_islet <- dat[["exprs"]]
+exprs_islet <- exprs_islet |> 
+  tibble::as_tibble() |> 
+  filter(cell_type == "Beta") |> 
+  filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset")) |>
+  tidyr::drop_na(cell_type)
+
+p <- exprs_islet  |> 
+  dplyr::filter(channel %in% c("IAPP", "HLA_ABC")) |> 
+  pivot_wider(names_from = channel, values_from = exprs) |>
+  ggplot(aes(x = IAPP, y = HLA_ABC, color = donor_type)) +
+  geom_point(size = 3, alpha = 0.5) +
+  scale_color_manual(values = palettes[["stages"]]) + 
+  geom_smooth(method = "lm") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(x = "IAPP expression", y = "HLA-ABC expression", color = "Stage") +
+  mytheme$standard_new() + 
+  theme(legend.position = "none") + 
+  stat_cor(method = "spearman", aes(color = donor_type), label.x = 4.5)
+
+print(p)
+fn <- paste0(paste(today, "Correlation_IAPP_HLA_Islet", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+
+# A9: HLA co-expression
+
+## A9.1: HLA-ABC co-expression from Beta-cells to other cell types.
+
+Test for correlation on the levels of islets
+```{r regional-HLA-ABC-up}
+# Each dot = one islet
+exprs_dat <- dat[["exprs"]]
+exprs_dat <- exprs_dat  |> 
+  tibble::as_tibble() |> 
+  filter(cell_type %in% celltypes) |> 
+  tidyr::drop_na(cell_type)
+
+## Compute correlations between alpha and beta expression in same islet.
+# For each islet, compute the correlation between alpha and beta expression.
+# FIXME: almost surely this is also true for cell types such as Endothelial and the 
+# the Immune Cells as well.
+ab_hla <- exprs_dat  |> 
+  dplyr::filter(channel == "HLA_ABC") |> 
+  dplyr::filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset")) |>
+  tidyr::pivot_wider(names_from = cell_type, values_from = exprs) |> 
+  filter(!is.na(Beta)) |> 
+  filter(!case_id %in% to_del)
+
+# Compute correlation between alpha and beta expression in same islet.
+ab_hla |> dplyr::group_by(donor_type) |>
+  dplyr::summarise(cors = cor(Beta, Alpha, use = "complete.obs", method = "spearman"))
+ab_hla |> dplyr::group_by(donor_type) |>
+  dplyr::summarise(cors = cor(Beta, Delta, use = "complete.obs", method = "spearman"))
+ab_hla |> dplyr::group_by(donor_type) |> 
+  dplyr::summarise(cors = cor(Beta, Acinar, use = "complete.obs", method = "spearman"))
+ab_hla  |> dplyr::group_by(donor_type) |> 
+  dplyr::summarise(cors = cor(Beta, Endothelial, use = "complete.obs", method = "spearman"))
+
+## Plot correlation between beta and alpha expression in same islet.
+p <- ab_hla |> 
+  select(donor_type, case_id, image_id, channel, Alpha, Beta, Delta, Acinar, Ductal) |> 
+  pivot_longer(c("Alpha", "Delta", "Acinar", "Ductal"), 
+      names_to = "cell_type", values_to = "exprs") |> 
+  mutate(cell_type = factor(cell_type, levels = c("Alpha", "Delta", "Acinar", "Ductal"))) |>
+  ggplot(aes(x = Beta, y = exprs, color = donor_type)) +
+  geom_point(size = 0.5, alpha = 0.5) +
+  scale_color_manual(values = palettes[["stages"]]) + 
+  geom_smooth(method = "lm") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(x = expression(beta ~ "-cell HLA-ABC expression"), 
+        y = "HLA-ABC expression", color = "Stage") +
+  mytheme$large_new() + 
+  facet_wrap(~ cell_type, ncol = 2, scales = "free_y") + 
+  stat_cor(method = "spearman", 
+    aes(color = donor_type, label = ..r.label..), label.x = 1, size = 12,
+    show.legend = FALSE) + 
+  theme(legend.position = "top", legend.direction = "horizontal")
+
+print(p)  
+
+fn <- paste0(paste(today, "Correlation_Islet_HLA", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+## Note, warning message is due to absence of e.g. delta-cells from some islets.
+extfig4a <- p
+saveRDS(extfig4a, file.path(paths$home_git, "figures", "extfig4a.rds"))
+```
+
+
+## A9.2 MHC-I hyperexpression in Cell Types
+
+Perform differential expression analysis for MHC-I.
+
+```{r mhc-i-celltypes}
+cur_assay <- "exprs"
+## Make figure with expressions (per case.)
+exprs_islet <- dat[[cur_assay]] |> as_tibble() |> 
+  filter(!case_id %in% to_del) |>
+  filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"))
+
+
+p <- plot_expression_violin(exprs_islet, 
+                            channels_oi = "HLA_ABC", 
+                            cell_types = c("Alpha", "Beta", "Acinar", "Ductal"),
+                            facet_by = "cell_type",
+                            y_label = "HLA-ABC expression")
+
+print(p)
+fig2a <- p
+fn <- paste0(paste(today, "Boxplot", "MHC-I", "CellTypes", "HLA_ABC", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+saveRDS(fig2a, file.path(paths$home_git, "figures", "fig2a.rds"))
+```
+
+
+```{r}
+## Calculate coefficent of variation for Islets.
+exprs_dat  |> 
+  filter(cell_type %in% c("Beta"), channel == "HLA_ABC") |> 
+  group_by(cell_type, donor_type) |> 
+  summarise(cv = sd(exprs) / mean(exprs), mm = mean(exprs))
+```

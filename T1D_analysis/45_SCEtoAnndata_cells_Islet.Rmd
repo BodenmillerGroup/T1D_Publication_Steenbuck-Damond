@@ -1,0 +1,188 @@
+---
+title: "45_SCEtoAnndata_cells_Islet"
+author: "Nathan Steenbuck"
+date: "Created: 24 May, 2025; Compiled: `r format(Sys.time(), '%d %b, %Y')`"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+if (rstudioapi::isAvailable()) {
+  script_name <- basename(rstudioapi::getSourceEditorContext()$path)
+} else {
+  script_name <- knitr::current_input()
+}
+
+cur_user <- Sys.info()[["user"]]
+script_name <- "45_SCEtoAnndata_cells_Islet.Rmd"
+
+if (cur_user == "ubuntu") {
+  source(file.path("/", "mnt", "central_nas", "projects", 
+    "type1_diabetes", "nathan", "T1D_Vol", "T1D_analysis", 
+    "analysis", "helpers.R"))
+  #n_cores <- future::availableCores() - 1
+  n_cores <- 4
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  knitr::opts_knit$set(root_dir = paths$home_data)
+  do_print <- FALSE
+} else {
+  source(file.path("/", "home", "nsteen", "scripts", "T1D_analysis", "analysis", "helpers.R"))
+  n_cores <- 8
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  paths$folder_script <- paths$cluster_folder_script
+  paths$folder_in <- paths$cluster_folder_in
+  paths$folder_out <- paths$cluster_home 
+  knitr::opts_knit$set(root_dir = paths$cluster_home)
+  do_print <- TRUE
+}
+
+seed <- 123456
+set.seed(seed)
+options <- furrr::furrr_options(seed = seed)
+paths$prev <- paste("24_BetacellsAssociations", paths$object_type, paths$panel_type, sep = "_")
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Rscript -e "rmarkdown::render('T1D_analysis/analysis/45_SCEtoAnndata_cells_Islet.Rmd')"
+
+# **Goal**
+
+Measure differences in islet cell type composition across cases and stages.
+
+
+# **Settings**  
+
+## Load packages
+
+```{r packages, results='hide'}
+suppressPackageStartupMessages(c(
+  library(dplyr),
+  library(tidyr),
+  library(data.table),
+  library(SpatialExperiment),
+  library(ggplot2),
+  library(ggpubr),
+  library(scuttle),
+  library(RSpectra),
+  library(zellkonverter)
+))
+```
+
+## Paths and settings
+
+```{r settings}
+# Paths
+if (!dir.exists(paths$folder_script)) dir.create(paths$folder_script)
+plotsave_param$path <- paths$folder_script
+plotsave_param_large$path <- paths$folder_script
+
+# Misc settings
+today <- gsub("-", "", Sys.Date())
+```
+
+##  Read in the data
+
+Load the SpatialExperiment (SPE) object saved at the previous step.
+
+```{r load-data}
+# fn_spe <- file.path(paths$folder_out, paths$prev, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+fn_spe_islet <- file.path(paths$home_git, "data", "spe_Islet_full.rds")
+spe <- readRDS(fn_spe_islet)
+print(spe)
+```
+
+```{r delete-overhead-spe-object}
+## Trim down the object.
+assayNames(spe)
+assay(spe, "fastMNN_batch") <- NULL
+assay(spe, "fastMNN_case_id") <- NULL
+
+reducedDimNames(spe)
+reducedDim(spe, "PCA") <- NULL
+reducedDim(spe, "harmony_batch") <- NULL
+reducedDim(spe, "UMAP_harmony_batch") <- NULL
+# reducedDim(spe, "UMAP_scaled") <- NULL
+reducedDim(spe, "UMAP_fastMNN_case_id") <- NULL
+
+colnames(colData(spe))
+
+# FIXME: add patch-id + insulitic here later.
+metadata_oi <- c("case_id", "donor_type", "batch",
+                "panel", "cell_id", "islet_id", "image_id", "islet_area", "distance_to_islet", "islet_closest",
+                "age", "gender", "race", "BMI", "HbA1c", "C_peptide", "diabetes_duration", "age_group",
+                 "number_of_AAbs", "GADA", "IA2A", "mIAA", "ZnT8A",
+                 "cell_category", "cell_type",  
+                 "transit_time_minutes", "ICU_time_days", "cause_of_death", 
+                 "case_recovery_type", "drug_use", "class_weight", "pseudotime_beta")
+
+colData(spe) <- colData(spe)[, metadata_oi]
+metadata(spe)$stages <- NULL
+metadata(spe)$cases <- NULL
+metadata(spe)$subset <- NULL
+metadata(spe)$subset_islet <- NULL
+metadata(spe)$subset_exo <- NULL
+metadata(spe)$channels <- NULL
+metadata(spe)$islet_compo <- NULL
+```
+
+# Immune cells.
+
+##  Read in the data
+
+Load the SpatialExperiment (SPE) object saved at the previous step.
+
+```{r load-data-immune}
+# fn_spe <- file.path(paths$folder_out, paths$prev, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+fn_spe_immune <- file.path(paths$home_git, "data", "spe_Immune_full.rds")
+spe_imm <- readRDS(fn_spe_immune)
+print(spe_imm)
+```
+
+
+```{r delete-overhead-spe-object-immune}
+## Trim down the object.
+assayNames(spe_imm)
+assay(spe_imm, "fastMNN_case_id") <- NULL
+
+reducedDimNames(spe_imm)
+reducedDim(spe_imm, "PCA") <- NULL
+reducedDim(spe_imm, "harmony_batch") <- NULL
+reducedDim(spe_imm, "UMAP_harmony_batch") <- NULL
+# reducedDim(spe_imm, "UMAP_scaled") <- NULL
+reducedDim(spe_imm, "UMAP_fastMNN_case_id") <- NULL
+
+colnames(colData(spe_imm))
+
+# FIXME: add patch-id + insulitic here later.
+metadata_oi <- c("case_id", "donor_type", "batch",
+                "panel", "cell_id", "islet_id", "image_id", "islet_area", "distance_to_islet", "islet_closest",
+                "age", "gender", "race", "BMI", "HbA1c", "C_peptide", "diabetes_duration", "age_group",
+                 "number_of_AAbs", "GADA", "IA2A", "mIAA", "ZnT8A",
+                 "cell_category", "cell_type",  
+                 "transit_time_minutes", "ICU_time_days", "cause_of_death", 
+                 "case_recovery_type", "drug_use", "class_weight")
+
+colData(spe_imm) <- colData(spe_imm)[, metadata_oi]
+metadata(spe_imm)$stages <- NULL
+metadata(spe_imm)$cases <- NULL
+metadata(spe_imm)$subset <- NULL
+metadata(spe_imm)$channels <- NULL
+metadata(spe_imm)$celltype_compo <- NULL
+metadata(spe_imm)$cluster_compo <- NULL
+metadata(spe_imm)$cluster_compo_score <- NULL
+metadata(spe_imm)$celltype_compo_score <- NULL
+```
+
+```{r save-anndatas}
+reticulate::use_condaenv("/home/ubuntu/miniconda3/envs/scanpy_env", required = TRUE)
+## Islet:
+fn <- file.path(paths$folder_in, paste0(paths$object_type, "_", paths$panel_type, ".h5ad"))
+zellkonverter::writeH5AD(spe, file = fn, verbose = TRUE)
+
+## Immune:
+fn <- file.path(paths$folder_in, paste0(paths$object_type, "_", "Immune", ".h5ad"))
+zellkonverter::writeH5AD(spe_imm, file = fn, verbose = TRUE)
+```

@@ -1,0 +1,1595 @@
+---
+title: "28_PseudotimeAnalysisBeta_cells_Islet"
+author: Nathan Steenbuck, Nicolas Damond
+output: html_document
+date: "Created: 28 May, 2025; Compiled: `r format(Sys.time(), '%d %b, %Y')`"
+---
+
+
+```{r setup, include=FALSE}
+cur_user <- Sys.info()[["user"]]
+script_name <- "28_PseudotimeAnalysisBeta_cells_Islet.Rmd"
+
+if (cur_user == "ubuntu") {
+    source(file.path("/", "mnt", "central_nas", "projects", "type1_diabetes", "nathan", 
+                   "T1D_Vol", "T1D_analysis", "analysis", "helpers.R"))
+  #n_cores <- future::availableCores() - 1
+  n_cores <- 4
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  knitr::opts_knit$set(root_dir = paths$home_data)
+} else {
+  source(file.path("/", "home", "nsteen", "scripts", "T1D_analysis", "analysis", "helpers.R"))
+  n_cores <- 8
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  paths$folder_script <- paths$cluster_folder_script
+  paths$folder_in <- paths$cluster_folder_in
+  paths$folder_out <- paths$cluster_home 
+  knitr::opts_knit$set(root_dir = paths$cluster_home)
+}
+
+seed <- 123456
+set.seed(seed)
+options <- furrr::furrr_options(seed = seed)
+paths$prev <- paste("08_SubclusteringBeta", paths$object_type, paths$panel_type, sep = "_")
+knitr::opts_chunk$set(echo = TRUE)
+do_print <- TRUE
+```
+
+# **A0: Premise:**
+
+In this Script we will perform Pseudotime-Analysis using Slingshot. 
+Slingshot is a method for inferring continuous, branching lineage structures in low-dimensional data. 
+It is based on the idea of fitting principal curves to the data, and then using these curves to define a minimum spanning tree that describes the global lineage structure. 
+
+In T1D:
+- We fit pseudotime analysis to Beta-cells to account for the 
+  lobularity of the disease, i.e. the islets of the same donors are heterogeneous.
+
+## A0.1 Steps:
+When using Slingshot the following steps are performed:
+- Dimensionality-Reduction (done in script 14)
+- Clustering on Dimensionality Reduction (-> identify potential branching events)
+- Slingshot:
+  - identifying the global lineage structure with a cluster-based minimum spanning tree (MST)
+  - fitting simultaneous principal curves to describe each lineage.
+- Downstream Analysis:
+  - Identifying temporally dynamic genes (fit GAMs)
+
+# **A1: Load packages and settings**
+## A1.1 Load packages
+
+```{r packages, results='hide'}
+suppressPackageStartupMessages(c(
+  library(data.table),
+  library(dplyr),
+  library(SpatialExperiment),
+  library(parallel),
+  library(patchwork),
+  library(ggpubr),
+  library(rstatix)
+))
+```
+
+## A1.2 Paths and settings
+
+```{r settings}
+# Paths
+if (!dir.exists(paths$folder_script)) dir.create(paths$folder_script)
+plotsave_param$path <- paths$folder_script
+plotsave_param_large$path <- paths$folder_script
+
+# Misc settings
+today <- gsub("-", "", Sys.Date())
+```
+
+##  A1.3 Read in the data (SPE)
+
+Load the SpatialExperiment (SPE) object saved at the previous step.
+
+```{r load-data}
+fn_spe <- file.path(paths$folder_out, paths$prev, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+spe <- readRDS(fn_spe)
+print(spe)
+```
+
+##  A1.4 Read in the data (SPE-LIST)
+
+Load the list containing one SCE object per cell type.  
+
+```{r load-data-celltypes}
+fn_spes <- file.path(paths$folder_out, "12_CellTypeSCEs_cells_Islet", "celltypes_Islet.rds")
+spes <- readRDS(fn_spes)
+```
+
+# **A2: Pseudotime using Slingshot**
+## A2.1: Prepare Data.
+
+Import spes$Beta from the list of SPEs generated after script 14.
+
+```{r}
+library(slingshot)
+library(scuttle)
+library(ggplot2)
+library(purrr)
+library(tidyr)
+```
+
+```{r}
+dimred_name <- "DiffMap_exprs"
+```
+
+```{r}
+beta <- spes$Beta
+# islet <- spes$Islet
+```
+
+## A2.2 Run Slingshot for beta-cells:
+
+-> By not specifying cluster labels, Slingshot will construct a single lineage.
+Results are stored as: colData(sce)$slingshot
+Otherwise extract as: as.PseudotimeOrdering or as.SlingshotDataSet.
+
+Notably: we DO NOT provide the start or the end cluster.
+-> i.e. Slingshot infers in an unbiased manner the global lineage structure!
+
+```{r beta_slingshot}
+run_sligshot <- FALSE
+if (run_sligshot) {
+  sds <- slingshot::slingshot(
+      beta,
+      # clusterLabels = "donor_type",
+      # start.clus = "NoDiabetes",
+      # end.clus = "RecentOnset", #LongDuration",
+      reducedDim = dimred_name
+  )
+  sds$pseudotime <- sds$slingPseudotime_1
+  names(sds$pseudotime) <- colnames(sds)
+  metadata(sds)$curves <- slingCurves(sds, as.df = TRUE)
+  metadata(sds)$mst <- slingMST(sds, as.df = TRUE)
+  # Save results:
+  saveRDS(sds, file.path(paths$folder_script, paste0("cells", "_", "beta", "_", "Slingshot", ".rds")))
+}
+```
+
+## A2.3 Add results + save results
+Add Pseudotime to Beta-SPE and Save Results.
+```{r read-beta-sling}
+## Load Results:
+sds <- readRDS(file.path(paths$folder_script, paste0("cells", "_", "beta", "_", "Slingshot", ".rds")))
+beta$slingshot <- sds$slingPseudotime_1
+```
+
+Scale Pseudotime to an [0, 1] interval for readability.
+```{r scale-pseudotime}
+beta$slingshot <- (beta$slingshot - min(beta$slingshot)) / (max(beta$slingshot) - min(beta$slingshot))
+```
+
+# **A3: Analysis Pseudotime beta-cells.**
+Get Data.
+```{r get-data}
+cur_dat <- scuttle::makePerCellDF(beta, use_dimred = TRUE) %>%
+  as_tibble() |> 
+  mutate(case_id = factor(case_id, levels = metadata(beta)$cases),
+         donor_type = factor(donor_type, levels = metadata(beta)$stages)) %>%
+  arrange(case_id, donor_type) |> 
+  # Flip.
+  mutate(`DiffMap_exprs.1` = `DiffMap_exprs.1` * -1)
+```
+
+## A3.1 Plot DiffMap for Beta-cell Trajectory.
+### A3.1.1: Plot 1: with LD.
+Plot DiffMap for Beta-cell Trajectory.
+Ext Fig 1F.
+```{r plot-diff-map}
+p <- plot_dim_red(cur_dat, dimred_name, "slingshot", size = 0.1,
+                  palette_continuous = TRUE) + 
+                  labs(title = "", x = "DC1", y = "DC2") + 
+                  guides(color = guide_colorbar(title = "Pseudotime")) + 
+                  mytheme$standard_new()
+# print(p)
+
+curves <- metadata(sds)$curves
+colnames(curves)[1] <- paste0(dimred_name, ".1")
+colnames(curves)[2] <- paste0(dimred_name, ".2")
+p <- p + geom_path(data = curves %>% arrange(Order),
+                   aes(group = as.factor(Lineage)))
+if (do_print) print(p)
+fn <- paste0(paste(today, "Beta_DiffMap_Slingshot",
+                   sep = "_"), '.png')
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+```{r}
+extfig3f <- p 
+saveRDS(extfig3f, file.path(paths$home_git, "figures", "extfig3f.rds"))
+rm(extfig3f); gc()
+```
+
+Actually, only remove LD, as Pancreatitis samples were not used to construct pseudotime.
+Also: beta-cells completely ablated in LongDuration. -> basically no influence on results. 
+```{r remove-pancreatitis-LD}
+palettes$stages2 <- palettes$stages[names(palettes$stages) != "Pancreatitis"]
+
+palettes$stages3 <- palettes$stages[names(palettes$stages) != "Pancreatitis" &
+                                      names(palettes$stages) != "LongDuration"]
+```
+
+```{r plot-diff-map-no-pancreatitis}
+p1 <- plot_dim_red(cur_dat, dimred_name, "donor_type", size = 0.1,
+                   palette = palettes$stages2) + 
+          labs(title = "", x = "DC1", y = "DC2") +
+    theme(
+    axis.title.x = element_text(size = 25),  # Adjust the legend title font size
+    axis.title.y = element_text(size = 25)
+    )
+if (do_print) print(p1)
+
+fn <- paste0(paste(today, "Custom_Beta_DiffMap_Stages",
+                   sep = "_"), '.png')
+do.call(ggsave, c(list(fn, p1), plotsave_param))
+
+curves <- metadata(sds)$curves
+colnames(curves)[1] <- paste0(dimred_name, ".1")
+colnames(curves)[2] <- paste0(dimred_name, ".2")
+p2 <- p1 + geom_path(data = curves %>% arrange(Order),
+                   aes(group = as.factor(Lineage)),
+                   size = 2) 
+if (do_print) print(p2)
+
+fn <- paste0(paste(today, "Custom_Beta_DiffMap_Slingshot",
+                   sep = "_"), '.png')
+do.call(ggsave, c(list(fn, p2), plotsave_param))
+```
+
+### A3.1.2: Plot trajectory without LD
+
+Plot trajectory withouth LD.
+This is Fig 1g.
+
+Color by Stage + Pseudotime.
+```{r plot-diff-map-no-pancreatitis-LD}
+p1 <- plot_dim_red(cur_dat, dimred_name, "donor_type", size = 0.1,
+                   palette = palettes$stages3) +
+                    labs(title = "", x = "DC1", y = "DC2") +
+    theme(
+      axis.title.x = element_text(size = 25),  # Adjust the legend title font size
+      axis.title.y = element_text(size = 25)
+    )
+if (do_print) print(p1)
+
+fn <- paste0(paste(today, "Custom_Beta_DiffMap_Stages_no_LD",
+                   sep = "_"), '.png')
+do.call(ggsave, c(list(fn, p1), plotsave_param))
+
+curves <- metadata(sds)$curves
+colnames(curves)[1] <- paste0(dimred_name, ".1")
+colnames(curves)[2] <- paste0(dimred_name, ".2")
+p2 <- p1 + geom_path(data = curves %>% arrange(Order),
+                     aes(group = as.factor(Lineage)),
+                         size = 2) + 
+  mytheme$standard_new() + 
+  theme(    # Adjust the legend text font size
+    legend.position = "top",                 # Move legend above the plot
+    legend.justification = "center",         # Center the legend
+    legend.box = "horizontal" 
+  ) + 
+  guides(color = guide_legend(title = "Stage", override.aes = list(size = 5)))
+if (do_print) print(p2)
+
+fn <- paste0(paste(today, "Custom_Beta_DiffMap_Slingshot_no_LD",
+                   sep = "_"), '.png')
+plotsave_param2 <- plotsave_param
+plotsave_param2$width <- 250
+do.call(ggsave, c(list(fn, p2), plotsave_param2))
+```
+
+Save Fig 1g.
+```{r}
+fig1g <- p2
+saveRDS(fig1g, file.path(paths$home_git, "figures", "fig1g.rds"))
+```
+
+### A3.1.3: Plot Insulitic vs Non-Insulitic
+```{r pseudotime-insulitic}
+# Insulitic:
+fn <- file.path(paths$folder_out, "13_MarkerExpression_cells_Immune", "insulitic_images.rds")
+
+if (file.exists(fn)) {
+  image_ids <- readRDS(fn)
+  image_ids2 <- stringr::str_replace(image_ids, "_Immune_", "_Islet_")
+  cur_dat <- cur_dat |> 
+    mutate(insulitic = if_else(image_id %in% image_ids2, "insulitis", "non-insulitis")) |> 
+    mutate(insulitic = ifelse(insulitic == "insulitis", "Insulitic", "Non-Insulitic")) |> 
+    mutate(insulitic = factor(insulitic, levels = c("Insulitic", "Non-Insulitic")))
+}
+
+palettes$insulitic <- c("Insulitic" = palettes$colors[1], "Non-Insulitic" = palettes$colors[2])
+
+p1 <- plot_dim_red(cur_dat, dimred_name, "insulitic", size = 0.1,
+                  palette = palettes$insulitic) + 
+                  labs(title = "", x = "DC1", y = "DC2") + 
+                  guides(color = guide_colorbar(title = "Pseudotime")) + 
+                  mytheme$standard_new()
+
+curves <- metadata(sds)$curves
+colnames(curves)[1] <- paste0(dimred_name, ".1")
+colnames(curves)[2] <- paste0(dimred_name, ".2")
+p2 <- p1 + geom_path(data = curves %>% arrange(Order),
+                     aes(group = as.factor(Lineage)),
+                         size = 2) + 
+  mytheme$standard_new() + 
+  theme(    # Adjust the legend text font size
+    legend.position = "top",                 # Move legend above the plot
+    legend.justification = "center",         # Center the legend
+    legend.box = "horizontal",
+    plot.margin = margin(2, 10, 2, 2, "mm")
+  ) + 
+  guides(color = guide_legend(title = "Insulitis", override.aes = list(size = 5))) 
+
+fn <- paste0(paste(today, "Custom_Beta_DiffMap_Slingshot_Insulitic",
+                   sep = "_"), '.png')
+do.call(ggsave, c(list(fn, p2), plotsave_param))
+```
+
+```{r}
+extfig3h <- p2
+saveRDS(extfig3h, file.path(paths$home_git, "figures", "extfig3h.rds"))
+rm(extfig3h); gc()
+```
+
+## A3.2 Plot Channels on Diffmap.
+Plot CHANNELS on Diffmap; thus showing association with Beta-cell Pseudotime.
+```{r channels-pseudotime}
+cur_channels <- c("INS", "ProINS", "Cpep", "IAPP", "CHGA", "HLA_ABC", "ECad")
+censor_vals <- c(0.90, 0.99, 0.90, 0.95, 0.97, 0.97, 0.95)
+cur_dats <- as_tibble(
+  makePerCellDF(beta,
+                features = cur_channels,
+                exprs_values = "exprs"))
+
+cur_dat_long <- cur_dats |> 
+  tidyr::pivot_longer(cols = all_of(cur_channels), names_to = "channel", values_to = "exprs")
+
+purrr::map2(cur_channels, censor_vals, \(cur_channel, cur_censors){
+  p <- plot_dim_red_channels(cur_dat_long, dimred_name, "exprs",
+                         cur_channel, size = 0.1,
+                         force_points = TRUE, censor_val = cur_censors)
+  fn <- paste0(paste(today, "Custom_Beta_DiffMap_", cur_channel,
+                     sep = "_"), '.png')
+  do.call(ggsave, c(list(fn, p), plotsave_param))
+})
+```
+
+### A3.2.1: Plot key channels on DiffMap (beta-cell level)
+Plot Channels on DiffMap.
+```{r plot-diff-map-channels}
+# Plot on x-axis SlingShotScore and y-axis Exprs of Markers
+cur_channels <- c("ProINS", "IAPP", "HLA_ABC", "ECad")
+cur_dats <- as_tibble(
+  makePerCellDF(beta,
+                features = cur_channels,
+                exprs_values = "exprs")) |> 
+  filter(!donor_type %in% c("LongDuration", "Pancreatitis"))
+
+cur_dat_long <- cur_dats  |>
+  tidyr::pivot_longer(cols = all_of(cur_channels), names_to = "channel", values_to = "exprs") |> 
+  select(c(cell_id, channel, case_id, image_id, donor_type, exprs, slingshot)) |> 
+  mutate(channel = as.character(channel)) |>
+  mutate(channel = factor(channel, levels = cur_channels))
+
+# For Markers of Interest. By Sample.
+p <- cur_dat_long |>
+  group_by(case_id, donor_type, channel) |> 
+  summarize("exprs" = mean(exprs), "slingshot" = mean(slingshot)) |>
+  ggplot(aes(x = slingshot, y = exprs)) +
+  geom_point(aes(color = donor_type), size = 5)+
+  scale_color_manual(values = palettes$stages)+
+  geom_smooth(method = "loess", color = "black") + 
+  facet_wrap(~channel, ncol = 2) + 
+  # increase font size
+  mytheme$large_new() + 
+  labs(x = "Pseudotime", y = expression(beta ~ "-cell expression")) + 
+  guides(color = guide_legend(title = "Stage", override.aes = list(size = 5)))
+
+fn <- paste0(paste(today, "Markers_Beta_Slingshot",
+                   sep = "_"), '.png')
+plotsave_param_large2 <- plotsave_param_large
+plotsave_param_large2$width <- 500
+do.call(ggsave, c(list(fn, p), plotsave_param_large2))
+```
+
+### A3.2.2: Plot key channels on DiffMap (image level)
+
+This is Ext Fig 3I.
+```{r plot-diff-map-channels-imageID}
+# For Markers of Interest. By ROI.
+p <- cur_dat_long |>
+  group_by(case_id, image_id, donor_type, channel) |> 
+  summarize("exprs" = mean(exprs), "slingshot" = mean(slingshot)) |>
+  ggplot(aes(x = slingshot, y = exprs)) +
+  geom_point(aes(color = donor_type), size = 1, alpha = 0.8)+
+  scale_color_manual(values = palettes$stages)+
+  geom_smooth(method = "loess", color = "black") + 
+  facet_wrap(~channel, ncol = 2) + 
+  mytheme$large_new() + 
+  labs(x = "Pseudotime", y = expression(beta ~ "-cell expression")) + 
+  guides(color = guide_legend(title = "Stage", override.aes = list(size = 5)))
+p
+fn <- paste0(paste(today, "Markers_Beta_Slingshot_imageID",
+                   sep = "_"), '.png')
+plotsave_param_large2 <- plotsave_param_large
+plotsave_param_large2$width <- 500
+do.call(ggsave, c(list(fn, p), plotsave_param_large2))
+
+extfig3i <- p
+saveRDS(extfig3i, file.path(paths$home_git, "figures", "extfig3i.rds"))
+```
+
+### A3.2.3: Plot all beta-cell markers along Pseudotime.
+#### Donor-level.
+Plot Markers along Pseudotime.
+
+```{r plot-slingshot-score-exprs-donor}
+# Plot on x-axis SlingShotScore and y-axis Exprs of Markers
+cur_channels <- rownames(beta)
+cur_dats <- as_tibble(
+  makePerCellDF(beta,
+                features = cur_channels,
+                exprs_values = "exprs")) |> 
+  filter(!donor_type %in% c("LongDuration", "Pancreatitis"))
+
+cur_dat_long <- cur_dats  |>
+  tidyr::pivot_longer(cols = all_of(cur_channels), names_to = "channel", values_to = "exprs") |> 
+  select(c(cell_id, channel, image_id, case_id, donor_type, exprs, slingshot)) |> 
+  mutate(channel = as.character(channel)) |>
+  mutate(channel = factor(channel, levels = cur_channels))
+
+# By donor.
+p <- cur_dat_long |>
+  group_by(case_id, donor_type, channel) |> 
+  summarize("exprs" = mean(exprs), "slingshot" = mean(slingshot)) |>
+  ggplot(aes(x = slingshot, y = exprs)) +
+  geom_point(aes(color = donor_type), size = 3, alpha = 0.8)+
+  scale_color_manual(values = palettes$stages)+
+  mytheme$standard() + 
+  geom_smooth(method = "loess") + 
+  facet_wrap(~channel, scales = "free_y")
+
+fn <- paste0(paste(today, "Markers_Beta_Slingshot_full",
+                   sep = "_"), '.png')
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+
+#### Image level
+
+```{r plot-slingshot-score-exprs-donor-imageID}
+# By image.
+p <- cur_dat_long |>
+  group_by(image_id, donor_type, channel) |> 
+  summarize("exprs" = mean(exprs), "slingshot" = mean(slingshot)) |>
+  ggplot(aes(x = slingshot, y = exprs)) +
+  geom_point(aes(color = donor_type), size = 0.2, alpha = 0.8)+
+  scale_color_manual(values = palettes$stages)+
+  mytheme$standard() + 
+  geom_smooth(method = "loess") + 
+  facet_wrap(~channel, scales = "free_y")
+
+fn <- paste0(paste(today, "Markers_Beta_Slingshot_full_imageID",
+                   sep = "_"), '.png')
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+
+### A3.2.4 Plot functional markers along Pseudotime.
+Plot Expression of IFN-response marker (ADAR, MX1, HLA-ABC), ER-stress (WFS1, XBP1, ERN1), 
+and stress-signalling (TXNIP, NFkB) along slingshot pseudotime.
+
+```{r slingshot-functional-markers}
+channels_oi <- c("ADAR", "MX1", "HLA_ABC", "WFS1", "XBP1", "NFkB", "TXNIP", "ERN1")
+cur_channels <- rownames(beta)
+cur_dats <- as_tibble(
+  makePerCellDF(beta,
+                features = channels_oi,
+                exprs_values = "exprs")) |> 
+  filter(!donor_type %in% c("LongDuration", "Pancreatitis"))
+
+cur_dat_long <- cur_dats  |>
+  tidyr::pivot_longer(cols = all_of(channels_oi), names_to = "channel", values_to = "exprs") |> 
+  select(c(cell_id, channel, image_id, case_id, donor_type, exprs, slingshot)) |> 
+  mutate(channel = as.character(channel)) |>
+  mutate(channel = factor(channel, levels = channels_oi))
+
+# By donor.
+p <- cur_dat_long |>
+  group_by(case_id, donor_type, channel) |> 
+  summarize("exprs" = mean(exprs), "slingshot" = mean(slingshot)) |>
+  ggplot(aes(x = slingshot, y = exprs)) +
+  geom_point(aes(color = donor_type), size = 5)+
+  scale_color_manual(values = palettes$stages)+
+  mytheme$standard() + 
+  geom_smooth(method = "loess") + 
+  facet_wrap(~channel, scales = "free_y")
+
+fn <- paste0(paste(today, "Markers_Beta_Slingshot_functional",
+                   sep = "_"), '.png')
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+
+```{r slingshot-functional-markers-imageID}
+# By image.
+p <- cur_dat_long |>
+  group_by(image_id, donor_type, channel) |> 
+  summarize("exprs" = mean(exprs), "slingshot" = mean(slingshot)) |>
+  ggplot(aes(x = slingshot, y = exprs)) +
+  geom_point(aes(color = donor_type), size = 0.2, alpha = 0.8)+
+  scale_color_manual(values = palettes$stages)+
+  mytheme$standard() + 
+  geom_smooth(method = "loess") + 
+  facet_wrap(~channel, scales = "free_y")
+
+fn <- paste0(paste(today, "Markers_Beta_Slingshot_functional_imageID",
+                   sep = "_"), '.png')
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+### A3.2.5 Plot lineage markers along Pseudotime.
+Plot islet and beta-cell lineage markers along Pseudotime.
+```{r lineage-markers-slingshot}
+channels_oi <- c("NKX6_1", "PDX1",   
+                "SYP", "PCSK1",
+                "INS", "NKX2_2")
+cur_dats <- as_tibble(
+  makePerCellDF(beta,
+                features = channels_oi,
+                exprs_values = "exprs")) |> 
+  filter(!donor_type %in% c("LongDuration", "Pancreatitis"))
+
+cur_dat_long <- cur_dats  |>
+  tidyr::pivot_longer(cols = all_of(channels_oi), names_to = "channel", values_to = "exprs") |> 
+  select(c(cell_id, channel, image_id, case_id, donor_type, exprs, slingshot)) |> 
+  mutate(channel = as.character(channel)) |>
+  mutate(channel = factor(channel, levels = channels_oi))
+
+# By donor.
+p <- cur_dat_long |>
+  group_by(case_id, donor_type, channel) |> 
+  summarize("exprs" = mean(exprs), "slingshot" = mean(slingshot)) |>
+  ggplot(aes(x = slingshot, y = exprs)) +
+  geom_point(aes(color = donor_type), size = 5)+
+  scale_color_manual(values = palettes$stages)+
+  mytheme$standard() + 
+  geom_smooth(method = "loess") + 
+  facet_wrap(~channel, scales = "free_y")
+
+fn <- paste0(paste(today, "Markers_Beta_Slingshot_lineage",
+                   sep = "_"), '.png')
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+# By image.
+p <- cur_dat_long |>
+  group_by(image_id, donor_type, channel) |> 
+  summarize("exprs" = mean(exprs), "slingshot" = mean(slingshot)) |>
+  ggplot(aes(x = slingshot, y = exprs)) +
+  geom_point(aes(color = donor_type), size = 0.2, alpha = 0.8)+
+  scale_color_manual(values = palettes$stages)+
+  mytheme$standard() + 
+  geom_smooth(method = "loess") + 
+  facet_wrap(~channel, scales = "free_y")
+
+fn <- paste0(paste(today, "Markers_Beta_Slingshot_lineage_imageID",
+                   sep = "_"), '.png')
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+
+# A4: Calculate Association of beta-cell markers to pseudotime.
+
+## A4.1: Prepare image-level and donor-level data.
+- Calculate Association to Slingshot Pseudotime.
+- No mixed-effects.
+```{r stats-association-pseudotime}
+channels_oi <- rownames(beta)
+
+## Counts: Image-level.
+cur_dat_image <- as_tibble(
+  makePerCellDF(beta,
+                features = channels_oi,
+                exprs_values = "counts")) |> 
+  group_by(case_id, image_id, donor_type) |> 
+  summarize(across(c(all_of(channels_oi), "slingshot"), \(x) mean(x, na.rm = TRUE)), .groups = "drop") |> 
+  filter(!donor_type %in% c("LongDuration", "Pancreatitis"))
+
+## Counts: Donor-type.
+cur_dat <- as_tibble(
+  makePerCellDF(beta,
+                features = channels_oi,
+                exprs_values = "counts")) |> 
+  group_by(case_id, donor_type) |> 
+  summarize(across(c(all_of(channels_oi), "slingshot"), \(x) mean(x, na.rm = TRUE)), .groups = "drop") |> 
+  filter(!donor_type %in% c("LongDuration", "Pancreatitis"))
+```
+
+## A4.2: Tradeseq: associative analysis of Pseudotime Expression.
+Here using **Tradeseq**.
+
+Tradeseq fits negative-binomial GAMs.
+```{r tradeSeq-GAMs}
+library(tradeSeq)
+
+# Donor-level Expression + Pseudotime.
+counts_beta <- cur_dat |> select(all_of(channels_oi)) |> as.matrix() |> t()
+pseudotime <- cur_dat |> select(slingshot, case_id) |> as.data.frame() 
+rownames(pseudotime) <- pseudotime$case_id
+colnames(counts_beta) <- pseudotime$case_id
+pseudotime[, 2] <- NULL
+
+# Equally weight all cases.
+cellWeights <- pseudotime
+cellWeights[, 1] <- 1
+colnames(cellWeights) <- "Lineage"
+cellWeights <- as.matrix(cellWeights)
+pseudotime <- as.matrix(pseudotime)
+
+# fit negative binomial GAM. 
+results <- tradeSeq::fitGAM(counts = counts_beta, pseudotime = pseudotime, 
+                            cellWeights = cellWeights, nknots = 3)
+
+# test for dynamic expression
+ATres <- tradeSeq::associationTest(results)
+
+ATres |> tibble::as_tibble(rownames = "channels") |> 
+  mutate(p.adj = p.adjust(pvalue, method = "fdr")) |> 
+  arrange(waldStat) |> 
+  print(n ="all")
+```
+
+Significant markers:
+- IAPP, HLA-ABC, ProINS, Cpep, ARX (remove), INS, PCSK1, B2M, CHGA, ATPIF1, SYP
+-> largely overlap with disease stages.
+
+FIXME: Cluster into Pseudo-stages?
+
+## A 4.3: Pseudotime Heatmap.
+Plot Heatmap along Progression.
+Expression of Features along progression.
+
+### A4.3.1: Prepare data for heatmap.
+```{r pseudotime-heatmap}
+palettes$stages <- palettes$stages[!names(palettes$stages) %in% c("Pancreatitis", "LongDuration")]
+
+# Plot heatmap along Pseudotime (compare previous paper).
+topgenes <- rownames(ATres[order(ATres$pvalue), ])[1:30]
+topgenes <- topgenes[topgenes != c("ARX", "PDL1")]
+
+## Data per image.
+cur_dat_image <- as_tibble(
+  makePerCellDF(beta,
+                features = channels_oi,
+                exprs_values = "scaled")) |> 
+  group_by(case_id, image_id, donor_type) |> 
+  summarize(across(c(all_of(channels_oi), "slingshot"), \(x) mean(x, na.rm = TRUE)), .groups = "drop") |> 
+  filter(!donor_type %in% c("LongDuration", "Pancreatitis")) |> 
+  select(-ARX, -PDL1)
+cur_df <- cur_dat_image |> arrange(slingshot)
+
+# Get order along Pseudotime.
+pst.ord <- cur_df |> pull(image_id)
+heatdata <- cur_df |> select(all_of(topgenes)) |> as.matrix() |> t()
+heatclus <- cur_df |> pull(donor_type)
+```
+
+### A4.3.1: rowAnnos for heatmap.
+
+```{r complex-heatmap-annotations}
+## Row-annotations.
+annotation_colors <- palettes$stages[heatclus]
+heatclus_factor <- factor(heatclus, levels = names(palettes$stages))
+
+# Create the annotation with the correct mapping
+rowanno <- ComplexHeatmap::HeatmapAnnotation(
+    Stage = heatclus_factor,
+    col = list(Stage = palettes$stages,
+               labels = c("Control", "sAAb+", "mAAb+", "Onset")),
+    annotation_legend_param = list(
+      title_gp = grid::gpar(fontsize = 25),  # Set row annotation legend title font size
+      labels_gp = grid::gpar(fontsize = 22),  # Set row annotation legend text font size
+      labels = c("Control", "sAAb+", "mAAb+", "Onset"),  # Rename Stage legend labels here
+      direction = "horizontal"
+  ), annotation_name_gp = grid::gpar(fontsize = 22))
+
+saveRDS(heatdata, file.path(paths$home_git, "figures", "fig1i.rds"))
+saveRDS(rowanno, file.path(paths$home_git, "figures", "fig1i_anno.rds"))
+```
+
+### A4.3.2: Plot heatmap.
+
+```{r complex-heatmap-heatmapbody}
+fn <- file.path(paths$folder_script, paste0(paste(today, "Beta_Pseudotime_Heatmap",
+                   sep = "_"), '.png'))
+png(fn, width = 300, height = 300, units = "mm", res = 300)
+p <- ComplexHeatmap::Heatmap(
+  heatdata, name = "Scaled Counts",
+  col = circlize::colorRamp2(c(0, 0.5, 0.99), c("blue", "white", "red")), 
+  show_row_names = TRUE, show_column_names = FALSE,
+  cluster_rows = TRUE, cluster_columns = FALSE,
+  top_annotation = rowanno,
+  heatmap_legend_param = list(
+    legend_direction = "horizontal",
+    title_position = "topcenter",
+    title_gp = grid::gpar(fontsize = 22),
+    labels_gp = grid::gpar(fontsize = 22)
+  ),
+  row_names_gp = grid::gpar(fontsize = 22),
+  column_title = "Pseudotime",
+  column_title_gp = grid::gpar(fontsize = 30, fontface = "bold"), # Increase title size
+  column_title_side = "bottom",  # Ensure the title appears on the left
+  row_title_rot = 90,       # Rotate title (default is 90°)
+#  row_title_gap = unit(5, "mm") # Add spacing to make sure it’s visible
+)
+
+# Combine the legends into one area)
+ComplexHeatmap::draw(p, heatmap_legend_side = "top",  # Place the heatmap legend at the bottom
+  annotation_legend_side = "top",  # Place the annotation legend at the bottom
+  merge_legends = FALSE)
+dev.off()
+```
+
+# A5: Plot additional Pseudotime plots (not much used)
+## A5.1: Aggregate Position on DiffMap by case.
+Aggregate Position on DiffMap by case.
+```{r diffmap-by-case}
+# Aggregate by point
+diffpos <- reducedDim(beta, dimred_name)
+diffpos <- diffpos |> 
+  as_tibble() |> 
+  dplyr::mutate(DiffMap1 = DiffMap1 * -1)
+diffpos <- cbind(diffpos, colData(beta)[, c("donor_type", "case_id", "image_id", "slingshot")])
+
+diffpos_cases <- diffpos  |> 
+  as_tibble()  |> 
+  filter(!donor_type %in% c("Pancreatitis", "LongDuration")) %>%
+  group_by(donor_type, case_id) %>%
+  mutate("DiffMap1_Case" = mean(DiffMap1),
+         "DiffMap2_Case" = mean(DiffMap2)) %>%
+  select(c(DiffMap1_Case, DiffMap2_Case, case_id, donor_type)) %>%
+  distinct() %>%
+  mutate(case_id = factor(case_id, levels = metadata(beta)$cases),
+         donor_type = factor(donor_type, levels = metadata(beta)$stages)) %>%
+  arrange(donor_type, case_id)
+
+# Curves
+curves2 <- metadata(sds)$curves
+colnames(curves2)[1] <- "DiffMap1_Case"
+colnames(curves2)[2] <- "DiffMap2_Case"
+```
+
+Plot DiffMap by case.
+```{r plot-diffmap-by-case}
+p <- diffpos_cases %>%
+  ggplot(aes(x = DiffMap1_Case, y = DiffMap2_Case))+
+  geom_point(aes(color = donor_type), size = 3)+
+  geom_path(data = curves2 %>% arrange(Order),
+            aes(group = as.factor(Lineage)),
+            size = 1)+
+  scale_color_manual(values = palettes$stages3, name = "Stage",
+                      labels = metadata(spe)$stages)+
+  mytheme$standard() + 
+  labs(title = "", x = "DC1", y = "DC2") + 
+  mytheme$standard_new()
+if (do_print) print(p)
+
+fn <- paste0(paste(today, "Custom_Beta_DiffMap_Cases",
+                   sep = "_"), '.png')
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+```{r}
+extfig3g <- p
+saveRDS(extfig3g, file.path(paths$home_git, "figures", "extfig3g.rds"))
+```
+
+
+## A5.2: Flatten the slingshot curve
+
+```{r flatten-slingshot}
+plotsave_param_sling <- plotsave_param
+plotsave_param_sling$height <- 70
+
+# By image
+beta_flat <- colData(beta) %>%
+  as_tibble()
+
+beta_flat$y_axis <- sample(0:1000, nrow(beta_flat), replace=TRUE) / 1000
+
+p1 <- beta_flat %>%
+  sample_n(5000) %>%
+  ggplot(aes(x = slingshot, y = y_axis))+
+  geom_point(aes(color = donor_type), size = 0.1)+
+  scale_color_manual(values = palettes$stages3)+
+  ylim(-0.2, 1.2)+
+  mytheme$standard() + 
+  labs(title = "", x = "Pseudotime", y = "Donor") + 
+  # keep y-axis, but remove all labels and axis-tick labels
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank()) + 
+  xlim(0.13,0.89)
+if (do_print) print(p1)
+
+fn <- paste0(paste(today, "Beta_Slingshot_Flat_Images", sep = "_"), '.png')
+do.call(ggsave, c(list(fn, p1), plotsave_param_sling))
+
+# By case
+diffpos2 <- diffpos %>%
+  as_tibble() %>%
+  filter(!donor_type %in% c("Pancreatitis", "LongDuration")) %>%
+  group_by(donor_type, case_id) %>%
+  mutate("DiffMap1_Case" = mean(DiffMap1),
+         "DiffMap2_Case" = mean(DiffMap2),
+         "Slingshot_Case" = mean(slingshot)) %>%
+  select(c(DiffMap1_Case, DiffMap2_Case, Slingshot_Case, case_id, donor_type)) %>%
+  distinct() %>%
+  mutate(case_id = factor(case_id, levels = metadata(beta)$cases),
+         donor_type = factor(donor_type, levels = metadata(beta)$stages)) %>%
+  arrange(donor_type, case_id)
+
+diffpos2$y_axis <- sample(0:1000, nrow(diffpos2), replace=TRUE) / 1000 
+
+p2 <- diffpos2 %>% 
+  ggplot(aes(x = Slingshot_Case, y = y_axis))+
+  geom_point(aes(color = donor_type), size = 3)+
+  scale_color_manual(values = palettes$stages3, name = "Stage",
+              breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"),
+              labels = c("Control", "sAAb+", "mAAb+", "Onset"))+
+  ylim(-0.2, 1.2)+
+  mytheme$large() + 
+  labs(title = "", x = "Pseudotime", y = "Donor") + 
+  # keep y-axis, but remove all labels and axis-tick labels
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank()) + 
+  xlim(0,1)
+
+if (do_print) print(p2)
+
+fn <- paste0(paste(today, "Beta_Slingshot_Flat_Cases", sep = "_"), '.png')
+do.call(ggsave, c(list(fn, p2), plotsave_param_sling))
+
+saveRDS(p2, file.path(paths$home_git, "figures", "pseudotime_flat.rds"))
+
+p3 <- beta_flat %>%
+  filter(!donor_type %in% c("Pancreatitis", "LongDuration")) %>%
+  mutate(case_id = factor(case_id, levels = metadata(beta)$cases),
+         donor_type = factor(donor_type, levels = metadata(beta)$stages)) %>%
+  arrange(donor_type, case_id) %>%
+
+  ggplot(aes(y = slingshot, x = as.factor(case_id)))+
+  geom_boxplot(aes(fill=case_id), outlier.shape=NA)+
+  # geom_point(aes(color = donor_type), size = 0.1)+
+  scale_fill_manual(values = palettes$casestages)+
+  mytheme$standard()+
+  theme(legend.position = "none") + 
+  # rotate x-axsi labels
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+if (do_print) print(p3)
+
+fn <- paste0(paste(today, "Beta_Slingshot_Flat_Boxplot", sep = "_"), '.png')
+do.call(ggsave, c(list(fn, p3), plotsave_param))
+```
+
+Aggregate by ImageID and CaseID.
+```{r pseudo-image-case}
+pseudo <- colData(beta) %>%
+  as_tibble() %>%
+  select(c("donor_type", "case_id", "image_id", "slingshot")) %>%
+  filter(!donor_type %in% c("LongDuration", "Pancreatitis"))
+
+pseudo <- pseudo %>%
+  group_by(image_id) %>%
+  mutate("sling_image" = mean(slingshot))
+
+pseudo <- pseudo %>%
+  group_by(case_id) %>%
+  mutate("sling_case" = mean(slingshot))
+
+pseudo <- pseudo %>%
+  mutate(case_id = factor(case_id, levels = metadata(beta)$cases),
+         donor_type = factor(donor_type, levels = metadata(beta)$stages)) %>%
+  arrange(donor_type, case_id)
+```
+
+Plot Pseudotime by Case.
+```{r plot-pseudotime-case}
+to_del <- pseudo |> 
+  ungroup() |> 
+  dplyr::count(case_id) |> 
+  arrange(n) |> 
+  filter(n < 10) |> pull(case_id)
+
+temp <- pseudo %>%
+  select(c("donor_type", "case_id", "sling_case")) %>%
+  distinct() |> 
+  ungroup() |> 
+  mutate(donor_type = factor(donor_type, levels = metadata(beta)$stages[1:4])) |> 
+  filter(!case_id %in% to_del)
+
+temp_images <- pseudo %>%
+  select(c("donor_type", "case_id", "image_id", "sling_image")) %>%
+  distinct() |> 
+  ungroup() |> 
+  mutate(donor_type = factor(donor_type, levels = metadata(beta)$stages[1:4])) |> 
+  filter(!case_id %in% to_del)
+```
+
+## A5.3: Calc p-value differences by case.
+```{r pvals-baseline}
+test <- lmerTest::lmer(data = temp_images, sling_image ~ donor_type + (1 | case_id))
+
+m.emm <- emmeans::emmeans(test, ~ donor_type, pbkrtest.limit = 10000)
+# Pairwise comparisons (except for sAAb+ vs RecentOnset -> not required)
+
+p_vals <- m.emm |> 
+  emmeans::contrast("pairwise", adjust = "none") |> 
+  as_tibble() |> 
+  filter(contrast != "(sAAb+) - RecentOnset") |> 
+  mutate(p.adj = p.adjust(p.value, method = "fdr")) |> 
+    mutate(group1 = contrast, group2 = contrast) |>  
+    mutate(group1 = stringr::str_replace(group1, "\\s.*", "")) |> 
+    mutate(group2 = stringr::str_replace(group2, "^(?:\\S+\\s+\\S+\\s+)", "")) |> 
+    mutate(group1 = stringr::str_remove(group1, "\\(")) |>
+    mutate(group2 = stringr::str_remove(group2, "\\(")) |> 
+    mutate(group1 = stringr::str_remove(group1, "\\)")) |> 
+    mutate(group2 = stringr::str_remove(group2, "\\)")) |> 
+    mutate(.y. = "sling_image",
+           p = p.value,
+           statistic = t.ratio,
+           p.adj = p.adjust(p, method = "fdr"),
+           p.signif = cut(p.adj, breaks = c(-Inf, 0.001, 0.01, 0.05, 0.1, Inf), labels = c("***", "**", "*", "•", ""))
+           ) |> 
+    select(.y., group1, group2,
+           statistic, p, p.adj, p.signif)
+```
+
+Plot Pseudotime by Case with significances.
+
+```{r}
+# ggpubr:
+## Calculate p-values with ggpubr.
+# Use this for right formatting of DF
+stat.test <- temp_images |>  
+  ungroup() |> 
+  tukey_hsd(sling_image ~ donor_type)  |> 
+  filter(!(group1 == "sAAb+" & group2 == "RecentOnset")) |> 
+  select(group1, group2, term) |> 
+  add_xy_position(x = "donor_type", step.increase = 0.15, dodge = 0.8) |> 
+  distinct()
+
+# Combine formatting + P-value dataframe.
+stat.test.test <- p_vals |> 
+  left_join(stat.test, by = c("group1", "group2")) |> 
+  filter(p.adj < 0.1)
+
+bxp <- ggboxplot(temp, x = "donor_type", y = "sling_case", 
+                fill = "donor_type", add = "jitter",
+                add.params = list(size = 3, width = 0.2),
+                palette = palettes$stages, alpha = 1) + 
+      labs(x = "Stage", y = "Pseudotime")
+
+p <- bxp + 
+  stat_pvalue_manual(stat.test.test, label = "p.signif", tip.length = 0.02,
+                    size = 7, label.size = 7, 
+                    step.increase = 0) + 
+  mytheme$standard_new() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45, size = 22),
+        panel.grid.major.y = element_line(colour = "grey")) + 
+  scale_fill_manual(values = palettes$stages) + 
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) + 
+  ylim(0, 1.2)
+  
+fn <- paste0(paste(today, "Sling_Pseudotime_byCase",
+                   sep = "_"), ".png")
+plotsave_param2 <- plotsave_param
+plotsave_param2$width <- 200
+do.call(ggsave, c(list(fn, p), plotsave_param2))
+```
+
+Fig 1h
+```{r}
+fig1h <- p
+saveRDS(fig1h, file.path(paths$home_git, "figures", "fig1h.rds"))
+```
+
+# A.6: Correlation Pseudotime.
+Correlate Pseudotime to other features for its validation.
+
+## A6.1: Correlate Pseudotime to Donor C-peptide, HbA1c, and Islet Composition.
+-> Donor Cpeptide, HbA1c..
+
+### A6.1.1: Prepare Data.
+```{r correlation-pseudotime}
+pseudos <- colData(beta) %>%
+  as_tibble() %>%
+  select(c("donor_type", "case_id", "C_peptide", "image_id", "HbA1c", "slingshot")) %>%
+  filter(!donor_type %in% c("Pancreatitis"))
+
+islet_compo <- metadata(beta)$islet_compo
+case_compo <- islet_compo  |> 
+  as_tibble() |> 
+  # use first 4 digits of image_id
+  mutate(case_id = stringr::str_sub(image_id, 1, 4)) |>
+  group_by(case_id) |> 
+  summarize("islet_compo" = mean(fraction_Beta), .groups = "drop")
+
+## Get aggregated values.
+temp <- pseudos |> 
+  group_by(case_id, donor_type) |>
+  summarize("HbA1c" = mean(HbA1c, na.rm = TRUE),
+            "Cpep" = mean(C_peptide, na.rm = TRUE),
+            "slingshot" = mean(slingshot, na.rm = TRUE), .groups = "drop") |> 
+  filter(donor_type != "LongDuration") |>
+  mutate(donor_type = factor(donor_type, levels = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"))) |> 
+  mutate(donor_type_num = as.numeric(donor_type))
+
+temp |> dplyr::count(donor_type)
+```
+
+### A6.1.2: Correlations + plot for one.
+```{r correlation-pseudotimes-metadata}
+## Plot:
+cor.test(temp$HbA1c, temp$Cpep, method = "pearson", use = "pairwise.complete.obs")
+cor.test(temp$HbA1c, temp$slingshot, method = "pearson", use = "pairwise.complete.obs")
+cor.test(temp$Cpep, temp$slingshot, method = "pearson", use = "pairwise.complete.obs")
+cor.test(temp$donor_type_num, temp$slingshot, method = "pearson", use = "pairwise.complete.obs")
+
+temp2 <- temp |> inner_join(case_compo, by = "case_id")
+cor.test(temp2$islet_compo, temp2$slingshot, method = "pearson", use = "pairwise.complete.obs")
+
+fn <- paste0(paste(today, "Sling_HbA1c_Cpep", sep = "_"), '.png')
+p <- temp |> 
+  ggplot(aes(x = donor_type, y = slingshot))+
+  geom_boxplot(aes(fill = donor_type), outlier.shape = NA)+
+  geom_jitter(width = 0.1, size=3)+
+  scale_fill_manual("Cell Type",
+                    labels = metadata(beta)$stages,
+                    values = palettes$stages2)+
+  mytheme$large()+
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45))
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+-> Observe that pseudotime is correlated to HbA1c, C-peptide, disease stages, and islet composition.
+-> Validates pseudotime. 
+
+# A7: Pseudotime within ONE donor.
+## A7.1: Calculate Pseudotime variances within donors.
+
+### A.7.1.1: Prepare Data
+First, detect variances within donors.
+-> See plot: Beta_Slingshot_Flat_Boxplot.png
+
+Cases-IDs to keep.
+```{r cases-keep-variances}
+case_keep <- beta_flat |> 
+  ungroup() |>
+  filter(!is.na(donor_type )) |> 
+  select(case_id, age, distance_to_islet, islet_id, image_id, donor_type, case_id, slingshot) |> 
+  group_by(case_id, donor_type, age) |> 
+  summarize("mean_sling" = mean(slingshot, na.rm = TRUE),
+            "sd_sling" = sd(slingshot, na.rm = TRUE), 
+            "n" = n(), .groups = "drop") |> 
+  arrange(desc(sd_sling)) |> 
+  filter(n > 10) |> 
+  pull(case_id)
+```
+
+Prepare Data.
+
+```{r get-data-variances}
+channels_red <- rownames(beta)[!rownames(beta) %in% c("PDL1", "ARX", "Ki67")]
+
+df_beta_cells <- makePerCellDF(beta, features = channels_red, assay.type = "exprs", 
+  use.dimred = FALSE) |> 
+  as_tibble() |> 
+  select(c("donor_type", "case_id", "image_id", "slingshot"), all_of(channels_red)) |> 
+  filter(!donor_type %in% c("LongDuration", "Pancreatitis"))
+```
+
+
+---------------------------------
+UNUSED BELOW.
+
+## A7.2: Calculate Pseudotime variances within donors.
+
+Q: Within stages, which markers are associated with heterogeneity in pseudotime or across islets?
+-> Which markers are associated with disease WITHIN donors.
+
+Method:
+- z-scale variances per cases (pseudotime/non-pseudotime).
+- Block for donor-type (most variance).
+
+- Fit linear mixed-effects model.
+  - Pseudotime:       expression_islet_markerX ~ sd_total_pseudotime(case) + donor_type + (1|case_id)
+  - Non-pseudotime:   expression_islet_markerX ~ sd_total(case) + donor_type + (1|case_id)
+
+- Note: pseudotime was derived from marker expression (dependence).
+
+- Also: Compare expression between discrete variables.
+  - ICIs vs Insulitic ICIs (different script).
+
+### A7.2.1: Within-donors: Pseudotime heterogeneity.
+
+```{r islet-level-heterogeneity}
+### Aggregate by islet-level -> then SD by donor.
+sd_sling <- df_beta_cells |> 
+  filter(case_id %in% case_keep) |>
+  # z-scale slingshot.
+  mutate(slingshot = scale(slingshot, center = TRUE, scale = TRUE)) |>
+  # agg. by ROI-level.
+  group_by(case_id, donor_type, image_id) |>
+  summarise(slingshot = mean(slingshot, na.rm = TRUE), .groups = "drop") |>
+  # agg. by case_id.
+  group_by(case_id, donor_type) |> 
+  summarise(sd_slingshot = sd(slingshot, na.rm = TRUE),
+            mu_slingshot = mean(slingshot, na.rm = TRUE), .groups = "drop") |>
+  arrange(desc(sd_slingshot))
+
+# -> SD is highest in Recent-Onset.
+sd_sling |> group_by(donor_type) |> summarise(mean_sd_slingshot = mean(sd_slingshot))
+sd_sling |> group_by(donor_type) |> summarise(mean_mu_slingshot = mean(mu_slingshot))
+
+## Average expression of channels by image-level.
+beta_image <- df_beta_cells |> 
+  filter(case_id %in% case_keep) |>
+  # image-level.
+  group_by(case_id, donor_type, image_id) |>
+  summarise(across(all_of(channels_red), \(.x) mean(.x, na.rm = TRUE)),
+            slingshot = mean(slingshot, na.rm = TRUE), .groups = "drop")
+
+## Average expression of channels by case-id (for plotting).
+image_case <- beta_image |> 
+  group_by(case_id, donor_type) |>
+  summarise(across(all_of(channels_red), \(.x) mean(.x, na.rm = TRUE)),
+            slingshot = mean(slingshot, na.rm = TRUE), 
+            .groups = "drop") |> 
+  inner_join(sd_sling, by = c("case_id", "donor_type"))
+
+## Prepare data for linear mixed-effects model.
+lmm_input <- beta_image |>
+  inner_join(sd_sling, by = c("case_id", "donor_type")) |> 
+  tidyr::pivot_longer(cols = all_of(channels_red), names_to = "channel", values_to = "exprs") 
+
+## Calculating LMMs.
+res_lmm <- lmm_input |> 
+  tidyr::nest(data = -channel) |> 
+  # Epxprs_islet(markerX) ~ sd_pseudotime(case_id) + donor_type + (1|case_id)
+  mutate(model = purrr::map(data, ~ 
+    lmerTest::lmer(exprs ~ sd_slingshot + donor_type + (1|case_id), data = .x))) |> 
+  mutate(tidy = purrr::map(model, broom.mixed::tidy)) |> 
+  unnest(tidy) |> 
+  filter(term == "sd_slingshot") |> arrange(p.value)
+
+## Calculating LMMs ICCs.
+res_lmm <- lmm_input |> 
+  tidyr::nest(data = -channel) |> 
+  # Epxprs_islet(markerX) ~ sd_pseudotime(case_id) + donor_type + (1|case_id)
+  mutate(model = purrr::map(data, ~ 
+    lmerTest::lmer(exprs ~ slingshot + donor_type + (1|case_id), data = .x))) |> 
+  mutate(tidy = purrr::map(model, broom.mixed::tidy)) |> 
+  unnest(tidy) |> 
+  filter(term == "sd_slingshot") |> arrange(p.value)
+
+## Not adjusted by donor-type.
+res_lmm2 <- lmm_input |> 
+  tidyr::nest(data = -channel) |> 
+  # Epxprs_islet(markerX) ~ sd_pseudotime(case_id) + (1|case_id)
+  mutate(model = purrr::map(data, ~ 
+    lmerTest::lmer(exprs ~ sd_slingshot + (1|case_id), data = .x))) |> 
+  mutate(tidy = purrr::map(model, broom.mixed::tidy)) |> 
+  unnest(tidy) |> 
+  filter(term == "sd_slingshot") |> arrange(p.value)
+
+
+purrr::walk(channels_red, \(.x) {
+  print(paste0("Channel: ", .x))
+  p <- image_case |> 
+    select(case_id, donor_type, slingshot, sd_slingshot, !!.x) |>
+    ggplot(aes(x = sd_slingshot, y = log(get(.x)), color = donor_type))+
+    geom_point(size = 3)+
+    geom_smooth(method = "lm")+
+    stat_cor(method = "spearman")+
+    scale_color_manual(values = palettes$stages2)+
+    mytheme$standard_new() + 
+    labs(x = "SD Slingshot", y = paste("log:", .x, "expression"))
+
+  print(p)
+  fn <- paste0(paste(today, paste("Beta_Slingshot", .x), "SD", "donor_type",
+                    sep = "_"), '.png')
+  do.call(ggsave, c(list(fn, p), plotsave_param))
+
+    p <- image_case |> 
+        select(case_id, donor_type, slingshot, sd_slingshot, !!.x) |>
+        ggplot(aes(x = sd_slingshot, y = log(get(.x))))+
+        geom_point(size = 3)+
+        geom_smooth(method = "lm")+
+        stat_cor(method = "spearman")+
+        mytheme$standard_new() + 
+        labs(x = "SD Slingshot", y = paste("log:", .x, "expression"))
+
+    print(p)
+    fn <- paste0(paste(today, paste("Beta_Slingshot", .x), "SD",
+                        sep = "_"), '.png')
+    do.call(ggsave, c(list(fn, p), plotsave_param))
+})
+```
+
+### A7.2.2: Islet-level heterogeneity.
+Here, we calculate the heterogeneity of islet-level expression by case_id.
+Without pseudotime.
+Note: this is limited by channel collinearity. 
+-> That is, total heterogeneity is not captured by a single channel, 
+but rather by the total expression of all channels.
+
+#### All channels.
+
+```{r islet-level-heterogeneity-no-pseudotime}
+## exprs_markerX_islet ~ sd(exprs_ALL_caseID) + (1|case_id)
+## Take mean of sd of all markers per case_id.
+sd_case <- beta_image |> 
+  # z-scale all markers.
+  mutate(across(all_of(channels_red), ~ scale(.x, center = TRUE, scale = TRUE))) |>
+  pivot_longer(cols = all_of(channels_red), names_to = "channel", values_to = "exprs") |>
+  # SD by donor + channel.
+  group_by(case_id, donor_type, channel) |> 
+  summarise(sd_exprs = sd(exprs, na.rm = TRUE), .groups = "drop") |> 
+  # total SD by donor.
+  group_by(case_id, donor_type) |> 
+  summarise(sd_exprs = mean(sd_exprs, na.rm = TRUE), .groups = "drop") |> 
+  arrange(desc(sd_exprs))
+
+## Again: show highest SD by donor_type.
+sd_case |> group_by(donor_type) |> summarise(mean_sd_exprs = mean(sd_exprs))
+
+## Decent correlation across slingshot/expression.
+sd_sling |> 
+  inner_join(sd_case, by = c("case_id", "donor_type")) |> 
+  # Cor ~ 0.6
+  summarise(cor(sd_slingshot, sd_exprs, method = "spearman"))
+
+## Average expression of channels by case-id (for plotting).
+image_case_no_ps <- beta_image |> 
+  group_by(case_id, donor_type) |>
+  summarise(across(all_of(channels_red), \(.x) mean(.x, na.rm = TRUE)),
+            slingshot = mean(slingshot, na.rm = TRUE), .groups = "drop") |> 
+  arrange(case_id, donor_type) |> 
+  inner_join(sd_case, by = c("case_id", "donor_type"))
+
+## Prepare data for linear mixed-effects model.
+
+
+purrr::walk(channels_red, \(.x) {
+  print(paste0("Channel: ", .x))
+  p <- image_case_no_ps |> 
+    select(case_id, donor_type, sd_exprs, !!.x) |>
+    ggplot(aes(x = sd_exprs, y = get(.x), color = donor_type))+
+    geom_point(size = 3)+
+    geom_smooth(method = "lm")+
+    stat_cor(method = "spearman")+
+    scale_color_manual(values = palettes$stages2)+
+    mytheme$standard_new() + 
+    labs(x = "SD Case", y = paste("log:", .x, "expression"))
+
+  print(p)
+  fn <- paste0(paste(today, paste("Beta_Heterogeneity", .x), "SD",
+                    sep = "_"), '.png')
+  do.call(ggsave, c(list(fn, p), plotsave_param))
+})
+```
+
+### Test with non-collinear channels.
+Delete correlated channels.
+```{r identify-collinear-channels}
+library(olsrr)
+
+tt <- image_case_no_ps |> 
+    filter(donor_type == "RecentOnset") |> 
+    mutate(across(all_of(channels_non_coll), ~ scale(.x, center = TRUE, scale = TRUE)))
+tt
+model <- lm(data = tt, sd_exprs ~ 
+    B2M + HLA_ABC + MX1 + ADAR + # Inflammation)
+    PAX6 + NKX2_2 + FoxA2 + NKX6_1 + PDX1 + # Nuclear
+    PCSK1 + Cpep + IAPP + INS + ProINS +  # Hormones
+    CHGA + ATPIF1 + SYP + ECad + C3+ # Other
+    ERN1 + XBP1 + NFkB + WFS1 + TXNIP +  # Stress
+    CD155 + CAIX + CD9)
+ols_vif_tol(model)
+
+## Progressively eliminated largest VIFs until all < 5.
+## Also, no cor > 0.7 // cor < -0.7.
+model <- lm(data = tt, sd_exprs ~ 
+    HLA_ABC + 
+    MX1 + # Inflammation)
+    NKX2_2 + 
+    NKX6_1 + # Nuclear
+    PCSK1 + IAPP + ProINS + # Hormones/Cuts.
+    ATPIF1 +  # Other
+    ERN1 + 
+    TXNIP +  # Stress
+    CD9)
+
+ols_vif_tol(model)
+
+channels_non_coll <- c(
+    "HLA_ABC", # Long-term IFN
+    "MX1", # Acute IFN.
+    "NKX2_2", # Islet TF.
+    "NKX6_1", # Beta-TF.
+    "PCSK1",  # hormone processing.
+    "ProINS", "IAPP", # Hormones.
+    "ATPIF1",  # Metabolism.
+    "ERN1", # ER-stress.
+    "TXNIP", # Stress.
+    "CD9" # Other
+    )
+
+# Plot cor_matrix
+cor_matrix <- cor(
+    tt |> select(all_of(channels_non_coll)), 
+        use = "pairwise.complete.obs", 
+        method = "spearman")
+
+corrplot::corrplot(cor_matrix, method = 'number')
+```
+
+```{r}
+## Recompute sd_exprs.
+sd_case_non_coll <- beta_image |> 
+  # z-scale all markers.
+  mutate(across(all_of(channels_non_coll), ~ scale(.x, center = TRUE, scale = TRUE))) |>
+  pivot_longer(cols = all_of(channels_non_coll), names_to = "channel", values_to = "exprs") |>
+  # SD by donor + channel.
+  group_by(case_id, donor_type, channel) |> 
+  summarise(sd_exprs = sd(exprs, na.rm = TRUE), .groups = "drop") |> 
+  # total SD by donor.
+  group_by(case_id, donor_type) |> 
+  summarise(sd_exprs = mean(sd_exprs, na.rm = TRUE), .groups = "drop") |> 
+  arrange(desc(sd_exprs))
+
+## Again: show highest SD by donor_type.
+sd_case_non_coll |> group_by(donor_type) |> summarise(mean_sd_exprs = mean(sd_exprs))
+
+## Decent correlation across slingshot/expression.
+sd_sling |> 
+  inner_join(sd_case_non_coll, by = c("case_id", "donor_type")) |> 
+  # Cor ~ 0.6
+  summarise(cor(sd_slingshot, sd_exprs, method = "spearman"))
+
+## Average expression of channels by case-id (for plotting).
+image_case_no_ps_coll <- beta_image |> 
+  select(case_id, donor_type, image_id, slingshot, all_of(channels_non_coll)) |>
+  group_by(case_id, donor_type) |>
+  summarise(across(all_of(channels_non_coll), \(.x) mean(.x, na.rm = TRUE)),
+            slingshot = mean(slingshot, na.rm = TRUE), .groups = "drop") |> 
+  arrange(case_id, donor_type) |> 
+  inner_join(sd_case_non_coll, by = c("case_id", "donor_type"))
+```
+
+
+```{r}
+## Not incredibly predictive.
+res_lmm_no_ps_coll <- beta_image |> 
+  inner_join(sd_case_non_coll, by = c("case_id", "donor_type")) |>
+  filter(donor_type == "RecentOnset") |>
+  select(case_id, donor_type, sd_exprs, all_of(channels_non_coll)) |>
+  pivot_longer(cols = all_of(channels_non_coll), names_to = "channel", values_to = "exprs") |>
+  tidyr::nest(data = -channel) |>
+  mutate(model = purrr::map(data, ~ 
+    lmerTest::lmer(exprs ~ sd_exprs + (1|case_id), data = .x))) |> 
+  mutate(tidy = purrr::map(model, broom.mixed::tidy)) |> 
+  unnest(tidy) |> 
+  filter(term == "sd_exprs") |> 
+  arrange(p.value)
+
+test_t <- beta_image |> 
+  inner_join(sd_case_non_coll, by = c("case_id", "donor_type")) |>
+  filter(donor_type == "RecentOnset") |>
+  select(case_id, donor_type, sd_exprs, all_of(channels_non_coll)) |>
+  pivot_longer(cols = all_of(channels_non_coll), names_to = "channel", values_to = "exprs") 
+  
+lr_iapp <- lmerTest::lmer(exprs ~ (1|case_id), data = test_t |> filter(channel == "IAPP"))
+performance::model_performance(lr_iapp)$ICC
+
+## exprs ~ (1|case_id) -> ICC = R2_cond; as fixed effects are not included.
+
+## High ICC indicates that the variance is explained by the case_id.
+## Low ICC indicates that the variance is not explained by the case-id -> higher intra-case heterogeneity.
+purrr::map(channels_non_coll, \(.x) {
+  lr <- lmerTest::lmer(exprs ~ (1|case_id), data = test_t |> filter(channel == .x))
+  print(paste0("Channel: ", .x, " - ICC: ", performance::model_performance(lr)$ICC))
+  print(paste0("Channel: ", .x, " - R2cond: ", performance::model_performance(lr)$R2_conditional))
+})
+
+res_lmm_no_ps
+
+purrr::walk(channels_non_coll, \(.x) {
+  print(paste0("Channel: ", .x))
+  p <- image_case_no_ps |> 
+    select(case_id, donor_type, sd_exprs, !!.x) |>
+    ggplot(aes(x = sd_exprs, y = get(.x), color = donor_type))+
+    geom_point(size = 3)+
+    geom_smooth(method = "lm")+
+    stat_cor(method = "spearman")+
+    scale_color_manual(values = palettes$stages2)+
+    mytheme$standard_new() + 
+    labs(x = "SD Case", y = paste("log:", .x, "expression"))
+
+  print(p)
+  fn <- paste0(paste(today, paste("Beta_Heterogeneity", .x), "SD", "non_coll",
+                    sep = "_"), '.png')
+  do.call(ggsave, c(list(fn, p), plotsave_param))
+})
+```
+
+Cases with high SD per case.
+```{r}
+sd_case
+```
+
+Others: 
+ND: ADAR down, CAIX up, CHGA up, ECad down, ERN1 up, INS up, PCSK1 up, XBP1up
+sAAB+: CAIX up, E-Cad up, ERN1 up, MX1up; TXNIPup, XBP1up
+mAAb+: CHGA up, ERN1up, NFkB up, PCSK1 up.
+
+Recent-Onset: Cpep loss, B2M up; HLA-ABC; INS loss, MX1 up, ProINS down.
+
+# A8: Acinar cells on beta-cell defined pseudotime
+
+## A8.1: Get Acinar Cells.
+Get acinar cells
+
+```{r}
+acinar <- spes$Acinar
+```
+
+```{r acinar-cells}
+cur_assay <- "exprs"
+
+acinar_dat <- makePerCellDF(acinar, features = unique(rownames(acinar)),
+                         assay.type = cur_assay, use.dimred = FALSE) %>%
+                         select(-c(HBP)) |> 
+  # delete duplicated column
+  as_tibble() |>
+  mutate(case_id = factor(case_id, levels = metadata(acinar)$cases),
+         donor_type = factor(donor_type, levels = metadata(acinar)$stages)) %>%
+  arrange(case_id, donor_type)
+
+# Add slingshot
+acinar_dat <- dplyr::left_join(acinar_dat, 
+                    unique(pseudo[, c("image_id", "sling_image", "sling_case")]),
+                    by = "image_id")
+```
+
+Sample random acinar cells for plotting. 
+```{r}
+# Reduce; sample 100 random rows:
+# Perform the sampling
+acinar_dat_sampled <- acinar_dat %>%
+  group_by(case_id) %>%
+  group_modify(~ slice_sample(.x, n = min(100, nrow(.x))))
+
+acinar_dat_sampled<- acinar_dat_sampled |> 
+  tidyr::pivot_longer(cols = rownames(acinar)[rownames(acinar) != "HBP"], names_to = "channel", values_to = cur_assay)
+```
+
+Plot.
+```{r acinar-cells-plot}
+p <- acinar_dat_sampled %>%
+  ggplot(aes(x = sling_image, y = exprs))+
+  geom_point(aes(color = donor_type), size = 0.5)+
+  geom_smooth(method = "loess")+
+  facet_wrap(~channel, ncol=10)+
+  scale_color_manual(values = palettes$stages2)+
+  # labs(x = cur_model, y = cur_assay,
+  #      title = paste(cur_model, names(sces)[j]), color = "T1D stage")+
+  guides(color = guide_legend(override.aes = list(size=2)))+ 
+  mytheme$large()
+if (do_print) print(p)
+
+fn <- paste0(paste(today, "Slingshot_Acinar", "Pseudotime", "Markers",
+                   sep = "_"), '.png')
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+#acinar_dat <- acinar_dat[, .SD[sample(.N, min(100,.N))], by = "case_id"]
+#acinar_dat <- melt.data.table(
+#  acinar_dat, id.vars = colnames(acinar_dat),
+#  measure.vars = rownames(acinar),
+#  variable.name = "channel", value.name = cur_assay)
+```
+Results:
+Acinar Cell Changes.
+As observed previously: AMY vs HLA-ABC negative correlation.
+AMY-loss! 
+ATPFIF1 potential increase?
+HLA-ABC strong increase in T1D.
+
+## A8.2: Plot acinar cells expression by distance to islet.
+```{r acinar-cells-distance-to-islet}
+p <- acinar_dat_sampled %>%
+  ggplot(aes(x = log1p(abs(distance_to_islet)), y = exprs))+
+  geom_point(aes(color = donor_type), size = 0.5)+
+  geom_smooth(method = "loess")+
+  facet_wrap(~channel, ncol=10)+
+  scale_color_manual(values = palettes$stages2)+
+  # labs(x = cur_model, y = cur_assay,
+  #      title = paste(cur_model, names(sces)[j]), color = "T1D stage")+
+  guides(color = guide_legend(override.aes = list(size=2)))+ 
+  mytheme$large()
+if (do_print) print(p)
+
+fn <- paste0(paste(today, "Slingshot_Acinar", "Distance", "Markers",
+                   sep = "_"), '.png')
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+
+Notably, TXNIP + HLA-ABC + B2M highest around islet.
+AMY is actually lowest around the islet - and highest far from islet.
+
+Select Peri-Islet Localized Acinar Cells. 
+Here, higher AMY + HLA-ABC.
+```{r}
+p <- acinar_dat_sampled %>%
+  filter((channel %in% c("AMY", "HLA_ABC")) & (distance_to_islet < -10)) %>%
+  ggplot(aes(x = log(abs(distance_to_islet)), y = exprs))+
+  geom_point(aes(color = donor_type), size = 0.5)+
+  geom_smooth(method = "loess")+
+  facet_wrap(~channel, ncol=2)+
+  scale_color_manual(values = palettes$stages2)+
+  # labs(x = cur_model, y = cur_assay,
+  #      title = paste(cur_model, names(sces)[j]), color = "T1D stage")+
+  guides(color = guide_legend(override.aes = list(size=2)))+ 
+  mytheme$large()
+if (do_print) print(p)
+
+fn <- paste0(paste(today, "Slingshot_Acinar", "Distance", "AMY",
+                   sep = "_"), '.png')
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+
+
+```{r}
+p <- acinar_dat_sampled %>%
+  filter(channel == "AMY" & distance_to_islet < -2) %>%
+  
+  ggplot(aes(x = log(abs(distance_to_islet)), y = sling_image,
+             color = donor_type))+
+  geom_point(size = 0.5)+
+  scale_color_manual(values = palettes$stages2)+
+  # labs(x = cur_model, y = cur_assay,
+  #      title = paste(cur_model, names(sces)[j]), color = "T1D stage")+
+  guides(color = guide_legend(override.aes = list(size=2)))+ 
+  mytheme$large()
+if (do_print) print(p)
+
+fn <- paste0(paste(today, "Slingshot", "Distance", "Acinar",
+                   sep = "_"), '.png')
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+p <- acinar_dat_sampled %>%
+  filter(channel == "AMY" & distance_to_islet < -2) %>%
+  
+  ggplot(aes(x = log(abs(distance_to_islet)), y = sling_image,
+             color = exprs))+
+  geom_point(size = 0.5)+
+  scale_color_viridis()+
+  # labs(x = cur_model, y = cur_assay,
+  #      title = paste(cur_model, names(sces)[j]), color = "T1D stage")+
+  guides(color = guide_legend(override.aes = list(size=2)))+ 
+  mytheme$large()
+if (do_print) print(p)
+
+fn <- paste0(paste(today, "Slingshot", "Distance", "Acinar", "expression",
+                   sep = "_"), '.png')
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+-> Could calculate here: 
+- LM(expression ~ pseudotime + distance_to_islet)

@@ -1,0 +1,872 @@
+---
+title: "06_CellTypesIslet_cells_Islet"
+author: "Nicolas Damond, Nathan Steenbuck"
+date: "Created: 24 May, 2022; Compiled: `r format(Sys.time(), '%d %b, %Y')`"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+if (rstudioapi::isAvailable()) {
+  script_name <- basename(rstudioapi::getSourceEditorContext()$path)
+} else {
+  script_name <- knitr::current_input()
+}
+
+cur_user <- Sys.info()[["user"]]
+script_name <- "06_CellTypesIslet_cells_Islet.Rmd"
+
+if (cur_user == "ubuntu") {
+    source(file.path("/", "mnt", "central_nas", "projects", 
+    "type1_diabetes", "nathan", "T1D_Vol", "T1D_analysis", 
+    "analysis", "helpers.R"))
+  #n_cores <- future::availableCores() - 1
+  n_cores <- 4
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  knitr::opts_knit$set(root_dir = paths$home_data)
+  do_print <- FALSE
+} else {
+  source(file.path("/", "home", "nsteen", "scripts", "T1D_analysis", "analysis", "helpers.R"))
+  n_cores <- 8
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  paths$folder_script <- paths$cluster_folder_script
+  paths$folder_in <- paths$cluster_folder_in
+  paths$folder_out <- paths$cluster_home 
+  knitr::opts_knit$set(root_dir = paths$cluster_home)
+  do_print <- TRUE
+}
+
+seed <- 123456
+set.seed(seed)
+options <- furrr::furrr_options(seed = seed)
+paths$prev <- paste("05_CellCategories", paths$object_type, paths$panel_type, sep = "_")
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+# **Goal**
+
+The goal of this script is to attribute consensus cell types based on the clustering results obtained at the previous step.  
+Also, potential islet cells cells outside of the islet-mask are attributed to islet cell types using a random forest classifier 
+trained on the islet cells inside the islet mask.  
+Finally, segmentation scores are calculated for each islet cell type based on the expression of cell type-specific hormones versus non-specific hormones.
+
+# **Settings**  
+
+## Load packages
+
+```{r packages, results='hide'}
+suppressPackageStartupMessages(c(
+  library(data.table),
+  library(dplyr),
+  library(SpatialExperiment),
+  library(parallel)
+))
+```
+
+## Paths and settings
+
+```{r settings}
+# Paths
+if (!dir.exists(paths$folder_script)) dir.create(paths$folder_script)
+plotsave_param$path <- paths$folder_script
+plotsave_param_large$path <- paths$folder_script
+
+# Misc settings
+today <- gsub("-", "", Sys.Date())
+```
+
+##  Read in the data
+
+Load the SpatialExperiment (SPE) object saved at the previous step.
+
+```{r load-data}
+fn_spe <- file.path(paths$folder_out, paths$prev, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+spe <- readRDS(fn_spe)
+print(spe)
+```
+
+## Methods and assays
+
+Select channels (`channels_clust`), assays (`assay_sel`) and reduced dimensions (`dimred_sel`) to use.
+
+```{r select-methods-assays}
+methods_sel <- c("Pheno1", "Leiden1")
+
+#assay_sel <- c("fastMNN", "scaled")
+assay_sel <- c("fastMNN_case_id", "scaled")
+#names(assay_sel) <- c("exprs", "scaled")
+names(assay_sel) <- c("exprs", "exprs", "scaled")
+writeLines(c("Assays:", assay_sel[assay_sel %in% assayNames(spe)]))
+
+dimred_sel <- c("UMAP")
+writeLines(c("\nReduced dimensions:", dimred_sel))
+
+channels <- rownames(spe)[!(grepl("DNA|H3", rownames(spe)))]
+```
+
+## Subset SPE
+
+```{r subset-islet-cells}
+# Extract the metadata (to avoid conflicts when merging the SCEs)
+meta <- metadata(spe)
+spatial_coords <- spatialCoords(spe)
+colpairs <- colPairs(spe)
+
+# Split the SPE object (cells outside vs inside islets)
+sce_isl <- spe[, spe$distance_to_islet >= 0]
+sce_exo <- spe[, !(colnames(spe) %in% colnames(sce_isl))]
+
+# Convert to SingleCellExperiment
+sce_isl <- as(sce_isl, "SingleCellExperiment")
+sce_exo <- as(sce_exo, "SingleCellExperiment")
+remove(spe)
+```
+
+
+
+# **Consensus cell types**
+
+Attribute consensus cell types for islet cells based on the clustering performed with the previous script.
+
+## Packages
+
+```{r packages2, results='hide'}
+suppressPackageStartupMessages(c(
+  library(ggplot2),
+  library(ggalluvial),
+  library(heatmaply),
+  library(scuttle),
+  library(ranger),
+  library(cytomapper)
+))
+```
+
+
+## Cell type concordance
+
+Compare concordance of cell types attributed using different methods.
+
+```{r celltypes-concordance}
+celltype_cols <- colnames(colData(sce_isl))[grepl(paste0(
+  "CellType_", methods_sel, collapse = "|"), colnames(colData(sce_isl)))]
+
+names(celltype_cols) <- celltype_cols
+celltype_cols <- celltype_cols[!celltype_cols %in% c("CellType_Pheno1_fastMNN_case_id")]
+
+celltypes <- as.data.table(colData(sce_isl)[
+  , c("cell_id", "case_id", "donor_type", "image_number", "cell_number", celltype_cols)])
+
+ct_combination <- t(combn(unique(celltype_cols), 2))
+
+for (i in (seq_along(ct_combination[, 1]))) {
+  cat("\n", ct_combination[i, 1], " vs ", ct_combination[i, 2], "\n")
+  
+  ct_concord <- nrow(
+    celltypes[get(ct_combination[i, 1]) == get(ct_combination[i, 2]), ]
+  )
+  ct_discord <- nrow(
+    celltypes[get(ct_combination[i, 1]) != get(ct_combination[i, 2]), ]
+  )
+  cat("Number of cells with concordant cell types: ", ct_concord,
+      "\nNumber of cells with discordant cell types: ", ct_discord,
+      "\nPercentage of cells with concordant cell types:",
+      100 * ct_concord / (ct_discord + ct_concord), "%", "\n")
+}
+```
+The same assays have a high concordance.
+Scaled assay: Pheno vs Leiden (95 % concordance).
+
+Different assays have a lower concordance.
+Pheno: scaled vs fastMNN: 83 %
+Across clust/assay have similar lower concordance:
+Pheno-fastMNN vs Leiden-scaled: 84 %
+
+## Attribute consensus cell types
+
+### Majority vote
+
+Cells for which 3 out of 4 methods agree on the cell type are attributed this cell type, other cells as considered as "Ambiguous".
+
+```{r consensus-celltype}
+# Majority vote
+func_majority_vote <- function(x) {
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+celltypes[, cell_type := apply(celltypes, 1, func_majority_vote)]
+celltypes[, Paste := do.call(paste0, .SD),
+          .SDcols = grep("CellType_", colnames(celltypes))]
+## Count the number of times the majority-voted cell type appears in the Paste column
+celltypes[, count := stringr::str_count(Paste, cell_type)]
+celltypes[count < 2, cell_type := "Ambiguous"]
+#celltypes[, `:=`(Paste = NULL, count = NULL)]
+
+cat("Percentage of cells with an ambiguous cell type: ",
+    100 * nrow(celltypes[cell_type == "Ambiguous"]) / nrow(celltypes),
+    "%")
+
+## Frequency of nr. of counts per cell type.
+celltypes |> 
+  as_tibble() |>
+  group_by(cell_type)  |> 
+  mutate(n_cell = n())  |> 
+  ungroup() |> 
+  group_by(cell_type, count, n_cell) |>
+  # freq. per cell_type.
+  summarise(n = n() / dplyr::first(n_cell)) |>
+  print(n = "all")
+```
+
+Note: beta, alpha-cells are pretty robust. (~ 80, 70% counts = 5)
+Gamma, delta, epsilon: less robust (45 % counts = 5 (or 4))
+Non-islet: problematic! (only 20 % counts = 5)
+
+### Rescue rare cells
+
+Epsilon or gamma cells are sometimes too rare for the above methods to work. 
+Usually they are best identified using scaled counts, so if these rare cells 
+cannot be identified using different counts transformations, cell types are 
+attributed to them based on scaled counts only.
+
+```{r rescue-rare-populations}
+# # Select cell type columns based on scaled counts
+# cn_rare_celltypes <- colnames(colData(sce_isl))[grepl(paste0(
+#   paste("cell_type", methods_sel, "scaled", sep = "_"), collapse = "|"),
+#   colnames(colData(sce_isl)))]
+# 
+# # Attribute cell types
+# celltypes[get(cn_rare_celltypes[1]) == "Epsilon" &
+#             get(cn_rare_celltypes[2]) == "Epsilon", cell_type := "Epsilon"]
+# 
+# celltypes[get(cn_rare_celltypes[1]) == "Gamma" &
+#             get(cn_rare_celltypes[2]) == "Gamma", cell_type := "Gamma"]
+```
+
+### Compare cell type attributions
+
+```{r celltypes-alluvial, warning=FALSE}
+celltype_cols <- c("cell_type", colnames(colData(sce_isl))[grepl(paste0(
+  "CellType_", methods_sel, collapse = "|"), colnames(colData(sce_isl)))])
+
+names(celltype_cols) <- celltype_cols
+celltype_cols <- celltype_cols[!celltype_cols %in% c("CellType_Pheno1_fastMNN_case_id")]
+
+p <- celltypes[, .(number = .N), by = celltype_cols] |>
+  ggplot(aes(axis1 = get(celltype_cols[1]),
+             axis2 = get(celltype_cols[2]),
+             axis3 = get(celltype_cols[3]),
+             axis4 = get(celltype_cols[4]),
+             #axis5 = get(celltype_cols[3]),
+             #axis6 = get(celltype_cols[4]),
+             y = number)) +
+  ggalluvial::geom_stratum() +
+  geom_text(stat = "stratum", infer.label = TRUE) +
+  ggalluvial::geom_alluvium(aes(fill = get(celltype_cols[1]))) +
+  scale_x_discrete(limits = gsub("cell_type_", "", celltype_cols)) +
+  scale_fill_manual(values = palettes$colors[c(TRUE, FALSE)],
+                    name = "Cell Type") +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+if (do_print) {
+  print(p)
+}
+
+fn <- paste0(paste(today, "CellTypes", "alluvial", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+### Number of cells by cell type
+
+```{r cells-per-celltype}
+tibble::as_tibble(celltypes) |>
+  dplyr::select(cell_type) |>
+  dplyr::group_by(cell_type) |>
+  add_count(name = "Number of cells") |>
+  distinct()
+```
+
+
+## Add celltyes to islet SPE
+
+```{r add-celltypes-spe-islet}
+celltypes <- celltypes[order(match(celltypes$cell_id, colnames(sce_isl))), ]
+colData(sce_isl)$cell_type <- celltypes$cell_type
+```
+
+
+
+# **Islet cells outside islet masks**
+
+Some islet cells may found themselves outside the islet masks generated during preprocessing. 
+In that case, their distance to islet is smaller than 0 and they are not considered for clustering in the previous script.
+Here, we use a random forest classifier to attribute islet cell types to cells with a distance to islet < 0. 
+Training is performed on the `sce_isl` object and cell types are predicted for cells in the `sce_exo` object. 
+As above, final cell types are attributed based on a majority vote.
+
+## Train classifier
+
+```{r random-forest-train-predict}
+channels_clust <- rownames(rowData(sce_isl)[rowData(sce_isl)$clustering == 1, ])
+n_features <- length(channels_clust)
+
+assay_sel <- c("fastMNN_case_id", "scaled")
+names(assay_sel) <- c("exprs", "scaled")
+
+# Vector to map cell types to integers
+celltype_map <- c("Alpha" = 1L, "Beta" = 2L, "Delta" = 3L, "Gamma" = 4L,
+                  "Epsilon" = 5L, "NonIslet" = 6L, "Ambiguous" = 7L)
+celltype_map_inv <- setNames(names(celltype_map), celltype_map)
+
+purrr::walk(assay_sel, \(cur_assay) {
+  purrr::walk(methods_sel, \(cur_method) {
+    clust_name <- paste("CellType", cur_method, cur_assay, sep = "_")
+    print(clust_name)
+
+    if (paste(cur_method, cur_assay, sep = "_") != "Pheno1_fastMNN_case_id") {  
+
+      # Define training (`sce_isl`) and test data (`sce_exo`)
+      #training_data <- cbind(data.frame(t(assay(sce_isl, cur_assay))),
+      #                       cluster = sce_isl[[clust_name]])
+      if (cur_assay %in% assayNames(sce_isl)) {
+        training_data <- dplyr::bind_cols(t(assay(sce_isl, cur_assay)),
+                                            cluster = sce_isl[[clust_name]])
+        test_data <- dplyr::bind_cols(t(assay(sce_exo, cur_assay)),
+                                        cluster = sce_exo[[clust_name]])
+      } else {
+        training_data <- dplyr::bind_cols(reducedDim(sce_isl, cur_assay),
+                                          cluster = sce_isl[[clust_name]])
+        test_data <- dplyr::bind_cols(reducedDim(sce_exo, cur_assay),
+                                      cluster = sce_exo[[clust_name]])
+      }
+
+      training_data$cluster <- celltype_map[training_data$cluster]
+      test_data$cluster <- celltype_map[test_data$cluster]
+
+      # Train
+      ranger_model <- ranger(
+        formula = cluster ~ .,
+        data = training_data,
+        mtry = floor(n_features / 3),
+        num.trees = 10 * n_features,
+        classification = TRUE,
+        num.threads = n_cores,
+        seed = seed)
+
+      # Predict
+      rf_predict <- predict(ranger_model, test_data)
+      sce_exo[[clust_name]] <<- rf_predict$predictions
+      sce_exo[[clust_name]] <<- celltype_map_inv[sce_exo[[clust_name]]]
+    }
+  })
+})
+remove(training_data, test_data, ranger_model, rf_predict)
+```
+
+```{r save-sce-exo}
+fn_spe_exo <- file.path(paths$folder_script, paste0(paths$object_type, "_", paths$panel_type, "_exo.rds"))
+saveRDS(sce_exo, fn_spe_exo)
+```
+
+## Cell type concordance
+
+Compare concordance of cell types attributed using different methods.
+
+```{r celltypes-concordance-exo}
+celltype_cols <- colnames(colData(sce_exo))[grepl(paste0(
+  "CellType_", methods_sel, collapse = "|"), colnames(colData(sce_exo)))]
+
+celltypes <- as.data.table(colData(sce_exo)[
+  , c("cell_id", "case_id", "image_number", "cell_number", celltype_cols)])
+
+ct_combination <- t(combn(unique(celltype_cols), 2))
+
+
+for (i in seq_along(ct_combination[, 1])) {
+  cat("\n", ct_combination[i, 1], " vs ", ct_combination[i, 2], "\n")
+  
+  ct_concord <- nrow(
+    celltypes[get(ct_combination[i, 1]) == get(ct_combination[i, 2]), ]
+  )
+  ct_discord <- nrow(
+    celltypes[get(ct_combination[i, 1]) != get(ct_combination[i, 2]), ]
+  )
+  cat("Number of cells with concordant cell types: ", ct_concord,
+      "\nNumber of cells with discordant cell types: ", ct_discord,
+      "\nPercentage of cells with concordant cell types:",
+      100 * ct_concord / (ct_discord + ct_concord), "%", "\n")
+}
+```
+
+## Attribute consensus cell types
+
+### Majority vote
+
+Cells for which 3 out of 4 methods agree on the cell type are attributed this cell type, other cells as considered as "Ambiguous".
+
+```{r consensus-celltype-exo}
+# Majority vote
+## Count the number of times the majority-voted cell type appears in the Paste column
+celltypes[, cell_type := apply(celltypes, 1, func_majority_vote)]
+celltypes[, Paste := do.call(paste0, .SD),
+          .SDcols = grep("CellType_", colnames(celltypes))]
+celltypes[, count := stringr::str_count(Paste, cell_type)]
+celltypes[count < 2, cell_type := "Ambiguous"]
+#celltypes[, `:=`(Paste = NULL, count = NULL)]
+
+cat("Percentage of cells with an ambiguous cell type: ",
+    100 * nrow(celltypes[cell_type == "Ambiguous"]) / nrow(celltypes),
+    "%")
+```
+
+
+### Compare cell type attributions
+
+```{r celltypes-alluvial-exo, warning=FALSE}
+celltype_cols <- c("cell_type", colnames(colData(sce_exo))[grepl(paste0(
+  "CellType_", methods_sel, collapse = "|"), colnames(colData(sce_exo)))])
+
+names(celltype_cols) <- celltype_cols
+celltype_cols <- celltype_cols[!celltype_cols %in% c("CellType_Pheno1_fastMNN_case_id")]
+
+p <- celltypes[, .(number = .N), by = celltype_cols] |>
+  ggplot(aes(axis1 = get(celltype_cols[1]),
+             axis2 = get(celltype_cols[2]),
+             axis3 = get(celltype_cols[3]),
+             axis4 = get(celltype_cols[4]),
+             #axis5 = get(celltype_cols[4]),
+             #axis6 = get(celltype_cols[6]),
+             y = number)) +
+  ggalluvial::geom_stratum() +
+  ggplot2::geom_text(stat = "stratum", infer.label = TRUE) +
+  ggalluvial::geom_alluvium(aes(fill = get(celltype_cols[1]))) +
+  ggplot2::scale_x_discrete(limits = gsub("cell_type_", "", celltype_cols)) +
+  ggplot2::scale_fill_manual(values = palettes$colors[c(TRUE, FALSE)],
+                             name = "Cell Type") +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+if (do_print) {
+  print(p)
+}
+fn <- paste0(paste(today, "CellTypes", "alluvial", "exo", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+### Number of cells by cell type
+
+```{r cells-per-celltype-exo}
+tibble::as_tibble(celltypes) |>
+  dplyr::select(cell_type) |>
+  dplyr::group_by(cell_type) |>
+  dplyr::add_count(name = "Number of cells") |>
+  dplyr::distinct()
+```
+
+
+## Add consensus cell types for all cells
+
+### Add celltyes to exo SPE
+
+```{r add-celltypes-spe-exo}
+celltypes <- celltypes[order(match(celltypes$cell_id, colnames(sce_exo))), ]
+colData(sce_exo)$cell_type <- celltypes$cell_type
+```
+
+### Merge objects
+
+Merge the "islet" and "non-islet" SCE objects, convert to SPE.
+
+```{r merge-spe}
+# Merge and re-order
+spe <- cbind(sce_isl, sce_exo)
+spe <- spe[, order(colData(spe)$case_id,
+                   colData(spe)$image_number,
+                   colData(spe)$cell_number)]
+
+# Fix sample_id and convert to SPE
+spe$sample_id <- spe$image_id
+spe <- as(spe, "SpatialExperiment")
+
+# Add the saved metadata, spatial coordinates and colPairs
+metadata(spe) <- meta
+spatialCoords(spe) <- spatial_coords
+colPairs(spe) <- colpairs
+remove(sce_isl, sce_exo)
+```
+
+### Temp save SPE
+
+```{r save-spe-1}
+fn_spe <- file.path(paths$folder_script, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+saveRDS(spe, fn_spe)
+# spe <- readRDS(fn_spe)
+```
+
+### Add cell categories
+
+```{r add-cellcat}
+islet_celltypes <- c("Alpha", "Beta", "Gamma", "Delta", "Epsilon")
+spe$cell_category <- ifelse(spe$cell_type %in% islet_celltypes,
+                            "islet", "other")
+```
+
+
+
+# **Plot cell types**
+
+## Reduced dimensions
+
+Plot consensus cell types on reduced dimensions
+
+```{r consensus-dimred}
+ct <- c("beta", "alpha", "gamma", "delta", "epsilon", "ambiguous", "non-islet")
+names(ct) <- c("Beta", "Alpha", "Gamma", "Delta", "Epsilon",
+               "Ambiguous", "NonIslet")
+palette_ct <- c(palettes$colors[1:(length(ct) - 2)], "grey40", "grey")
+names(palette_ct) <- names(ct)
+
+
+cur_dat <- scuttle::makePerCellDF(spe[, colnames(spe) %in% metadata(spe)$subset],
+                                  use_dimred = TRUE) |>
+  dplyr::mutate(case_id = factor(case_id, levels = metadata(spe)$cases),
+                donor_type = factor(donor_type, levels = metadata(spe)$stages),
+                cell_type = factor(cell_type, levels = names(ct))) |>
+  dplyr::arrange(cell_type, case_id, donor_type)
+
+purrr::walk(assay_sel, \(cur_assay) {
+  purrr::walk(dimred_sel, \(cur_dimred) {
+    dimred_name <- paste(cur_dimred, cur_assay, sep = "_")
+    
+    p <- plot_dim_red(cur_dat, dimred_name, "cell_type",
+                      sample = TRUE, size = 0.1, alpha = 1,
+                      palette = palette_ct)
+    if (do_print) {
+      print(p)
+    }
+    fn <- paste0(paste(today, "CellType", "Consensus", dimred_name,
+                       sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param))
+  })
+})
+remove(cur_dat)
+```
+
+## Heatmap
+
+```{r consensus-heatmap}
+hmlist <- list()
+purrr::walk(assay_sel, \(cur_assay) {
+  clust_name <- paste("cell_type", cur_assay, sep = "_")
+  
+  # Summarize the data
+  hm <- summarize_heatmap(spe,
+                          expr_values = cur_assay,
+                          cluster_by = "cell_type",
+                          channels = channels)
+  
+  # Display the heatmap
+  fn <- paste0(paste(today, "CellType", "Consensus", cur_assay,
+                     "Heatmap", sep = "_"), ".html")
+  
+  hmlist[[i]] <- heatmaply(
+    heatmaply::normalize(hm), main = clust_name,
+    file = file.path(paths$folder_script, fn))
+})
+htmltools::tagList(setNames(hmlist, NULL))
+```
+
+
+## Correlation between channels
+
+```{r celltype-correlation}
+# Define the correlation method
+cor_method <- "pearson"
+
+# Function to calculate p values
+cor_test_p <- function(x) {
+  FUN <- function(x, y) cor.test(x, y, method = cor_method)[["p.value"]]
+  z <- outer(
+    colnames(x), 
+    colnames(x), 
+    Vectorize(function(i, j) FUN(x[, i], x[, j]))
+  )
+  dimnames(z) <- list(colnames(x), colnames(x))
+  z
+}
+
+hmlist <- list()
+purrr::walk(assay_sel, \(cur_assay) {
+  # Summarize the data
+  hm <- summarize_heatmap(spe,
+                          expr_values = cur_assay,
+                          cluster_by = "cell_type",
+                          channels = channels)
+  
+  # Run the correlation test
+  r <- cor(hm, method = cor_method)
+  p <- cor_test_p(hm)
+  diag(p) <- NA
+  
+  # Plot and save the heatmap
+  fn <- paste0(paste(today, "CellTypes", "Consensus", "Correlation",
+                     cur_assay, sep = "_"), ".html")
+  
+  hmlist[[i]] <- heatmaply_cor(
+    r, node_type = "scatter",
+    point_size_mat = -log10(p), point_size_name = "-log10(p-value)",
+    label_names = c("x", "y", "Correlation"),
+    main = paste("Cell type -", cur_assay),
+    file = file.path(paths$folder_script, fn))
+})
+htmltools::tagList(setNames(hmlist, NULL))
+```
+
+## Images
+
+Load random images and masks
+
+```{r consensus-viz-load}
+nb_images <- 14
+image_extension <- ".tiff"
+
+# Folders
+folder_images <- file.path(paths$folder_in, "img", paths$panel_type)
+folder_masks <- file.path(paths$folder_in, "masks_cells",
+                          paths$panel_type, "whole-cell")
+
+# Select random images and the associated masks
+set.seed(seed)
+image_list <- list.files(folder_images)
+image_list <- mask_list <- sort(c(sample(unique(image_list), nb_images))) #"6447_Islet_ROI_055.tiff", "6437_Islet_ROI_054.tiff", "6437_Islet_ROI_055.tiff", "6126_Islet_ROI_066.tiff", 
+writeLines(c("Selected images:", image_list))
+
+# Load images and masks
+images <- yoloader(
+  x = spe,
+  image_dir = folder_images,
+  image_names = image_list,
+  type = "stacks"
+)
+
+masks <- yoloader(
+  x = spe,
+  image_dir = folder_masks,
+  image_names = mask_list,
+  as.is = TRUE,
+  type = "masks"
+)
+
+if (length(setdiff(mcols(images)$ImageName,
+                   mcols(masks)$ImageName)) != 0) {
+  print("mcols(images)$ImageName and mcols(masks)$ImageName should have the same values")
+}
+
+# Subset the SPE object
+spe_sub <- spe[, spe$image_fullname %in% image_list]
+spe_sub$ImageName <- gsub(image_extension, "", spe_sub$image_fullname)
+```
+
+Plot the images
+
+```{r viz-celltype-plot}
+fn <- list(filename = file.path(
+  plotsave_param$path,
+  paste0(paste(today, "CellType", "Cytomapper", sep = "_"), ".png")))
+
+color_key <- list(c(
+  Alpha = "red", Beta = "blue",  Gamma = "yellow", Delta = "green",
+  Epsilon = "orange", Ambiguous = "white", NonIslet = "grey30"))
+names(color_key) <- "cell_type"
+    
+image_names <- c(unique(colData(spe_sub)[, c("ImageName", "case_id")])$case_id)
+
+cytomapper::plotPixels(images, object = spe_sub, masks,
+                       cell_id = "cell_number", img_id = "ImageName",
+                       colour_by = c("ProINS", "ProGCG", "SST", "PPY", "INS", "GHRL"),
+                       outline_by = "cell_type",
+                       # image_title = list(text = image_names),
+                       colour = color_key,
+                       bcg = list(ProINS = c(0, 3, 1), ProGCG = c(0, 7, 1), SST = c(0, 5, 1),
+                                  PPY = c(0, 3, 1), INS = c(0, 3, 1), GHRL = c(0, 10, 1)),
+                       image_title = NULL, scale = TRUE, save_plot = fn)
+```
+
+### Plot images
+
+Images are saved to disk but not shown.
+FIXME: Comment out when running on the cluster.
+```{r viz-cluster-plot-interactive}
+#channels_view <- channels_clust
+#sub_images <- cytomapper::getChannels(images, channels_view)
+# Use cytoviewer with images, masks and object
+#library(cytoviewer)
+#app <- cytoviewer(image = sub_images, 
+#                  mask = masks, 
+#                  object = spe_sub[channels_view, ], 
+#                  img_id = "ImageName", 
+#                  cell_id = "cell_number")
+
+#if (interactive()) {
+#  shiny::runApp(app)
+#}
+```
+
+# **Segmentation score**
+
+For each cell type, we measure the expression level of the cell type-specific hormone (e.g. glucagon in alpha cells) 
+versus the non-specific hormones (e.g. insulin and somatostatin in alpha cells). 
+The ratio of specific vs non-specific hormone expression is then calculated, which gives a score for each islet cell type.
+The final score is obtained by weighting the scores of each cell type by the fraction of this cell type in the total number of islet cells.  
+
+## Parameters
+
+```{r segscore-parameters}
+# Cell types and channels
+ct <- c("beta", "alpha", "gamma", "delta", "nonislet", "epsilon")
+names(ct) <- c("Beta", "Alpha", "Gamma", "Delta", "NonIslet", "Epsilon")
+hormone_channels <- c("ProINS", "ProGCG", "PPY", "SST", "CAV1", "GHRL")
+
+#spe_isl <- spe[, spe$cell_category == "islet"]
+# spe_exo <- spe[, spe$cell_category == "other"]
+spe_isl <- spe[, spe$distance_to_islet > 0]
+
+celltype_cols <- c("cell_type", colnames(colData(spe_isl))[grepl(paste0(
+  "CellType_", methods_sel, collapse = "|"), colnames(colData(spe_isl)))])
+
+
+# Plotting theme
+theme_segm <- list(
+  geom_jitter(size = 0.1, aes(color = as.factor(channel))),
+  geom_violin(scale = "width", draw_quantiles = 0.5, alpha = 0.5),
+  xlab(NULL),
+  ylab("Scaled counts"),
+  theme(
+    plot.title = element_text(size = 10),
+    legend.position = "none",
+    axis.title.y = element_text(size = 8),
+    axis.text.x = element_text(size = 6),
+    axis.text.y = element_text(size = 6))
+)
+
+# Plotting function
+plotSegScore <- function(x) {
+  segscore[segscore$CT == names(ct)[x] &
+             segscore$channel %in% hormone_channels, ] |>
+    ggplot(aes(x = channel, y = counts)) +
+    ggtitle(paste(names(ct)[x], "Cell Score:",
+                  round(score.table[CT == names(ct)[x]]$score, digits = 3))) +
+    mytheme$standard() +
+    theme_segm
+}
+```
+
+
+## Calculate segmentation score
+
+Calculate segmentation scores for each islet cell type and plot the results
+
+```{r segscore-calculate, warning=FALSE}
+# Prepare the data
+dat <- scuttle::makePerCellDF(spe_isl,
+                              use.dimred = FALSE,
+                              assay.type = "scaled",
+                              features = hormone_channels)
+
+dat <- dat[, c(hormone_channels, celltype_cols)] |>
+  tidyr::pivot_longer(all_of(hormone_channels),
+                      names_to = "channel", values_to = "counts")
+
+for (k in seq_along(celltype_cols)) {
+  segscore <- dat |>
+    dplyr::mutate(CT = get(celltype_cols[k])) |>
+    dplyr::select(CT, channel, counts) |>
+    dplyr::filter(CT %in% names(ct)) |>
+    dplyr::mutate(CT = factor(CT, levels = names(ct))) |>
+    dplyr::mutate(channel = factor(channel, levels = hormone_channels)) |>
+    dplyr::arrange(CT, channel)
+  
+  # Number of cells per cell type
+  nb.cells <- segscore |> 
+    dplyr::group_by(CT) |> 
+    dplyr::summarise(n = n()) |>
+    dplyr::mutate(tot = sum(n)) |>
+    dplyr::mutate(fract = n / tot) |>
+    as.data.table()
+  
+  # Calculate segmentation score
+  score.table <- segscore |>
+    dplyr::group_by(CT, channel) |>
+    dplyr::summarise(expr = mean(counts)) |>
+    tidyr::spread(key = channel, value = expr) |>
+    as.data.table()
+  
+  score.table[, ":="(mean = 0, score = 0, w_score = 0)] 
+
+  ## Calculate the mean expression level of cell type-specific hormones
+  for (i in seq_len(nrow(score.table))) {
+    for (j in 1:(ncol(score.table) - 2)) {
+      if (i == j) (score.table[[i, "mean"]] <- score.table[[i, (j + 1)]])
+    }
+  }
+  
+  ## Calculate the segmentation score for each cell type
+  for (i in seq_len(nrow(score.table))) {
+    for (j in 1:(ncol(score.table) - 4)) {
+      score.table[[i, "score"]] <-
+        ifelse(i == j,
+              score.table[[i, "score"]] + (score.table[[i, (j + 1)]] / score.table[[i, "mean"]]),
+              score.table[[i, "score"]] - (score.table[[i, (j + 1)]] / score.table[[i, "mean"]])
+        )
+    }
+  }
+
+  
+  ## Calculate weighted score
+  score.table <- merge(score.table, nb.cells, by = "CT")
+  ## Calculate the segmentation score for each cell type
+  #if (celltype_cols[k] != "CellType_Pheno1_fastMNN_case_id") {
+  #  for (i in seq_len(nrow(score.table))) {
+  #    for (j in 1:(ncol(score.table) - 7)) {
+  #      score.table[[i, "w_score"]] <- 
+  #              score.table[[i, "w_score"]] + ((score.table[[i, "mean"]] * score.table[[i, "fract"]]) / (score.table[[i, (j + 1)]] * score.table[[j, "fract"]]) 
+  #        )
+  #    }
+  #  }
+  #}
+
+  score.table[, weighted.score := score * fract]
+  
+  final.score <- sum(score.table$weighted.score)
+  
+  cat("\n", celltype_cols[k], "\n")
+  print(score.table[, .(CT, n, score, weighted.score)]) #, w_score
+  
+  # Plot the results
+  p <- list()
+  p <- lapply(seq_along(ct), plotSegScore)
+  
+  g <- gridExtra::grid.arrange(grobs = p, nrow = 2, top = paste(
+    "Segmentation score:", celltype_cols[k], round(final.score, digits = 3)
+  ))
+  
+  fn <- paste0(paste(today, "SegScore", celltype_cols[k], sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, g), plotsave_param_large))
+}
+```
+
+
+
+# **Save the updated SPE object**
+
+Contains consensus islet cell types.
+
+```{r save-spe}
+print(spe)
+fn_spe <- file.path(paths$folder_script, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+saveRDS(spe, fn_spe)
+```

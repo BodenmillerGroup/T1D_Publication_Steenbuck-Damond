@@ -1,0 +1,853 @@
+---
+title: "10_DistanceAnalysis_cells_Islet"
+author: "Nicolas Damond, Nathan Steenbuck"
+date: "Created: 24 May, 2022; Compiled: `r format(Sys.time(), '%d %b, %Y')`"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+if (rstudioapi::isAvailable()) {
+  script_name <- basename(rstudioapi::getSourceEditorContext()$path)
+} else {
+  script_name <- knitr::current_input()
+}
+
+cur_user <- Sys.info()[["user"]]
+script_name <- "10_DistanceAnalysis_cells_Islet.Rmd"
+
+if (cur_user == "ubuntu") {
+  source(file.path("/", "mnt", "T1D_Vol", "T1D_analysis", "analysis", "helpers.R"))
+  #n_cores <- future::availableCores() - 1
+  n_cores <- 4
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  knitr::opts_knit$set(root_dir = paths$home_data)
+  do_print <- FALSE
+} else {
+  source(file.path("/", "home", "nsteen", "scripts", "T1D_analysis", "analysis", "helpers.R"))
+  n_cores <- 8
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  paths$folder_script <- paths$cluster_folder_script
+  paths$folder_in <- paths$cluster_folder_in
+  paths$folder_out <- paths$cluster_home 
+  knitr::opts_knit$set(root_dir = paths$cluster_home)
+  do_print <- TRUE
+}
+
+seed <- 123456
+set.seed(seed)
+options <- furrr::furrr_options(seed = seed)
+paths$prev <- paste("08_SubclusteringBeta", paths$object_type, paths$panel_type, sep = "_")
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# **Goal**
+
+Study cells in function of their position relative to the islet edge.    
+
+
+# **Settings**  
+
+## Load packages
+
+```{r packages, results='hide'}
+suppressPackageStartupMessages(c(
+  library(dplyr),
+  library(tidyr),
+  library(data.table),
+  library(SpatialExperiment),
+  library(ggplot2),
+  library(RColorBrewer)
+))
+```
+
+## Paths and settings
+
+```{r settings}
+# Paths
+if (!dir.exists(paths$folder_script)) dir.create(paths$folder_script)
+plotsave_param$path <- paths$folder_script
+plotsave_param_large$path <- paths$folder_script
+
+# Misc settings
+today <- gsub("-", "", Sys.Date())
+```
+
+##  Read in the data
+
+Load the SpatialExperiment (SPE) object saved at the previous step.
+
+```{r load-data}
+fn_spe <- file.path(paths$folder_out, paths$prev, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+spe <- readRDS(fn_spe)
+print(spe)
+```
+
+## Define the analysis parameters
+
+```{r parameters}
+# List of cell types
+celltypes <- c("Beta", "Alpha", "Delta", "Gamma", "Epsilon")
+names(celltypes) <- celltypes
+print(celltypes)
+
+# Color palettes for plotting
+palette_ct <- c(palettes$colors[1:(length(celltypes))])
+names(palette_ct) <- celltypes
+
+# Variables to group by
+plot.variables <- c("donor_type", "case_id")
+names(plot.variables) <- c("Stage", "Donor")
+```
+
+## Subset islet cells
+
+```{r subset-islet}
+spe_isl <- spe[, spe$cell_category == "islet"]
+print(spe_isl)
+```
+
+
+# **Distances**
+
+Here, cell types are plotted in function of cell distances to the islet edge.  
+
+## Calculate distances
+
+```{r distances-define}
+# Print distance quantiles
+print(quantile(spe_isl$distance_to_islet[spe_isl$distance_to_islet >= -5]))
+
+# Define bins
+bins <- c(-5, 8, 18, 32)
+distances <- c("outside", "< 8 um", "8-18 um", "18-32 um", "> 32 um")
+names(distances) <- RColorBrewer::brewer.pal(9, "Spectral")[c(2, 4, 7, 8, 9)]
+print(distances)
+
+# Add bins to the SCE
+spe$infiltration <- ifelse(
+  spe$distance_to_islet < bins[1], distances[1],
+  ifelse(
+    spe$distance_to_islet >= bins[1] & spe$distance_to_islet <= bins[2], distances[2],
+    ifelse(
+      spe$distance_to_islet > bins[2] & spe$distance_to_islet <= bins[3], distances[3],
+      ifelse(
+        spe$distance_to_islet > bins[3] & spe$distance_to_islet <= bins[4], distances[4],
+        distances[5]))))
+
+# Subset islet cells
+spe_isl <- spe[, spe$cell_category == "islet"]
+
+cat("Number of islet cells per distance bin:")
+table(spe_isl$infiltration)
+
+# Exclude cells located outside of islets
+spe_isl <- spe_isl[, spe_isl$distance_to_islet >= -5]
+distances <- distances[distances != "outside"]
+spe_isl <- spe_isl[, spe_isl$donor_type != "Pancreatitis"]
+```
+
+## Plot distances by cell type
+
+### Horizontal
+
+By cell type only
+
+```{r distance-horizontal-celltype}
+# By donor
+compo_celltype_dist <- calc_compo(spe_isl, "cell_type", celltypes,
+                                  "infiltration", rev(distances))
+
+# Plot
+p <- compo_celltype_dist |>
+  ggplot(aes(y = Cluster, x = fraction, fill = as.factor(Group1))) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = rev(names(distances))) +
+  labs(y = "Cell type", x = "Fraction", fill = "Distance to islet edge") +
+  mytheme$large()
+if (do_print) print(p)
+fn <- paste0(paste(today, "Distance", "Horizontal", "CellType",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+By cell type X stage and case
+
+```{r distance-horizontal-celltype-casestage}
+# By stage
+compo_celltype_dist_stage <- calc_compo(
+  spe_isl, "cell_type", celltypes, "infiltration", rev(distances),
+  "donor_type", metadata(spe)$stages)
+
+p <- compo_celltype_dist_stage |>
+  ggplot(aes(y = Cluster, x = fraction, fill = as.factor(Group1))) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~Group2) +
+  scale_fill_manual(values = rev(names(distances))) +
+  labs(y = "Cell type", x = "Fraction", fill = "Distance to islet edge") +
+  mytheme$standard()
+if (do_print) print(p)
+fn <- paste0(paste(today, "Distance", "Horizontal", "CellType", "byStage",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# By case
+compo_celltype_dist_case <- calc_compo(
+  spe_isl, "cell_type", celltypes, "infiltration", rev(distances),
+  "case_id", metadata(spe)$cases)
+
+p <- compo_celltype_dist_case |>
+  ggplot(aes(y = Cluster, x = fraction, fill = as.factor(Group1))) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~Group2) +
+  scale_fill_manual(values = rev(names(distances))) +
+  labs(y = "Cell type", x = "Fraction", fill = "Distance to islet edge") +
+  mytheme$standard()
+
+if (do_print) print(p)
+fn <- paste0(paste(today, "Distance", "Horizontal", "CellType", "byCase",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+Only keep beta and alpha cells and remove Pancreatitis cases.
+```{r subset-speisl}
+spe_isl2 <- spe_isl[, spe_isl$cell_type %in% c("Beta", "Alpha") & spe_isl$donor_type != "Pancreatitis"]
+```
+
+
+```{r horizontal-temp}
+compo_celltype_dist_stage <- calc_compo(
+  spe_isl2, "cell_type", celltypes, "infiltration", rev(distances),
+  "donor_type", metadata(spe)$stages)
+
+p <- compo_celltype_dist_stage |>
+  ggplot(aes(y = fraction, x = Group2, fill = as.factor(Group1))) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~Cluster) +
+  scale_fill_manual(values = rev(names(distances))) +
+  labs(y = "Cell type", x = "Fraction", fill = "Distance to islet edge") +
+  mytheme$standard()
+if (do_print) print(p)
+fn <- paste0(paste(today, "Distance", "Horizontal", "CellType", "byStage", "TEMP",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# By case
+compo_celltype_dist_case <- calc_compo(
+  spe_isl2, "cell_type", celltypes, "infiltration", rev(distances),
+  "case_id", metadata(spe)$cases)
+
+p <- compo_celltype_dist_case |>
+  ggplot(aes(y = fraction, x = Group2, fill = as.factor(Group1))) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~Cluster) +
+  scale_fill_manual(values = rev(names(distances))) +
+  labs(y = "Cell type", x = "Fraction", fill = "Distance to islet edge") +
+  mytheme$standard()
+
+if (do_print) print(p)
+fn <- paste0(paste(today, "Distance", "Horizontal", "CellType", "byCase", "TEMP",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+
+By stage and case X cell type
+
+```{r distance-horizontal-casestage-celltype}
+# By stage
+compo_stage_dist_celltype <- calc_compo(
+  spe_isl, "donor_type", metadata(spe)$stages, "infiltration", rev(distances),
+  "cell_type", celltypes)
+
+p <- compo_stage_dist_celltype |>
+  ggplot(aes(y = Cluster, x = fraction, fill = as.factor(Group1))) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~Group2) +
+  scale_fill_manual(values = rev(names(distances))) +
+  labs(y = "T1D stage", x = "Fraction", fill = "Distance to islet edge") +
+  mytheme$standard()
+if (do_print) print(p)
+fn <- paste0(paste(today, "Distance", "CellType", "byStage2", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# By case
+compo_case_dist_celltype <- calc_compo(
+  spe_isl, "case_id", metadata(spe)$cases, "infiltration", rev(distances),
+  "cell_type", celltypes)
+
+p <- compo_case_dist_celltype |>
+  ggplot(aes(y = Cluster, x = fraction, fill = as.factor(Group1))) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~Group2) +
+  scale_fill_manual(values = rev(names(distances))) +
+  labs(y = "Case", x = "Fraction", fill = "Distance to islet edge") +
+  mytheme$standard()
+
+if (do_print) print(p)
+fn <- paste0(paste(today, "Distance", "CellType", "byCase2", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+
+### Vertical - fractions
+
+Calculate
+
+```{r distance-vertical-calculate}
+compo_celltype_dist <- calc_compo(
+  spe_isl,  "infiltration", rev(distances), "cell_type", celltypes)
+
+compo_celltype_dist_stage <- calc_compo(
+  spe_isl, "infiltration", rev(distances), "cell_type", celltypes,
+  "donor_type", metadata(spe)$stages)
+
+compo_celltype_dist_case <- calc_compo(
+  spe_isl, "infiltration", rev(distances), "cell_type", celltypes,
+  "case_id", metadata(spe)$cases)
+```
+
+Cell types
+
+```{r distance-vertical-fraction-celltype}
+# By distance
+p <- compo_celltype_dist |>
+  ggplot(aes(x = Cluster, y = fraction)) +
+  geom_bar(stat = "identity", position = "dodge", aes(fill = Group1)) +
+  scale_fill_manual("Cell Type", labels = names(celltypes),
+                    values = palette_ct) +
+  labs(y = "Cell type fraction", x = "Distance to islet edge", 
+       fill = "Cell type") +
+  mytheme$standard()
+if (do_print) print(p)
+fn <- paste0(paste(today, "Distance", "Vertical", "CellType", "Fraction",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# By distance x stage
+p <- compo_celltype_dist_stage |>
+  ggplot(aes(x = Cluster, y = fraction)) +
+  geom_bar(stat = "identity", position = "dodge", aes(fill = Group1)) +
+  facet_wrap(~Group2) +
+  scale_fill_manual("Cell Type", labels = names(celltypes),
+                    values = palette_ct) +
+  labs(y = "Cell type fraction", x = "Distance to islet edge", 
+       fill = "Cell type") +
+  mytheme$standard()
+if (do_print) print(p)
+fn <- paste0(paste(today, "Distance", "Vertical", "CellType", "Fraction",
+                   "byStage", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# By distance x case
+p <- compo_celltype_dist_case |>
+  ggplot(aes(x = Cluster, y = fraction)) +
+  geom_bar(stat = "identity", position = "dodge", aes(fill = Group1)) +
+  facet_wrap(~Group2) +
+  scale_fill_manual("Cell Type", labels = names(celltypes),
+                    values = palette_ct) +
+  labs(y = "Cell type fraction", x = "Distance to islet edge", 
+       fill = "Cell type") +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45))
+if (do_print) print(p)
+fn <- paste0(paste(today, "Distance", "Vertical", "CellType", "Fraction",
+                   "byCase", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+### Vertical - numbers
+
+Cell types
+
+```{r distance-vertical-numbers-celltype}
+# By distance
+p <- compo_celltype_dist |>
+  ggplot(aes(x = Cluster, y = CellNb)) +
+  geom_bar(stat = "identity", position = "dodge", aes(fill = Group1)) +
+  scale_fill_manual("Cell Type", labels = names(celltypes),
+                    values = palette_ct) +
+  labs(y = "Number of cells", x = "Distance to islet edge", 
+       fill = "Cell type") +
+  mytheme$standard()
+if (do_print) print(p)
+fn <- paste0(paste(today, "Distance", "Vertical", "CellType", "Numbers",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# By distance x stage
+p <- compo_celltype_dist_stage |>
+  ggplot(aes(x = Cluster, y = CellNb)) +
+  geom_bar(stat = "identity", position = "dodge", aes(fill = Group1)) +
+  facet_wrap(~Group2) +
+  scale_fill_manual("Cell Type", labels = names(celltypes),
+                    values = palette_ct) +
+  labs(y = "Number of cells", x = "Distance to islet edge", 
+       fill = "Cell type") +
+  mytheme$standard()
+if (do_print) print(p)
+fn <- paste0(paste(today, "Distance", "Vertical", "CellType", "Numbers",
+                   "byStage", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# By distance x case
+p <- compo_celltype_dist_case |>
+  ggplot(aes(x = Cluster, y = CellNb)) +
+  geom_bar(stat = "identity", position = "dodge", aes(fill = Group1)) +
+  facet_wrap(~Group2) +
+  scale_fill_manual("Cell Type", labels = names(celltypes),
+                    values = palette_ct) +
+  labs(y = "Number of cells", x = "Distance to islet edge", 
+       fill = "Cell type") +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45))
+
+if (do_print) print(p)
+fn <- paste0(paste(today, "Distance", "Vertical", "CellType", "Numbers",
+                   "byCase", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+```
+
+
+## Plot cell types by distances
+
+### Horizontal - Distance X Cell type
+
+Calculate
+
+```{r horizontal-distance-celltype-calculate}
+compo_dist_celltype <- calc_compo(
+  spe_isl, "infiltration", rev(distances),
+  "cell_type", celltypes)
+
+compo_stage_dist_celltype <- calc_compo(
+  spe_isl,  "infiltration", rev(distances), "cell_type", celltypes,
+  "donor_type", metadata(spe)$stages)
+
+compo_case_dist_celltype <- calc_compo(
+  spe_isl, "infiltration", rev(distances), "cell_type", celltypes,
+  "case_id", metadata(spe)$cases)
+```
+
+Cell types
+
+```{r horizontal-distance-celltype-plot}
+# All cells
+p <- compo_dist_celltype |>
+  ggplot(aes(y = Cluster, x = fraction, fill = as.factor(Group1))) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = palette_ct) +
+  labs(y = "Distance to islet edge", x = "Fraction", fill = "Cell type") +
+  mytheme$large()
+if (do_print) print(p)
+fn <- paste0(paste(today, "Distance", "Horizontal", "DistCellType",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# By stage
+p <- compo_stage_dist_celltype |>
+  ggplot(aes(y = Cluster, x = fraction, fill = as.factor(Group1))) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~Group2) +
+  scale_fill_manual(values = palette_ct) +
+  labs(y = "Distance to islet edge", x = "Fraction", fill = "Cell type") +
+  mytheme$standard()
+
+fn <- paste0(paste(today, "Distance", "Horizontal", "DistCellType", "byStage",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+if (do_print) print(p)
+
+# By case
+p <- compo_case_dist_celltype |>
+  ggplot(aes(y = Cluster, x = fraction, fill = as.factor(Group1))) +
+  geom_bar(stat = "identity", size = 1) +
+  facet_wrap(~Group2) +
+  scale_fill_manual(values = palette_ct) +
+  labs(y = "Distance to islet edge", x = "Fraction", fill = "Cell type") +
+  mytheme$standard()
+
+fn <- paste0(paste(today, "Distance", "Horizontal", "DistCellType", "byCase",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+if (do_print) print(p)
+```
+
+### Horizontal - Cell type X Distance
+
+Calculate
+
+```{r horizontal-celltype-distance-calculate}
+# Cell types
+compo_stage_celltype_dist <- calc_compo(
+  spe_isl,  "infiltration", rev(distances), "donor_type", metadata(spe)$stages,
+  "cell_type", celltypes)
+
+compo_case_celltype_dist <- calc_compo(
+  spe_isl, "infiltration", rev(distances), "case_id", metadata(spe)$cases,
+  "cell_type", celltypes) |>
+  inner_join(unique(as_tibble(colData(spe_isl)[, plot.variables])) |>
+               dplyr::rename(Group1 = case_id), by = "Group1") |>
+  mutate(Group1 = factor(Group1, levels = metadata(spe)$cases),
+         donor_type = factor(donor_type, levels = metadata(spe)$stages)) |>
+  arrange(donor_type, Group1)
+```
+
+Cell types
+
+```{r horizontal-celltype-distance-plot}
+# By stage
+p <- compo_stage_celltype_dist |>
+  ggplot(aes(y = Cluster, x = fraction, fill = as.factor(Group1))) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~Group2) +
+  scale_fill_manual(values = palettes$stages) +
+  labs(y = "Distance to islet edge", x = "Fraction", fill = "Stage") +
+  mytheme$standard()
+
+fn <- paste0(paste(today, "Distance", "Horizontal", "CellTypeDist", "byStage",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+if (do_print) print(p)
+
+# By case
+p <- compo_case_celltype_dist |>
+  ggplot(aes(y = Cluster, x = fraction, fill = as.factor(Group1))) +
+  geom_bar(stat = "identity", aes(color = as.factor(donor_type)), size = 1) +
+  facet_wrap(~Group2) +
+  scale_fill_manual(values = palettes$cases) +
+  scale_color_manual(values = palettes$stages) +
+  labs(y = "Distance to islet edge", x = "Fraction",
+       fill = "Case", color = "Stage") +
+  mytheme$standard()
+
+fn <- paste0(paste(today, "Distance", "Horizontal", "CellTypeDist", "byCase",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+if (do_print) print(p)
+```
+
+### Vertical - Fractions - Cell type X Distance
+
+Calculate
+
+```{r vertical-celltype-distance-calculate}
+compo_dist_celltype <- calc_compo(
+  spe_isl,  "cell_type", celltypes, "infiltration", rev(distances))
+
+compo_dist_celltype_stage <- calc_compo(
+  spe_isl, "cell_type", celltypes, "infiltration", rev(distances),
+  "donor_type", metadata(spe)$stages)
+
+compo_dist_celltype_case <- calc_compo(
+  spe_isl, "cell_type", celltypes, "infiltration", rev(distances),
+  "case_id", metadata(spe)$cases)
+```
+
+Cell types
+
+```{r vertical-celltype-distance-plot}
+# All cells
+p <- compo_celltype_dist |>
+  ggplot(aes(x = Group1, y = fraction)) +
+  geom_bar(stat = "identity", position = "dodge", aes(fill = Cluster)) +
+  scale_fill_manual("Distance to islet edge", labels = distances,
+                    values = names(distances)) +
+  labs(y = "Cell type fraction", x = "Cell type") +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45))
+fn <- paste0(paste(today, "Distance", "Vertical", "CellTypeDist", "Fraction",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+if (do_print) print(p)
+
+# By stage
+p <- compo_celltype_dist_stage |>
+  ggplot(aes(x = Group1, y = fraction)) +
+  geom_bar(stat = "identity", position = "dodge", aes(fill = Cluster)) +
+  facet_wrap(~Group2) +
+  scale_fill_manual("Distance to islet edge", labels = distances,
+                    values = names(distances)) +
+  labs(y = "Cell type fraction", x = "Cell type") +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45))
+fn <- paste0(paste(today, "Distance", "Vertical", "CellTypeDist", "Fraction",
+                   "byStage", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+if (do_print) print(p)
+
+# By case
+p <- compo_celltype_dist_case |>
+  ggplot(aes(x = Group1, y = fraction)) +
+  geom_bar(stat = "identity", position = "dodge", aes(fill = Cluster)) +
+  facet_wrap(~Group2) +
+  scale_fill_manual("Distance to islet edge", labels = distances,
+                    values = names(distances)) +
+  labs(y = "Cell type fraction", x = "Cell type") +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45))
+fn <- paste0(paste(today, "Distance", "Vertical", "CellTypeDist", "Fraction",
+                   "byCase", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+if (do_print) print(p)
+```
+
+### Vertical - Fractions - Distance X Celltype
+
+Cell types
+
+```{r vertical-fraction-distance-celltype}
+# By stage
+p <- compo_celltype_dist_stage |>
+  ggplot(aes(x = Cluster, y = fraction)) +
+  geom_bar(stat = "identity", position = "dodge", aes(fill = Group2)) +
+  facet_wrap(~Group1) +
+  scale_fill_manual("T1D stage", values = palettes$stages) +
+  labs(y = "Fraction", x = "Distance to islet edge") +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45))
+fn <- paste0(paste(today, "Distance", "Vertical", "DistCellType", "Fraction",
+                   "byStage", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+if (do_print) print(p)
+
+# By case
+p <- compo_celltype_dist_case |>
+  ggplot(aes(x = Cluster, y = fraction)) +
+  geom_bar(stat = "identity", position = "dodge", aes(fill = Group2)) +
+  facet_wrap(~Group1) +
+  scale_fill_manual("Case", values = palettes$cases) +
+  labs(y = "Fraction", x = "Distance to islet edge") +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45))
+fn <- paste0(paste(today, "Distance", "Vertical", "DistCellType", "Fraction",
+                   "byCase", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+if (do_print) print(p)
+```
+
+### Vertical - Numbers - Celltype X Distance
+
+Calculate
+
+```{r vertical-celltype-numbers-calculate}
+compo_dist_celltype <- calc_compo(
+  spe,  "cell_type", celltypes, "infiltration", distances)
+
+compo_dist_celltype_stage <- calc_compo(
+  spe,  "cell_type", celltypes, "infiltration", distances,
+  "donor_type", metadata(spe)$stages)
+
+compo_dist_celltype_case <- calc_compo(
+  spe,  "cell_type", celltypes, "infiltration", distances,
+  "case_id", metadata(spe)$cases)
+```
+
+Cell types
+
+```{r celltype-distance-vertical-numbers}
+# All cells
+p <- compo_dist_celltype |>
+  ggplot(aes(x = Cluster, y = CellNb)) +
+  geom_bar(stat = "identity", position = "dodge", aes(fill = Group1)) +
+  scale_fill_manual("Distance to islet edge", labels = distances,
+                    values = names(distances)) +
+  labs(y = "Cell number", x = "Cell type") +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45))
+
+fn <- paste0(paste(today, "Distance", "Vertical", "CellTypeDist", "Numbers",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+if (do_print) print(p)
+
+# By stage
+p <- compo_dist_celltype_stage |>
+  ggplot(aes(x = Cluster, y = CellNb)) +
+  geom_bar(stat = "identity", position = "dodge", aes(fill = Group1)) +
+  facet_wrap(~Group2) +
+  scale_fill_manual("Distance to islet edge", labels = distances,
+                    values = names(distances)) +
+  labs(y = "Cell number", x = "Cell type") +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45))
+
+fn <- paste0(paste(today, "Distance", "Vertical", "CellTypeDist", "Numbers",
+                   "byStage", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+if (do_print) print(p)
+
+# By case
+p <- compo_dist_celltype_case |>
+  ggplot(aes(x = Cluster, y = CellNb)) +
+  geom_bar(stat = "identity", position = "dodge", aes(fill = Group1)) +
+  facet_wrap(~Group2) +
+  scale_fill_manual("Distance to islet edge", labels = distances,
+                    values = names(distances)) +
+  labs(y = "Cell number", x = "Cell type") +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45))
+
+fn <- paste0(paste(today, "Distance", "Vertical", "CellTypeDist", "Numbers",
+                   "byCase", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+if (do_print) print(p)
+```
+
+### Vertical - Numbers - Distance X Celltype
+
+Cell types
+
+```{r vertical-numbers-celltype}
+# By distance x stage
+p <- compo_dist_celltype_stage |>
+  ggplot(aes(x = Group1, y = CellNb)) +
+  geom_bar(stat = "identity", position = "dodge", aes(fill = Group2)) +
+  facet_wrap(~Cluster) +
+  scale_fill_manual("T1D stage", values = palettes$stages) +
+  labs(y = "Cell number", x = "Distance to islet edge") +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45))
+
+fn <- paste0(paste(today, "Distance", "Vertical", "DistCellType", "Numbers",
+                   "byStage", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+if (do_print) print(p)
+
+# By distance x case
+p <- compo_dist_celltype_case |>
+  ggplot(aes(x = Group1, y = CellNb)) +
+  geom_bar(stat = "identity", position = "dodge", aes(fill = Group2)) +
+  facet_wrap(~Cluster) +
+  scale_fill_manual("Case", values = palettes$cases) +
+  labs(y = "Cell number", x = "Distance to islet edge") +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45))
+
+fn <- paste0(paste(today, "Distance", "Vertical", "DistCellType", "Numbers",
+                   "byCase", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+if (do_print) print(p)
+```
+
+## Continuous distances
+
+### Distance in um
+
+Cell types
+
+```{r distance-continuous-celltype}
+cur_dat <- as_tibble(colData(spe_isl)) |>
+  mutate(cell_type = factor(cell_type, levels = celltypes),
+         donor_type = factor(donor_type, levels = metadata(spe)$stages),
+         case_id = factor(case_id, levels = metadata(spe)$cases)) |>
+  arrange(case_id, donor_type, cell_type)
+
+# All cells
+p <- cur_dat |>
+  ggplot(aes(x = cell_type, y = distance_to_islet, color = cell_type)) +
+  geom_jitter(size = 0.1) +
+  geom_violin(scale = "width", draw_quantiles = c(0.1, 0.5, 0.9), alpha = 0.5) +
+  scale_color_manual("Cell Type", labels = names(celltypes),
+                     values = palette_ct) +
+  labs(y = "Distance to islet edge", x = "Cell type", 
+       colour = "Cell type") +
+  mytheme$standard()
+if (do_print) print(p)
+fn <- paste0(paste(today, "Distance", "Continuous", "CellType", 
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# By stage
+p <- cur_dat |>
+  ggplot(aes(x = cell_type, y = distance_to_islet, color = cell_type)) +
+  geom_jitter(size = 0.1) +
+  facet_wrap(~donor_type) +
+  geom_violin(scale = "width", draw_quantiles = c(0.1, 0.5, 0.9), alpha = 0.5) +
+  scale_color_manual("Cell Type", labels = names(celltypes),
+                     values = palette_ct) +
+  labs(y = "Distance to islet edge", x = "Cell type", 
+       colour = "Cell type") +
+  mytheme$standard()
+if (do_print) print(p)
+fn <- paste0(paste(today, "Distance", "Continuous", "CellType", "byStage",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# By case
+p <- cur_dat |>
+  ggplot(aes(x = cell_type, y = distance_to_islet, color = cell_type)) +
+  geom_jitter(size = 0.1) +
+  facet_wrap(~case_id) +
+  geom_violin(scale = "width", draw_quantiles = c(0.1, 0.5, 0.9), alpha = 0.5) +
+  scale_color_manual("Cell Type", labels = names(celltypes),
+                     values = palette_ct) +
+  labs(y = "Distance to islet edge", x = "Cell type", 
+       colour = "Cell type") +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45))
+if (do_print) print(p)
+fn <- paste0(paste(today, "Distance", "Continuous", "CellType", "byCase",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+### Log of distance
+
+Cell types
+
+```{r logdist-continuous-celltype, warning=FALSE}
+# All cells
+p <- cur_dat |>
+  ggplot(aes(x = cell_type, y = log(distance_to_islet), color = cell_type)) +
+  geom_jitter(size = 0.1) +
+  geom_violin(scale = "width", draw_quantiles = c(0.1, 0.5, 0.9), alpha = 0.5) +
+  scale_color_manual("Cell Type", labels = names(celltypes),
+                     values = palette_ct) +
+  labs(y = "Distance to islet edge (log)", x = "Cell type", 
+       colour = "Cell type") +
+  mytheme$standard()
+if (do_print) print(p)
+fn <- paste0(paste(today, "DistLog", "Continuous", "CellType", 
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# By stage
+p <- cur_dat |>
+  ggplot(aes(x = cell_type, y = log(distance_to_islet), color = cell_type)) +
+  geom_jitter(size = 0.1) +
+  facet_wrap(~donor_type) +
+  geom_violin(scale = "width", draw_quantiles = c(0.1, 0.5, 0.9), alpha = 0.5) +
+  scale_color_manual("Cell Type", labels = names(celltypes),
+                     values = palette_ct) +
+  labs(y = "Distance to islet edge (log)", x = "Cell type", 
+       colour = "Cell type") +
+  mytheme$standard()
+if (do_print) print(p)
+fn <- paste0(paste(today, "DistLog", "Continuous", "CellType", "byStage",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# By case
+p <- cur_dat |>
+  ggplot(aes(x = cell_type, y = log(distance_to_islet), color = cell_type)) +
+  geom_jitter(size = 0.1) +
+  facet_wrap(~case_id) +
+  geom_violin(scale = "width", draw_quantiles = c(0.1, 0.5, 0.9), alpha = 0.5) +
+  scale_color_manual("Cell Type", labels = names(celltypes),
+                     values = palette_ct) +
+  labs(y = "Distance to islet edge (log)", x = "Cell type", 
+       colour = "Cell type") +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45))
+if (do_print) print(p)
+fn <- paste0(paste(today, "DistLog", "Continuous", "CellType", "byCase",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```

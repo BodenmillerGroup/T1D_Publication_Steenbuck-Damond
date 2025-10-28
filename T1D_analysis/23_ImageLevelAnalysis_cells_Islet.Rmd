@@ -1,0 +1,863 @@
+---
+title: "23_ImageLevelAnalysis_cells_Islet"
+author: "Nathan Steenbuck"
+date: "Created: 24 May, 2025; Compiled: `r format(Sys.time(), '%d %b, %Y')`"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+if (rstudioapi::isAvailable()) {
+  script_name <- basename(rstudioapi::getSourceEditorContext()$path)
+} else {
+  script_name <- knitr::current_input()
+}
+
+cur_user <- Sys.info()[["user"]]
+script_name <- "23_ImageLevelAnalysis_cells_Islet.Rmd"
+
+if (cur_user == "ubuntu") {
+  source(file.path("/", "mnt", "central_nas", "projects", "type1_diabetes", "nathan", 
+                   "T1D_Vol", "T1D_analysis", "analysis", "helpers.R"))
+  #n_cores <- future::availableCores() - 1
+  n_cores <- 4
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  knitr::opts_knit$set(root_dir = paths$home_data)
+  do_print <- FALSE
+} else {
+  source(file.path("/", "home", "nsteen", "scripts", "T1D_analysis", "analysis", "helpers.R"))
+  n_cores <- 8
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  if (!dir.exists(cluster_folder_script)) dir.create(cluster_folder_script)
+  paths$folder_script <- paths$cluster_folder_script
+  paths$folder_in <- paths$cluster_folder_in
+  paths$folder_out <- paths$cluster_home 
+  knitr::opts_knit$set(root_dir = paths$cluster_home)
+  do_print <- TRUE
+}
+
+seed <- 123456
+set.seed(seed)
+options <- furrr::furrr_options(seed = seed)
+options(future.globals.maxSize = 50 * 1024 * 1024 * 1024)
+paths$prev <- paste("08_SubclusteringBeta", paths$object_type, paths$panel_type, sep = "_")
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# A0: **Introduction and Settings**
+
+Both total protein marker levels and localization are proxies for protein activity.
+
+Here, the aim is to detect potential shifts in localization across disease stages. 
+This could indicate distinct activities for the given marker.
+
+Here, we mainly look at distinct protein localization for XBP1. 
+
+As sXBP1 is a transcription factor, it is expected to be localized in the nucleus, 
+whereas unspliced XBP1 is expected to be localized in the cytoplasm.
+-> Note: clone detects both isoforms.
+
+
+Improved analysis:
+**- when defining pixels, I could take quantiles of uncertainty. **
+This could make the analysis more robust to noise. 
+However, based on the images - I dont expect much changes.
+
+## A0.1: Load packages
+
+```{r packages, results='hide'}
+suppressPackageStartupMessages(c(
+  library(data.table),
+  library(dplyr),
+  library(SpatialExperiment),
+  library(scuttle),
+  library(parallel),
+  library(patchwork),
+  library(tidyr),
+  library(cytomapper),
+  library(EBImage),
+  library(reshape2),
+  library(mclust)
+))
+```
+
+## A0.2: Paths and settings
+
+```{r settings}
+# Paths
+if (!dir.exists(paths$folder_script)) dir.create(paths$folder_script)
+plotsave_param$path <- paths$folder_script
+plotsave_param_large$path <- paths$folder_script
+
+# Misc settings
+today <- gsub("-", "", Sys.Date())
+```
+
+##  A0.3: Read in the SPE data
+
+Load the SpatialExperiment (SPE) object saved at the previous step.
+
+```{r load-data}
+fn_spe <- file.path(paths$folder_out, paths$prev, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+spe <- readRDS(fn_spe)
+print(spe)
+```
+
+## A0.4: Subset the data to beta-cells.
+```{r}
+beta_cells <- spe[, spe$cell_type == "Beta"]
+beta_cells <- beta_cells[, beta_cells$donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset")]
+```
+
+# **Aim 1: Estimate the correlation between channels (mainly DNA1) for each image.**
+
+Goal is to detect shifts in the correlation to DNA1, which would be a proxy for its localization shift.
+
+## A1.1: Prepare Data
+```{r subset-data}
+metadata_oi <- c("cell_id", "image_id", "case_id", "donor_type", "age")
+features_oi <- rownames(beta_cells)
+# Channels to estimate correlation for.
+channels_oi <- metadata(beta_cells)$channels$Beta
+channels_oi <- c("DNA1", "DNA3", channels_oi[!channels_oi %in% c("Ki67", "ARX", "PDL1")])
+
+exprs_df <- scuttle::makePerCellDF(beta_cells, 
+  features = features_oi,
+  assay.type = "exprs", 
+  use.coldata = metadata_oi, 
+  use.dimred = FALSE)
+
+image_ids <- unique(exprs_df$image_id)
+case_stages <- exprs_df |> distinct(case_id, donor_type, age) |> mutate(age_group = ifelse(age < 13, "young", "old"))
+set.seed(22222)
+rm(spe, beta_cells); gc()
+```
+
+## A1.2: Run the correlation pipeline.
+
+Steps:
+- Load image + Masks. 
+- Across Images, extract ALL beta-cell pixels.
+- For each image, extract the pixel values for the channels of interest.
+- Calculate the correlation between the channels - MAINLY TO DNA1- for each image.
+
+-> This yields a correlation matrix for each image, 
+which can be used to assess shifts in localization across disease stages.
+
+```{r run-pipeline}
+calc_corrs <- FALSE
+
+# iterate through all images. 
+if (calc_corrs){
+  corr_results <- purrr::map(image_ids, \(image_id){
+  # image_id <- "6433_Islet_008"
+    mask_ids <- unique(exprs_df$cell_id[exprs_df$image_id %in% image_id])
+    
+    # remove image-id prefix from mask_ids.
+    mask_ids <- stringr::str_remove(mask_ids, paste0(image_id, "_"))
+    message("Image: ", image_id, " - Number of mask ids: ", length(mask_ids))
+
+    ### Load Images:
+    image_extension <- ".tiff"
+    image_id_long <- stringr::str_replace(image_id, "Islet_", "Islet_ROI_")
+    image_id_full <- paste(image_id_long, image_extension, sep = "")
+
+    # Paths.
+    folder_images <- file.path(paths$folder_in, "img", paths$panel_type)
+    folder_masks <- file.path(paths$folder_in, "masks_cells", paths$panel_type, "whole-cell")
+
+    # ------ Load the masks and identify pixels of interest (beta-cell pixels).
+    masks <- cytomapper::loadImages(file.path(folder_masks, image_id_full), as.is = TRUE)
+    mask_image <- imageData(cytomapper::getImages(masks, image_id_long)[[1]])
+    nrow(mask_image); ncol(mask_image)
+    mask_df <- as.data.frame(which(!is.na(mask_image), arr.ind = TRUE))
+
+    # Get the value of the mask at these indices (= mask labels)
+    mask_df$label <- mask_image[cbind(mask_df$row, mask_df$col)]
+
+    # Filter by mask-ids.
+    result <- subset(mask_df, label %in% mask_ids)
+    mask_pixels <- result[, c("row", "col")]
+    head(result); head(mask_pixels)
+    
+    # ------- Load the images for the channels of interest.
+    images <- cytomapper::loadImages(file.path(folder_images, image_id_full))
+    cytomapper::channelNames(images) <- features_oi
+
+    ## Subset the tiff images to the channels of interest.  
+    images <- cytomapper::getChannels(images, channels_oi)
+
+    # Add image names to metadata
+    mcols(images)$ImageName <- names(images)
+    mcols(images)$ImageName <- paste0(mcols(images)$ImageName)
+
+    # Subset the images to the mask pixels.
+    image_data <- imageData(cytomapper::getImages(images, image_id_long)[[1]])
+
+    # Prepare to write pixel values channel-wise into HDF5
+    # Flatten spatial dimensions, keep channels
+    dims <- dim(image_data)  # Should be [rows, cols, channels]
+    n_channels <- dims[3]
+    pixel_count <- nrow(mask_pixels)
+
+    # Set a default temp folder.
+    HDF5Array::setHDF5DumpDir(tempdir())
+
+    # h5_file <- paste0(image_id, "_beta_image_by_channel.h5")
+
+    # Preallocate HDF5-backed matrix: rows = pixels, cols = channels
+    h5_beta <- HDF5Array::writeHDF5Array(
+      DelayedArray::DelayedArray(array(NA_real_, dim = c(pixel_count, n_channels))),
+      # filepath = h5_file,
+      name = "beta_pixels"
+    )
+
+    # Get the pixel values for the mask pixels. Across all channels.
+    # This ofc. destroys spatial structure of image.
+    # --- Channel-wise extraction to keep memory low
+    for (ch in seq_len(n_channels)) {
+      slice <- image_data[, , ch]
+      h5_beta[, ch] <- slice[cbind(mask_pixels$row, mask_pixels$col)]
+    }
+
+    # Function to compute correlation between one column and all others
+    cor_column <- function(h5_matrix, col_index) {
+      x <- h5_matrix[, col_index]
+      # Compute correlation between x and all columns
+      apply(h5_matrix, 2, function(y) cor(x, y, use = "pairwise.complete.obs", method = "spearman"))
+    }
+
+    # Preallocate correlation matrix
+    cor_matrix <- matrix(NA, n_channels, n_channels)
+
+    # Compute upper triangle (matrix is symmetric)
+    for (i in seq_len(n_channels)) {
+      cor_vals <- cor_column(h5_beta, i)
+      cor_matrix[i, ] <- cor_vals
+    }
+
+    # Optional: Set dimnames
+    channel_names <- dimnames(image_data)[[3]]
+    rownames(cor_matrix) <- channel_names
+    colnames(cor_matrix) <- channel_names
+
+    # Melt for plotting or export
+    library(reshape2)
+    cor_matrix_melted <- melt(cor_matrix)
+    colnames(cor_matrix_melted) <- c("Channel1", "Channel2", "Correlation") 
+
+    if (image_id == "6433_Islet_001") {
+      message("Plotting correlation matrix for image: ", image_id)
+      p <- ggplot(cor_matrix_melted, aes(x = Channel1, y = Channel2, fill = Correlation)) +
+        geom_tile() +
+        scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                            midpoint = 0, limit = c(-1, 1), space = "Lab", 
+                            name="Correlation") +
+        mytheme$standard_new() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+    fn <- file.path(paths$folder_script, "beta_cell_correlation_matrix.png")
+    ggsave(fn, plot = p, width = 10, height = 8, dpi = 300)
+    }
+
+    # Return:
+    as_tibble(cor_matrix_melted) |> 
+      mutate(image_id = image_id) |> 
+      mutate(nr_beta_cells = length(mask_ids))
+  }) |> bind_rows()
+  saveRDS(corr_results, file = file.path(paths$folder_script, "beta_cell_correlation_results.rds"))
+}
+```
+
+## A1.3: Analyze the correlation results.
+### A1.3.1 Load the correlation results and label insulitic images.
+Now, subset the images to the mask pixels.
+```{r load-corr-results}
+if (!calc_corrs){
+  corr_results <- readRDS(file.path(paths$folder_script, "beta_cell_correlation_results.rds"))## Label Insulitic images
+}
+
+fn <- file.path(paths$folder_out, "19_TcellsInsulitis_cells_Immune", "insulitic_images2.rds")
+if (file.exists(fn)) {
+  insulitic_images <- readRDS(fn) |> stringr::str_replace("Immune", "Islet")
+}
+corr_results <- corr_results |> 
+    mutate(insulitic = ifelse(image_id %in% insulitic_images, "Insulitic", "NonInsulitic"))
+```
+
+### A1.3.2 Check for differences in correlation between channels.
+Now, check if any correlations are associated with disease.
+Use linear model to test for differences in correlation between groups.
+
+```{r corr-differences} 
+to_del <- corr_results |> 
+  filter(Channel1 == "INS", Channel2 == "DNA1") |>
+  mutate(case_id = stringr::str_extract(image_id, "^[0-9]+")) |> 
+  group_by(case_id) |> 
+  summarise(sum_beta = sum(nr_beta_cells)) |> filter(sum_beta <= 10) |> 
+  pull(case_id)
+
+lmm_input <- corr_results |> 
+  filter(nr_beta_cells > 3) |> 
+  filter(Channel1 != Channel2) |>
+  mutate(case_id = stringr::str_extract(image_id, "^[0-9]+")) |>
+  filter(!case_id %in% to_del) |>
+  left_join(case_stages, by = "case_id")
+  #mutate(donor_type = if_else(insulitic == "Insulitic" & donor_type %in% c("RecentOnset", "mAAb+"), "Insulitic", donor_type)) |>
+  #mutate(donor_type = factor(donor_type, 
+  #  levels = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "Insulitic")))
+
+res <- lmm_input |>
+  tidyr::nest(data = -c(Channel1, Channel2)) |>
+  mutate(test = purrr::map(data, ~  broom.mixed::tidy(lmerTest::lmer(data = ., 
+    Correlation ~ donor_type + age_group + (1 | case_id))))
+  ) |> 
+  unnest(test) |> 
+  filter(term != "(Intercept)") |>
+  filter(effect == "fixed") |> 
+  arrange(p.value) |> 
+  mutate(donor_type = stringr::str_remove(term, "donor_type")) |>
+  mutate(p.adj = p.adjust(p.value, method = "fdr")) |> 
+  select(-data, -group, -data, -std.error, -effect)
+```
+
+```{r plot-corr-differences}
+c("INS", "DNA1", "DNA3", "ECad", "HLA_ABC", "MX1") |> 
+  purrr::walk(\(channel) {
+    p <- res |>
+      filter(Channel2 == !!channel) |>
+      mutate(direction = ifelse(estimate > 0, "positive", "negative")) |>
+      ggplot(aes(x = reorder(Channel1, p.adj), y = -log10(p.adj), fill = direction)) +
+      geom_bar(stat = "identity") +
+      labs(x = "Channel", y = "Adjusted p-value") +
+      mytheme$standard_new() + 
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+      facet_wrap(~ donor_type, scales = "free_y")
+    
+    fn <- paste0(today, "_correlation_differences_", channel, ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param_large))
+  })
+
+# Reflects shifts across stages. Less corr. with INS/ProINS and higher with HLA-ABC.
+res |> 
+  filter(Channel1 == "XBP1", Channel2 == "DNA1") |> 
+  select(Channel2, estimate, p.value, p.adj, donor_type) |> 
+  arrange(p.adj) |> 
+  print(n = 20)
+
+# Higher correlation with both nuclear/cytoplasmatic markers. 
+# Lower with CAIX
+res |> 
+  filter(Channel1 == "TXNIP") |> 
+  select(Channel2, estimate, p.value, p.adj, donor_type) |> 
+  arrange(p.adj) |> 
+  print(n = 20)
+
+# Plot only for ER-stress related markers.
+p <- res |> filter(Channel1 == "DNA3") |>
+  filter(Channel2 %in% c("TXNIP", "XBP1", "ERN1", "NFkB", "WFS1", "CAIX")) |>
+  mutate(direction = ifelse(estimate > 0, "positive", "negative")) |>
+  ggplot(aes(x = reorder(Channel2, p.adj), y = -log10(p.adj), fill = direction)) +
+  geom_bar(stat = "identity") +
+  labs(x = "Channel", y = "logpadj") +
+  mytheme$standard_new() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  facet_wrap(~ donor_type, scales = "free_y")
+
+print(p)
+fn <- paste0(today, "_correlation_differences_ER_only", ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+
+Boxplot with DNA1 + ECad for XBP1. 
+```{r}
+xbp1_plot <- lmm_input |> 
+  filter(Channel1 == "XBP1", Channel2 %in% c("DNA1", "ECad", "ProINS")) |> 
+  group_by(donor_type, case_id, Channel2) |>
+  summarize(mean_correlation = mean(Correlation, na.rm = TRUE),
+            sd_correlation = sd(Correlation, na.rm = TRUE),
+            .groups = "drop")
+palettes$stages2 <- palettes$stages
+names(palettes$stages2) <- rev(c("Onset", "mAAb+", "sAAb+", "Control"))
+
+p <- xbp1_plot |>
+  mutate(donor_type = case_when(
+    donor_type == "RecentOnset" ~ "Onset",
+    donor_type == "mAAb+" ~ "mAAb+",
+    donor_type == "sAAb+" ~ "sAAb+",
+    donor_type == "NoDiabetes" ~ "Control"
+  )) |>
+  mutate(donor_type = factor(donor_type, levels = c("Control", "sAAb+", "mAAb+", "Onset"))) |>
+  ggplot(aes(x = Channel2, y = mean_correlation, fill = donor_type)) +
+  geom_boxplot(position = "dodge", outliers = FALSE) +
+  geom_jitter() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  mytheme$standard_new() + 
+  scale_fill_manual(values = palettes$stages2, name = "Stage") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  labs(x = expression(beta ~ "-cell marker"), y = expression(beta ~ "-cell Spearman correlation (XBP1)", fill = "Stage")) + 
+  theme(legend.position = "top")
+
+print(p)
+fn <- paste0(today, "_xbp1_correlation_boxplot.png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+saveRDS(p, file.path(paths$home_git, "figures", "rev_supplfig4b.rds"))
+```
+
+Compare Insulitic vs non-insulitic:
+
+```{r}
+inputs <- lmm_input |> 
+  filter(Channel1 == "XBP1", Channel2 == "DNA1") |> 
+  filter(donor_type %in% c("mAAb+", "RecentOnset")) |> 
+  filter(!case_id %in% to_del) |> 
+  distinct(insulitic, case_id) |> 
+  dplyr::count(case_id) |> 
+  dplyr::filter(n == 2) |> pull(case_id)
+
+res_insulitic1 <- lmm_input |> 
+  filter(case_id %in% inputs) |> 
+  tidyr::nest(data = -c(Channel1, Channel2)) |>
+  mutate(test = purrr::map(data, ~  broom.mixed::tidy(lmerTest::lmer(data = ., 
+    Correlation ~ insulitic + age_group + (1 | case_id))))
+  ) |> 
+  unnest(test) |> 
+  filter(term != "(Intercept)", effect == "fixed")
+
+
+## Higher correlation (non-s) with DNA1+3 in non-insulitic.
+## HENCE NO nuclear translocation in insulitis.
+res_insulitic1 |> filter(Channel1 == "XBP1", Channel2 %in% c("B2M", "HLA_ABC", "SYP", "DNA1", "DNA3"), term != "age_groupyoung")
+
+## No clear direction.
+res_insulitic1 |> filter(Channel1 == "ADAR", Channel2 %in% c("B2M", "HLA_ABC", "SYP", "DNA1", "DNA3"), term != "age_groupyoung")
+```
+
+
+# Aim 2: Estimate nuclear, cytoplasmatic and total expression for each beta-cell.
+
+1) Get the nuclear, cytoplasmatic and total expression for each beta-cell.
+2) For this, iterate through all images, load the masks and images, then extract the nuclear pixels using a GMM.
+  -> Each cell has nucleus + cytoplasm. 
+  -> there are 2, 3 edge cases (very rare), but these are handled.
+3) Calculate the average expression for each channel in the nuclear pixels, total pixels and cytoplasmatic pixels.
+4) Write them to a .csv.
+
+## A2.1: Run the pipeline.
+```{r write-cyt-nuc-tot-exp-per-cell}
+# iterate through all images. 
+set.seed(222)
+calc_nuc_cyto_tot <- FALSE
+  if (calc_nuc_cyto_tot) {
+
+  purrr::walk(image_ids, \(image_id){
+    # image_id <- "6034_Islet_001"
+    mask_ids <- unique(exprs_df$cell_id[exprs_df$image_id %in% image_id])
+
+    # remove image-id prefix from mask_ids.
+    mask_ids <- stringr::str_remove(mask_ids, paste0(image_id, "_"))
+    message("Image: ", image_id, " - Number of mask ids: ", length(mask_ids))
+
+    ### Load Images:
+    image_extension <- ".tiff"
+    image_id_long <- stringr::str_replace(image_id, "Islet_", "Islet_ROI_")
+    image_id_full <- paste(image_id_long, image_extension, sep = "")
+
+    # Paths.
+    folder_images <- file.path(paths$folder_in, "img", paths$panel_type)
+    folder_masks <- file.path(paths$folder_in, "masks_cells", paths$panel_type, "whole-cell")
+
+    # ------ Load the masks and identify pixels of interest (beta-cell pixels).
+    masks <- cytomapper::loadImages(file.path(folder_masks, image_id_full), as.is = TRUE)
+    mask_image <- imageData(cytomapper::getImages(masks, image_id_long)[[1]])
+    nrow(mask_image); ncol(mask_image)
+    mask_df <- as.data.frame(which(!is.na(mask_image), arr.ind = TRUE))
+    head(mask_df)
+    
+    # Get the value of the mask at these indices (= mask labels)
+    mask_df$label <- mask_image[cbind(mask_df$row, mask_df$col)]
+
+    # Filter by mask-ids and split by label (cell-id)!
+    result <- subset(mask_df, label %in% mask_ids)
+    X <- split(result, result$label)
+    
+    # ------- Load the images for the channels of interest.
+    images <- cytomapper::loadImages(file.path(folder_images, image_id_full))
+    cytomapper::channelNames(images) <- features_oi
+
+    ## Subset the tiff images to the channels of interest.  
+    images <- cytomapper::getChannels(images, channels_oi)
+
+    # Add image names to metadata
+    mcols(images)$ImageName <- names(images)
+    mcols(images)$ImageName <- paste0(mcols(images)$ImageName)
+
+    # Get image data as 3D array and DNA1 image.
+    image_data <- imageData(cytomapper::getImages(images, image_id_long)[[1]])
+    DNA1_patch <- image_data[, , "DNA1"]
+
+    ## Now, iterate through every mask-id (CELL_LEVEL!)
+    ## 1) First, extract the DNA1 patch for each cell, then run a GMM to identify nuclear pixels.
+    ## 2) Then, go to the other channels and take their average pixel values. 
+    
+    average_exp <- purrr::map2(X, names(X), function(x_p, label_X) {
+      # x_p <- X[[2]]; label_X <- names(X)[2]
+      # Extract all DNA1 pixels of the current cell; then subset to NUCLEAR pixels (pos. for DNA1.)
+      patch <- purrr::map2_dbl(x_p$row, x_p$col, ~ image_data[.x, .y, "DNA1", drop = FALSE])
+
+      # For edge-case that DNA1 is 0. (segmentation errors).
+      if (sum(patch) == 0) {
+        message("No nuclear pixels found for cell: ", label_X, ". Skipping...")
+        nuc_pixel_coords <- tibble::tibble(row = x_p$row, 
+                                          col = x_p$col, 
+                                          label = label_X)
+        tot_pixel_coords <- tibble::tibble(row = x_p$row, 
+                                          col = x_p$col, 
+                                          label = label_X)
+        cyto_pixel_coords <- tibble::tibble(row = x_p$row, 
+                                          col = x_p$col, 
+                                          label = label_X)
+      } else {
+        gmm <- Mclust(patch, G = 2, verbose = FALSE)
+        if (is.null(gmm)) {
+          message("GMM failed for cell: ", label_X, ". Skipping...")
+          nuc_pixel_coords <- tibble::tibble(row = x_p$row, 
+                                            col = x_p$col, 
+                                            label = label_X)
+          tot_pixel_coords <- tibble::tibble(row = x_p$row, 
+                                            col = x_p$col, 
+                                            label = label_X)
+          cyto_pixel_coords <- tibble::tibble(row = x_p$row, 
+                                          col = x_p$col, 
+                                          label = label_X)
+        } else{
+          nuc_pixels <- which(gmm$classification == 2)  
+          cyto_pixels <- which(gmm$classification == 1)
+          nuc_pixel_coords <- tibble::tibble(row = x_p$row[nuc_pixels], 
+                                          col = x_p$col[nuc_pixels], 
+                                          label = label_X)
+          tot_pixel_coords <- tibble::tibble(row = x_p$row, 
+                                            col = x_p$col, 
+                                            label = label_X)
+          cyto_pixel_coords <- tibble::tibble(row = x_p$row[cyto_pixels], 
+                                          col = x_p$col[cyto_pixels], 
+                                          label = label_X)
+        }
+      }
+
+      ## Iterate across channels:
+      ## Get average nuclear expression for markers.
+      nuc_exp <- purrr::map(dimnames(image_data)[[3]], function(channel) {
+        pixels_nuc <- purrr::map2_dbl(nuc_pixel_coords$row, nuc_pixel_coords$col, ~ image_data[.x, .y, channel])
+      
+        # Average the pixel values for the nuclear pixels.
+        mean_value <- mean(pixels_nuc, na.rm = TRUE)
+        return(mean_value)
+      }) |> unlist() |> setNames(dimnames(image_data)[[3]])
+
+      tot_exp <- purrr::map(dimnames(image_data)[[3]], function(channel) {
+        pixels_tot <- purrr::map2_dbl(tot_pixel_coords$row, tot_pixel_coords$col, ~ image_data[.x, .y, channel])
+      
+        # Average the pixel values for the total pixels.
+        mean_value <- mean(pixels_tot, na.rm = TRUE)
+        return(mean_value)
+      }) |> unlist() |> setNames(dimnames(image_data)[[3]])
+
+      ## For cytoplasmatic expression, we can use the total expression values.
+      cyto_exp <- purrr::map(dimnames(image_data)[[3]], function(channel) {
+        pixels_cyto <- purrr::map2_dbl(cyto_pixel_coords$row, cyto_pixel_coords$col, ~ image_data[.x, .y, channel])
+      
+        # Average the pixel values for the cytoplasmatic pixels.
+        mean_value <- mean(pixels_cyto, na.rm = TRUE)
+        return(mean_value)
+      }) |> unlist() |> setNames(dimnames(image_data)[[3]])
+    
+
+      ## Creat the return-tibble with the average expression values.
+      nuc_df <- tibble(channel = names(nuc_exp), values = nuc_exp) |> 
+        mutate(label = label_X)
+
+      tot_df <- tibble(channel = names(tot_exp), values = tot_exp) |> 
+        mutate(label = label_X)
+      
+      cyto_df <- tibble(channel = names(cyto_exp), values = cyto_exp) |> 
+        mutate(label = label_X) 
+
+      list(nuclear = nuc_df, total = tot_df, cyto = cyto_df)
+    })
+
+    # Combine all "nuclear" into a list
+    nuclear_list <- purrr::map(average_exp, "nuclear") |> bind_rows()
+    total_list <- purrr::map(average_exp, "total") |> bind_rows()
+    cyto_list <- purrr::map(average_exp, "cyto") |> bind_rows()
+    
+    ## Write nuclear expression values to a .csv-file.
+    nuclear_list <- nuclear_list |> 
+      mutate(image_id = image_id) |> 
+      pivot_wider(names_from = channel, values_from = values)
+
+    fn <- file.path(paths$folder_in, "nuclear_data_cells", paste0(image_id, ".csv"))
+    write.csv(nuclear_list, file = fn, row.names = FALSE)
+
+    ## Write total expression values to a .csv-file.
+    total_list <- total_list |> 
+      mutate(image_id = image_id) |> 
+      pivot_wider(names_from = channel, values_from = values)
+    
+    fn_tot <- file.path(paths$folder_in, "total_data_cells", paste0(image_id, ".csv"))
+    write.csv(total_list, file = fn_tot, row.names = FALSE)
+    ## Write cytoplasmatic expression values to a .csv-file.
+    cyto_list <- cyto_list |> 
+      mutate(image_id = image_id) |> 
+      pivot_wider(names_from = channel, values_from = values)
+
+    fn_cyto <- file.path(paths$folder_in, "cyto_data_cells", paste0(image_id, ".csv"))
+    write.csv(cyto_list, file = fn_cyto, row.names = FALSE)
+  }) 
+# , .options = options)
+}
+```
+
+## A2.2: Save and Load the full data.
+Read in the nuclear expression data for each image.
+```{r read-expression-values}
+compartments <- c("nuclear", "cyto", "total")
+
+if (calc_nuc_cyto_tot){
+  df <- purrr::map(compartments, \(.x){
+    # Paths.
+    path <- file.path(paths$folder_in, paste0(.x, "_data_cells"))
+    files <- list.files(path, pattern = "\\.csv$", full.names = TRUE)
+    
+    ## Read .csv files in parallel.
+    df_list <- furrr::future_map(files, \(f) readr::read_csv(f), .options = options)
+
+    ## Reshape. Add caseID + cellID.
+    exprs_df_nuc <- bind_rows(df_list) |> 
+      mutate(cell_id = paste(image_id, label, sep = "_")) |> 
+      select(-label) |> 
+      mutate(case_id = stringr::str_extract(image_id, "^[0-9]+")) |>
+      dplyr::inner_join(case_stages, by = "case_id")
+    
+    # Save.
+    fn <- file.path(paths$folder_script, paste0(.x, "_expression.rds"))
+    saveRDS(exprs_df_nuc, file = fn)
+    #}
+    exprs_df_nuc
+  }) |> setNames(compartments)
+} else{
+   df <- purrr::map(compartments, \(.x){
+    fn <- file.path(paths$folder_script, paste0(.x, "_expression.rds"))
+    readRDS(file = fn)
+  }) |> setNames(compartments)
+}
+
+exprs_df_nuc <- df[["nuclear"]]
+exprs_df_cyto <- df[["cyto"]]
+exprs_df_tot <- df[["total"]]
+```
+
+## A2.3: Generate a joint dataframe with nuclear, cytoplasmatic and total expression values.
+Join the nuclear, cytoplasmatic and total expression values for each channel
+into one joint dataframe.
+Each row = 1 cell.
+
+```{r generate-joint-dataframe}
+### Compare across stages
+exprs_df_tot <- exprs_df_tot |> 
+  rename_with(~ paste0(.x, "_tot"), -c(image_id, cell_id, case_id, donor_type))
+
+joint_df <- exprs_df_nuc |>
+    inner_join(exprs_df_cyto, by = c("image_id", "cell_id", "case_id", "donor_type"), suffix = c("_nuc", "_cyto")) |> 
+    inner_join(exprs_df_tot, by = c("image_id", "cell_id", "case_id", "donor_type"))
+
+final_df <- joint_df |> 
+  select(-starts_with("age")) |>
+  pivot_longer(c(ends_with("_nuc"), ends_with("_cyto"), ends_with("_tot")),
+               names_to = c("channel"),
+               values_to = "count")
+final_df
+gc()
+```
+
+## A2.4: ALL: Plot the subcellular expression for each channel.
+Plot the subcellular expression for each channel.
+Plot for nuclear, cytoplasmatic and total expression.
+
+```{r plot-subcellular-expression}
+p <- final_df |> 
+  # remove the _nuc, _cyto, _tot suffixes.
+  mutate(channel2 = stringr::str_remove(channel, "_nuc|_cyto|_tot")) |>
+  # keep either _nuc, _cyto or _tot
+  mutate(channel = stringr::str_extract(channel, "_nuc|_cyto|_tot")) |>
+  # transform counts:
+  mutate(count = asinh(count)) |> 
+  # by image-id
+  group_by(donor_type, channel2, image_id, case_id, channel) |> 
+  summarise(count = mean(count, na.rm = TRUE), .groups = "drop") |>
+  # by case-id
+  group_by(donor_type, channel, channel2, case_id) |> 
+  summarise(count = mean(count, na.rm = TRUE), .groups = "drop") |>
+  # plot.
+  ggplot(aes(x = channel, y = count, fill = donor_type)) +
+  geom_boxplot() +
+  labs(x = "Channel", y = "Mean Nuclear Expression") +
+  mytheme$standard_new() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  facet_wrap(~ channel2, scales = "free_y")
+
+fn <- paste0(today, "_subcellular_expression_boxplot.png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+print(p)
+```
+
+## A2.5: LMMs: subcellular expression. 
+
+### A2.5.1: Calculate P-values for subcellular expression.
+Test, if taking the cyto/nuclear expression and calculating P-values makes a difference. 
+-> No major differences observed.
+```{r}
+res_lmm <- final_df |> 
+  filter(!case_id %in% to_del) |>
+  # take Islet-average.
+  group_by(channel, image_id, case_id, donor_type) |> 
+  summarise(count = mean(count, na.rm = TRUE), .groups = "drop") |> 
+  tidyr::nest(data = -channel) |> 
+  mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(data = ., 
+    count ~ donor_type + (1 | case_id))))
+  ) |> 
+  unnest(test) |> 
+  filter(term != "(Intercept)", effect == "fixed")
+
+res_lmm |> 
+  arrange(p.value) |> 
+  print(n = "all")
+```
+
+### A2.5.2: Plot LMMs P-values for subcellular expression.
+
+```{r}
+p <- res_lmm |> 
+  mutate(donor_type = stringr::str_remove(term, "donor_type")) |>
+  mutate(donor_type = factor(donor_type, 
+    levels = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"))) |>
+  mutate(direction = ifelse(estimate > 0, "positive", "negative")) |>
+  mutate(channel2 = stringr::str_remove(channel, "_nuc|_cyto|_tot")) |> 
+  mutate(channel3 = stringr::str_extract(channel, "_nuc|_cyto|_tot")) |>
+  ggplot(aes(x = reorder(channel2, p.value), y = -log10(p.value), fill = channel3)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(x = "Channel", y = "-log10(p-value)", fill = "") +
+  mytheme$standard_new() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  facet_wrap(~ donor_type, ncol = 2, scales = "free_y", axes = "all")
+print(p)
+fn <- paste0(today, "_subcellular_expression_pvalues.png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+
+
+## A2.6: Calculate vs numeric stages.
+
+Barplot of the p-values for the nuclear vs cytoplasmatic expression.
+There is basically no difference between nuclear and cytoplasmatic expression for most channels.
+
+## A 2.7: Calculate the fraction in nuclear and cytoplasmatic expression.
+
+```{r delta-expression-nuc-cyto}
+delta_exp <- joint_df |>
+  select(image_id, cell_id, case_id, donor_type, 
+         ends_with("_nuc"), ends_with("_cyto"), 
+         ends_with("_tot"), -starts_with("age")) |>
+  mutate(across(
+    .cols = ends_with("_nuc"),
+    .fns = \(nuc_val, .cols = cur_column()) {
+      marker <- stringr::str_remove(.cols, "_nuc")
+      cyto_col <- paste0(marker, "_cyto")
+      if (cyto_col %in% names(joint_df)) {
+        return(nuc_val/(nuc_val + joint_df[[cyto_col]]))
+      } else {
+        return(NA_real_)
+      }
+    },
+    .names = "{.col}_frac_cyto"
+  )) |> 
+  select(image_id, cell_id, case_id, donor_type, 
+         ends_with("_frac_cyto"), ends_with("_nuc"), ends_with("_tot"))
+```
+
+```{r plot-delta-expression-nuc-cyto}
+p <- delta_exp |> 
+  pivot_longer(
+    cols = ends_with("_nuc_frac_cyto"),
+    names_to = "channel",
+    values_to = "delta_expression"
+  ) |>
+  group_by(channel, image_id, case_id, donor_type) |> 
+  summarise(mean_exp = mean(delta_expression, na.rm = TRUE), .groups = "drop") |>
+  group_by(case_id, channel, donor_type) |> 
+  summarise(mean_exp = mean(mean_exp, na.rm = TRUE), .groups = "drop") |>
+  # transform counts:
+  mutate(mean_exp = asinh(mean_exp)) |>
+  mutate(channel = stringr::str_remove(channel, "_nuc_frac_cyto")) |>
+  ggplot(aes(x = channel, y = mean_exp, fill = donor_type)) +
+  geom_boxplot() +
+  # geom_jitter(width = 0.2, alpha = 0.5, dodge = TRUE) +
+  labs(x = "Channel", y = "Frac Nuclear Expression") +
+  mytheme$standard_new() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+fn <- paste0(today, "_delta_expression_boxplot.png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+print(p)
+```
+
+
+```{r}
+palettes$stages2 <- palettes$stages
+names(palettes$stages2) <- rev(c("Onset", "mAAb+", "sAAb+", "Control"))
+
+p <- delta_exp |>
+  pivot_longer(
+    cols = ends_with("_nuc_frac_cyto"),
+    names_to = "channel",
+    values_to = "delta_expression"
+  ) |>
+  filter(channel %in% c("XBP1_nuc_frac_cyto", "ProINS_nuc_frac_cyto", "DNA1_nuc_frac_cyto")) |>
+  group_by(channel, image_id, case_id, donor_type) |> 
+  summarise(mean_exp = mean(delta_expression, na.rm = TRUE), .groups = "drop") |>
+  group_by(case_id, channel, donor_type) |> 
+  summarise(mean_exp = mean(mean_exp, na.rm = TRUE), .groups = "drop") |>
+  # transform counts:
+  mutate(mean_exp = asinh(mean_exp)) |>
+  mutate(channel = stringr::str_remove(channel, "_nuc_frac_cyto")) |>
+  mutate(channel = factor(channel, levels = c("DNA1", "ProINS", "XBP1", "ECad"))) |>
+  mutate(donor_type = case_when(donor_type == "NoDiabetes" ~ "Control",
+                                donor_type == "sAAb+" ~ "sAAb+",
+                                donor_type == "mAAb+" ~ "mAAb+",
+                                donor_type == "RecentOnset" ~ "Onset")) |>
+  mutate(donor_type = factor(donor_type, levels = c("Control", "sAAb+", "mAAb+", "Onset"))) |> 
+  ggplot(aes(x = channel, y = mean_exp, fill = donor_type)) +
+  geom_boxplot(outliers = FALSE) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "black") +
+  geom_jitter(position = position_jitterdodge(jitter.width = 0.5, dodge.width = 0.75)) +
+  labs(x = expression(beta ~ "-cell marker"), y = "Nuclear fraction of normalized counts") +
+  mytheme$standard_new() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  scale_fill_manual(values = palettes$stages2, name = "Stage") + 
+  theme(legend.position = "top")
+
+fn <- paste0(today, "_delta_expression_boxplot_selected.png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+print(p)
+
+saveRDS(p, file.path(paths$home_git, "figures", "rev_supplfig4b.rds"))
+```
+
+-> Nothing really stands out.
+Note: no change for XBP1.
+
+Had calculated the p-values for cyto-nuc before -> nothing that stood out.

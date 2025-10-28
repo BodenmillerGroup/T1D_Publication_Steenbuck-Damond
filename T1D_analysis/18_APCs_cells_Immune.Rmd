@@ -1,0 +1,1124 @@
+---
+title: "18_APCs_cells_Immune"
+author: "Nathan Steenbuck"
+date: "Created: 01.06.2024; Compiled: `r format(Sys.time(), '%d %b, %Y')`"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+if (rstudioapi::isAvailable()) {
+  script_name <- basename(rstudioapi::getSourceEditorContext()$path)
+} else {
+  script_name <- knitr::current_input()
+}
+
+cur_user <- Sys.info()[["user"]]
+script_name <- "18_APCs_cells_Immune.Rmd"
+
+if (cur_user == "ubuntu") {
+    source(file.path("/", "mnt", "central_nas", "projects", 
+    "type1_diabetes", "nathan", "T1D_Vol", "T1D_analysis", 
+    "analysis", "helpers.R"))  #n_cores <- future::availableCores() - 1
+  #n_cores <- future::availableCores() - 1
+  n_cores <- 4
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  knitr::opts_knit$set(root_dir = paths$home_data)
+  do_print <- FALSE
+} else {
+  source(file.path("/", "home", "nsteen", "scripts", "T1D_analysis", "analysis", "helpers.R"))
+  n_cores <- 8
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  paths$folder_script <- paths$cluster_folder_script
+  paths$folder_in <- paths$cluster_folder_in
+  paths$folder_out <- paths$cluster_home 
+  knitr::opts_knit$set(root_dir = paths$cluster_home)
+  do_print <- TRUE
+}
+
+seed <- 123456
+set.seed(seed)
+options <- furrr::furrr_options(seed = seed)
+paths$prev <- paste("08_CellTypesIslet", paths$object_type, paths$panel_type, sep = "_")
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# **Goal**
+
+Myeloid-4 and Myeloid-3 cells are the likely the main antigen-presenting cells (APCs) in the pancreas.
+Here, we look into them in more detail. 
+Myeloid-3 = activated M1/M2 
+Myeloid-4 = cDCs
+
+# **Settings**
+
+## Load packages
+
+```{r packages, results='hide'}
+suppressPackageStartupMessages(c(
+  library(data.table),
+  library(dplyr),
+  library(SpatialExperiment),
+  library(scuttle),
+  library(parallel),
+  library(patchwork),
+  library(tidyr),
+  library(RSpectra),
+  library(rstatix),
+  library(ggpubr)
+))
+```
+
+## Paths and settings
+
+```{r settings}
+# Paths
+if (!dir.exists(paths$folder_script)) dir.create(paths$folder_script)
+plotsave_param$path <- paths$folder_script
+plotsave_param_large$path <- paths$folder_script
+
+# Misc settings
+today <- gsub("-", "", Sys.Date())
+```
+
+##  Read in the data
+
+Load the SpatialExperiment (SPE) object saved at the previous step.
+
+```{r load-data}
+fn_spe <- file.path(paths$folder_out, paths$prev, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+spe <- readRDS(fn_spe)
+print(spe)
+```
+
+
+## Add DistScore to the data
+```{r dist-score-spe}
+quantiles <- rev(quantile(spe$distance_to_islet[
+  spe$distance_to_islet <= 0], prob = c(0, 0.25, 0.5, 0.75, 0.89, 1)))
+print(quantiles)
+
+bins <- unname(round(quantiles))
+distances <- c("inside", "< 20 um", "20-40 um", "> 40 um")
+names(distances) <- RColorBrewer::brewer.pal(8, "Spectral")[c(1, 3, 4, 6)]
+print(distances)
+
+spe$infiltration <- ifelse(
+  spe$distance_to_islet > bins[1], distances[1],
+  ifelse(
+    spe$distance_to_islet < bins[1] & spe$distance_to_islet >= bins[2], distances[2],
+    ifelse(
+      spe$distance_to_islet < bins[2] & spe$distance_to_islet >= bins[3], distances[3],
+      distances[4])
+    ))
+
+spe$infiltration <- factor(spe$infiltration, levels = distances)
+spe$DistScore <- ifelse(spe$distance_to_islet >= 1, 1, abs(1/spe$distance_to_islet))
+spe$SqrtDistScore <- ifelse(spe$distance_to_islet >= 1, 1, sqrt(abs(1/spe$distance_to_islet)))
+```
+
+# A1: Expression changes to the islet edge
+## A1.1: Prepare the data
+
+Prepare Data. 
+Grouped by Islet. 
+Split into Macrophages, cDCs, Neutrophils, T-cells.
+
+```{r prepare-data}
+channels <- metadata(spe)$channels
+channels_imm <- unique(unlist(channels))
+
+exprs_df <- as_tibble(scuttle::makePerCellDF(spe, features = channels_imm, assay.type = "exprs", use.dimred = FALSE)) |> 
+  select(all_of(channels_imm), case_id, donor_type, DistScore, 
+         image_id, infiltration, cell_type, distance_to_islet, cell_cluster_scaled) |> 
+  filter(donor_type != "Pancreatitis") |> 
+  group_by(image_id, case_id, donor_type) |>
+  mutate(islet_type = if_else(sum(cell_type == "Beta") > 0, "ICI", "IDI")) |> 
+  ungroup()
+
+## Prepare the data. 
+myeloid_df <- exprs_df |> filter(cell_type == "Myeloid") |> 
+  mutate(donor_type = factor(donor_type, levels = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration")))
+
+# Macrophage-only (- cDCs).
+macrophages_df <- myeloid_df  |> filter(!cell_cluster_scaled %in% c("Myeloid_4"))
+# cDCs only.
+cdc_df <- myeloid_df  |> filter(cell_cluster_scaled == "Myeloid_4")
+# M1/M2 macrophages.
+my3_df <- myeloid_df  |> filter(cell_cluster_scaled == "Myeloid_3")
+gc()
+```
+
+## A1.2: Distance of Myeloid-3 and Myeloid-4 to islet edge
+
+Plot distance of My3 and My4 to islet edge.
+```{r localization_my3}
+# Not grouped by ROI -> too few cells.
+my4_df <- cdc_df |> 
+  select(image_id, donor_type, case_id, distance_to_islet, cell_cluster_scaled, islet_type) |> 
+  filter(islet_type == "ICI") |>
+  filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"))
+
+# Group by ROI.
+my3_df_image <- my3_df |> 
+  filter(islet_type == "ICI") |>
+  filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset")) |>
+  group_by(image_id, donor_type, case_id, cell_cluster_scaled, islet_type) |> 
+  summarize(distance_to_islet = mean(distance_to_islet), .groups = "drop") |> 
+  select(image_id, donor_type, case_id, distance_to_islet, cell_cluster_scaled, islet_type)
+
+my3_4_df <- rbind(my3_df_image, my4_df) |> 
+  mutate(cell_cluster_scaled = ifelse(cell_cluster_scaled == "Myeloid_3", "Activated M1/M2", cell_cluster_scaled)) |> 
+  mutate(cell_cluster_scaled = ifelse(cell_cluster_scaled == "Myeloid_4", "cDC", cell_cluster_scaled))
+
+my3_4_df <- my3_4_df |> 
+  left_join(colData(spe) |> as_tibble() |> distinct(case_id, age_group.y, ICU_time_days.y), by = "case_id") |> 
+  as_tibble() |> 
+  mutate(ICU_time_days.y = ifelse(is.na(ICU_time_days.y), mean(ICU_time_days.y, na.rm = TRUE), ICU_time_days.y))
+
+# Distance to Islet
+my3_4_df  |> 
+  group_by(cell_cluster_scaled, donor_type) |> 
+  summarize(distance_to_islet = mean(distance_to_islet), .groups = "drop")
+
+# MM_models for distinct distance to islets.
+p_vals <- my3_4_df |> 
+  tidyr::nest(data = -c("cell_cluster_scaled")) |>
+  mutate(test = purrr::map(data, \(.x) {
+    test <- lmerTest::lmer(data = .x, distance_to_islet ~ donor_type + age_group.y + ICU_time_days.y + (1 | case_id))
+    m.emm <- emmeans::emmeans(test, ~ donor_type, pbkrtest.limit = 10000)
+    pairwise <- m.emm |> 
+        emmeans::contrast("pairwise", adjust = "none") |> 
+        as_tibble() |> 
+        filter(contrast != "(sAAb+) - RecentOnset") |> 
+        filter(contrast != "(mAAb+) - LongDuration") |>
+        filter(contrast != "(sAAb+) - LongDuration")
+  })) |>
+  tidyr::unnest(test)
+
+p_vals <- p_vals |> 
+    mutate(group1 = contrast, group2 = contrast) |>  
+    mutate(group1 = stringr::str_replace(group1, "\\s.*", "")) |> 
+    mutate(group2 = stringr::str_replace(group2, "^(?:\\S+\\s+\\S+\\s+)", "")) |> 
+    mutate(group1 = stringr::str_remove(group1, "\\(")) |>
+    mutate(group2 = stringr::str_remove(group2, "\\(")) |> 
+    mutate(group1 = stringr::str_remove(group1, "\\)")) |> 
+    mutate(group2 = stringr::str_remove(group2, "\\)"))
+
+  # Use this for actual P-Values.
+  p_vals <- p_vals |> 
+    mutate(.y. = "distance_to_islet",
+           p = p.value,
+           statistic = t.ratio,
+           p.adj = p.adjust(p, method = "fdr"),
+           p.signif = cut(p.adj, breaks = c(-Inf, 0.001, 0.01, 0.05, Inf), labels = c("***", "**", "*", ""))
+           ) |> 
+    select(.y., group1, group2,
+           statistic, p, p.adj, p.signif, cell_cluster_scaled)
+
+  # get max-y-value PER channel.
+  p_vals <- my3_4_df  |> 
+      group_by(cell_cluster_scaled) |> 
+      summarise(max = max(distance_to_islet), .groups = "drop") |>
+      dplyr::right_join(p_vals, by = c("cell_cluster_scaled"))
+  p_vals
+
+## Ggpubr for appropriate formatting.
+stat.test <- my3_4_df  |> 
+  group_by(cell_cluster_scaled) |> 
+  t_test(distance_to_islet ~ donor_type, ref.group = "NoDiabetes") |> 
+  add_xy_position(x = "donor_type") |> 
+  select(-c(statistic, p, p.adj))
+
+  stat.test <- my3_4_df |> 
+    group_by(cell_cluster_scaled) |> 
+    tukey_hsd(distance_to_islet ~ donor_type)  |> 
+    filter(!(group1 == "sAAb+" & group2 == "RecentOnset")) |> 
+    select(group1, group2, cell_cluster_scaled) |> 
+    add_xy_position(x = "donor_type", step.increase = 0.07, dodge = 0.8) |> 
+    distinct()
+
+  stat.test.test <- p_vals |> 
+    left_join(stat.test, by = c("cell_cluster_scaled", "group1", "group2")) |> 
+    select(-c(statistic, p)) |> 
+    filter(p.adj < 0.05) |>
+    mutate(y.position = max * 1.3)  |> 
+    group_by(cell_cluster_scaled) %>%
+    mutate(y.position = first(y.position) * (1 + (0.07) * (row_number() - 1))) %>%
+    ungroup()
+
+stat.test.test
+
+# Plot.
+p <- ggviolin(my3_4_df, x = "donor_type", y = "distance_to_islet", fill = "donor_type", 
+        facet.by = "cell_cluster_scaled", palette = palettes$stages,
+        draw_quantiles = c(0.25, 0.5, 0.75), add = "jitter", 
+        add.params = list(width = 0.1, alpha = 0.4, size = 0.4)) + 
+  stat_pvalue_manual(stat.test.test, label = "p.signif", tip.length = 0.1,
+                     size = 10, label.size = 10) + 
+  facet_wrap(~ cell_cluster_scaled, scales = "free_y", nrow = 2) +
+  labs(x = "Stage", y = "Distance to Islet") + 
+  mytheme$standard_new() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "none")+ 
+  scale_y_continuous(limits = c(-150, NA), expand = expansion(mult = c(0, 0.1)))
+
+fn <- paste0(paste(today, "Myeloid_3_4_distance_stages", sep = "_"), ".png")
+plotsave_param2 <- plotsave_param
+plotsave_param2$height <- 400
+do.call(ggsave, c(list(fn, p), plotsave_param2))
+
+extfig8d <- p
+saveRDS(extfig8d, file.path(paths$home_git, "figures", "extfig8d.rds"))
+```
+
+## A1.3: Distance of Myeloid-4 to islet edge (Sample-wise)
+
+```{r cDC-distance-sample}
+## cDC Distance to Islet Edge PER SAMPLE - IF above 10 cDCs at least.
+test_cdc_sample <- cdc_df |> 
+  add_count(donor_type, case_id) |> 
+  filter(n > 3) |> 
+  group_by(donor_type, case_id) |>
+  summarize(distance_to_islet = mean(distance_to_islet), .groups = "drop")
+
+## Plot per sample
+p <- test_cdc_sample |> 
+  ggplot(aes(x = donor_type, y = distance_to_islet, fill = donor_type)) +
+  geom_violin() +
+  geom_point() + 
+  scale_fill_manual(values = palettes$stages) +
+  labs(x = "Donor Type", y = "Mean Distance to Islet Edge", fill = "Donor Type") +
+  mytheme$standard()
+
+print(p)
+fn <- paste0(paste(today, "cDC_distance_samples", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+## A1.4: cDC: Higher HLA-DR expression in cDCs at the islet edge
+Explorative. cDCs might show higher HLA-DR expression 
+closer to the islet edge in inflamm. conditions (here, REC donors).
+
+```{r distal-tele}
+## Compare Peri-islet vs Distal cDCs
+test_cdc <- cdc_df |> 
+  mutate(dist = ifelse(distance_to_islet > -20, "Peri-islet", "Distal"))
+
+plot_test_cdc <- test_cdc |> 
+  group_by(donor_type, case_id, dist) |>
+  summarize(HLA_DR = mean(HLA_DR, na.rm = TRUE))
+
+## Linear Mixed-effect model: 
+p_vals <- plot_test_cdc |> 
+    tidyr::nest(data = -c("donor_type")) |> 
+    mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(HLA_DR ~ dist + (1 | case_id), data = .x)))) |> 
+    unnest(test) |> 
+    filter(effect == "fixed", term != "(Intercept)") |> 
+    mutate(p.adj = p.adjust(p.value, method = "fdr")) |> 
+    mutate(significance = cut(p.adj, breaks = c(-Inf, 0.001, 0.01, 0.05, Inf), labels = c("***", "**", "*", ""))) |> 
+    arrange(donor_type) |> 
+    mutate(dist = stringr::str_remove(term, "dist"))
+
+## Plot Distance to Islet vs HLA-DR
+max_y_value <- max(plot_test_cdc$HLA_DR)* 1.1
+min_y_value <- min(plot_test_cdc$HLA_DR)
+pos_pvals <- max_y_value * 0.95
+
+p <- plot_test_cdc |> 
+  ggplot(aes(x = dist, y = HLA_DR, fill = donor_type)) +
+  geom_violin(draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_point(size = 0.5, alpha = 0.5) +
+  facet_wrap(~ donor_type, scales = "fixed") +
+  labs(x = "Distance to Islet", y = "HLA_DR", fill = "Donor Type") +
+  mytheme$standard() + 
+  scale_fill_manual(values = palettes$stages) + 
+  ylim(c(min_y_value, max_y_value)) + 
+  geom_line(aes(group = case_id), alpha = 0.2)
+
+p <- p + geom_text(data = p_vals, 
+        aes(x = dist, y = pos_pvals, label = significance), size = 10) + 
+        facet_wrap(~ donor_type, scales = "fixed")
+
+print(p)
+fn <- paste0(paste(today, "cDC_distance_HLA-DR", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+## A1.5: cDC: HLA-DR expression across stages
+Explorative: HLA-DR is also upregulated across stages; but non-significant. 
+Likely due to rarity of cDCs.
+```{r hla-dr-stages-cDCs}
+# Plot only Full HLA-DR
+p <- test_cdc |> 
+  group_by(case_id, donor_type) |>
+  summarize(mean_HLA = mean(HLA_DR, na.rm = TRUE)) |>
+  ggplot(aes(x = donor_type, y = mean_HLA, fill = donor_type)) +
+  geom_violin(draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 3, width = 0.2) +
+  labs(x = "Donor Type", y = "HLA_DR", fill = "Donor Type") +
+  # rotate x-axis labels
+  mytheme$large() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45),
+    panel.grid.major.y = element_line(colour = "grey")
+  ) + 
+  scale_fill_manual(values = palettes$stages)
+
+print(p)
+fn <- paste0(paste(today, "cDC_HLA_DR", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+## Linear Model. Non-significant in HLA-DR. Too few cells probably.
+p_vals_test <- test_cdc |> 
+    group_by(case_id, donor_type) |>
+    summarize(mean_HLA = mean(HLA_DR, na.rm = TRUE)) |> 
+    tidyr::nest(data = -c()) |> 
+    mutate(test = purrr::map(data, ~ broom::tidy(lm(mean_HLA ~ donor_type, data = .x)))) |> 
+    unnest(test) |> 
+    filter(term != "(Intercept)") |> 
+    mutate(p.adj = p.adjust(p.value, method = "fdr"))
+
+p_vals_test
+# Adj p-value: p = 0.14
+```
+
+Plot only RecentOnset HLA-DR.
+Higher Expression at Islet-Edge. 
+-> IFN-expression.
+```{r}
+## Only RecentOnset:
+p <- plot_test_cdc |>
+  filter(donor_type == "RecentOnset") |> 
+  ggplot(aes(x = dist, y = HLA_DR, fill = donor_type)) +
+  geom_violin(draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(size = 3, width = 0.2) +
+  labs(x = "Distance to Islet", y = "HLA_DR", fill = "Distance to Islet") +
+  mytheme$standard() + 
+  scale_fill_manual(values = palettes$stages) + 
+  geom_line(aes(group = case_id), alpha = 0.2)
+
+p <- p + geom_text(data = p_vals |> filter(donor_type == "RecentOnset"), 
+        aes(x = dist, y = pos_pvals, label = significance), size = 10)
+print(p)
+fn <- paste0(paste(today, "cDC_distance_HLA-DR_RecentOnset", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+# A2: cDCs UMAP + Channels
+-> Detect potential cDC1 + cDC2.
+
+## A2.1: cDCs UMAP + Channels
+```{r prepare-UMAP-cDCs}
+### UMAP:
+## UMAP of cDCs
+features_oi <- c("CD11c", "CD103", "HLA_DR", "TIM3", "CD54", "CD73")
+dimred_name <- "UMAP_cDC"
+spe_cDC <- spe[features_oi, colData(spe)$cell_cluster_scaled == "Myeloid_4"]
+spe_cDC <- spe_cDC[, spe_cDC$donor_type != "Pancreatitis"]
+```
+
+## A2.2: RUN UMAP
+
+```{r umap_cdc}
+cur_assay <- "exprs"
+set.seed(222)
+cur_umap <- uwot::umap(t(assay(spe_cDC, cur_assay)), n_neighbors = 15) # , n_threads = 4)
+colnames(cur_umap) <- c("UMAP1", "UMAP2")
+rownames(cur_umap) <- colnames(assay(spe_cDC, cur_assay))
+reducedDim(spe_cDC, dimred_name) <- cur_umap
+remove(cur_umap)
+```
+
+## A2.3: Get Data and plot UMAP (with channels)
+Get cDC data.
+
+```{r get-cdc-data}
+df_img <- scuttle::makePerCellDF(
+  x = spe_cDC,
+  assay.type = "scaled",
+  features = features_oi,
+  use.coldata = c("distance_to_islet", "cell_type", "donor_type", "case_id", "image_id", "cell_cluster_scaled"),
+  use.dimred = TRUE
+)  |> as_tibble(rownames = "cell_id") |> 
+  dplyr::select(cell_cluster_scaled, cell_id, distance_to_islet, cell_type, donor_type, image_id, case_id, starts_with("UMAP"), all_of(features_oi)) |> 
+  mutate(donor_type = factor(donor_type, levels = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration")))
+```
+
+Plot UMAP & Channels on UMAP.
+```{r plot_umap}
+## Plot by Channel.
+df_img_long <- df_img |>
+  tidyr::pivot_longer(cols = all_of(features_oi), names_to = "channel", values_to = cur_assay)
+
+p <- plot_dim_red_channels(dat = df_img_long, size = 1, alpha = 1, force_points = TRUE, 
+                           dimred = dimred_name, expr_values = cur_assay, censor_val = 0.99, channel = features_oi)
+print(p)
+fn <- paste0(paste(today, "cDC_UMAP_channels", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+## By Donor-Type & Distance to Islet
+p <- plot_dim_red(dat = df_img, dimred = dimred_name, color_by = "donor_type", palette = palettes$stages, sample = FALSE, size = 2, alpha = 1)
+q <- plot_dim_red(dat = df_img, dimred = dimred_name, 
+  color_by = "distance_to_islet", palette_continuous = TRUE,
+  sample = FALSE, size = 2, alpha = 1)
+fig <- p + q
+print(fig)
+fn <- paste0(paste(today, "cDC_UMAP_stage_distance", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, fig), plotsave_param))
+```
+
+-> Futile to define further subsets.
+
+## Plot Images of cDCs
+
+```{r viz-cDC-clust-select}
+spe_myeloid <- spe[ , colData(spe)$cell_type == "Myeloid"]
+all_channels <- rownames(spe_myeloid)
+
+viz_clust <- NULL # c(22, 21, 9) # c(21, 9, 11, 12, 2, 20, 1, 5, 3, 4)
+viz_method <- "cell_cluster_scaled"
+viz_assay <- "scaled"
+```
+
+```{r}
+## 
+exprs_df  |>
+  dplyr::count(image_id, cell_cluster_scaled) |>
+  filter(cell_cluster_scaled == "Myeloid_4") |>
+  arrange(desc(n))
+```
+
+### Load images and masks
+
+```{r viz-lympho-cluster-load}
+if (!is.null(viz_clust)) {
+  nb_images <- 14
+  image_extension <- ".tiff"
+  clust_name <- viz_method
+  
+  # Subset the SCE
+  sce_viz <- spe_myeloid
+
+  set.seed(seed)
+
+  image_sub <- sort(sample(
+    unique(sce_viz$image_fullname),
+    min(length(unique(sce_viz$image_fullname)), nb_images)))
+  
+  image_sub <- unique(c(image_sub, images <- 
+    c("6228_Immune_ROI_082.tiff", "6551_Immune_ROI_069.tiff", 
+      "6362_Immune_ROI_019.tiff", "6178_Immune_ROI_029.tiff",
+      # Myeloid-4:
+      "6509_Immune_ROI_026.tiff", "6447_Immune_ROI_009.tiff", "6533_Immune_ROI_051.tiff", "6551_Immune_ROI_069.tiff", 
+      "6551_Immune_ROI_050.tiff",
+      # Myeloid-11:
+      "6458_Immune_ROI_077.tiff", "6458_Immune_ROI_046.tiff", "6044_Immune_ROI_049.tiff", "6367_Immune_ROI_076.tiff",
+      # Myeloid-12:
+      "6429_Immune_ROI_008.tiff", "6449_Immune_ROI_072.tiff", "6534_Immune_ROI_066.tiff",
+      # Myeloid-7:
+      "6520_Immune_ROI_067.tiff", "6324_Immune_ROI_016.tiff", "6526_Immune_ROI_009.tiff",
+      # Myeloid-10:
+      "6228_Immune_ROI_023.tiff", "6534_Immune_ROI_076.tiff"
+      )))
+
+  # Folders
+  folder_images <- file.path(paths$folder_in, "img", paths$panel_type)
+  folder_masks <- file.path(paths$folder_in, "masks_cells",
+                            paths$panel_type, "whole-cell")
+  
+  images <- cytomapper::loadImages(file.path(folder_images, image_sub))
+  cytomapper::channelNames(images) <- all_channels
+  # Add image names to metadata
+  mcols(images)$ImageName <- names(images)
+  mcols(images)$ImageName <- paste0(mcols(images)$ImageName)
+
+  # Load images and masks
+  #images <- yoloader(
+  #  x = sce_viz,
+  #  image_dir = folder_images,
+  #  image_names = image_sub,
+  #  type = "stacks"
+  #)
+
+  masks <- yoloader(
+    x = sce_viz,
+    image_dir = folder_masks,
+    image_names = image_sub,
+    as.is = TRUE,
+    type = "masks"
+  )
+  
+  sce_viz <- sce_viz[, sce_viz$image_fullname %in% image_sub]
+  sce_viz$ImageName <- gsub(image_extension, "", sce_viz$image_fullname)
+}
+```
+
+### Cytoviewer app.
+```{r cytoviewer}
+if (!viz_clust){
+  library(cytoviewer)
+  sce_viz[[clust_name]] <- as.factor(sce_viz[[clust_name]])
+  app <- cytoviewer(image = images, 
+                    mask = masks, 
+                    object = sce_viz,
+                    img_id = "ImageName", 
+                    cell_id = "cell_number")
+
+  if (interactive()) {
+    shiny::runApp(app)
+  }  
+}
+```
+
+# A2: **Macrophage Analysis.**
+
+## A2.1: Prepare Data. 
+Select 
+- a) ISLET-RESIDENT Macrophages + ICIs 
+- b) ALL myeloid cells from ICIs.
+
+```{r macrophages-analysis}
+features_oi <- metadata(spe)$channels$Myeloid
+
+## Select only Islet-resident Myeloid cells + ICIs.
+islet_resident_macrophage <- macrophages_df |> 
+  mutate(DistScore = ifelse(distance_to_islet >= 1, 1, abs(1/distance_to_islet))) |>
+  mutate(DistScoreSqrt = ifelse(distance_to_islet >= 1, 1, sqrt(abs(1/distance_to_islet)))) |>
+  filter(donor_type %in% c("RecentOnset", "sAAb+", "mAAb+", "NoDiabetes"), islet_type == "ICI") |>
+  select(donor_type, DistScore, case_id, cell_cluster_scaled, image_id, infiltration, cell_type, all_of(features_oi)) |>
+  pivot_longer(cols = all_of(features_oi), names_to = "channel", values_to = "MeanExprs") |>
+  dplyr::filter(infiltration == "inside")
+
+## Select Myeloid cells + ICIs.
+macrophages_df_ici <- macrophages_df |> 
+  mutate(DistScore = ifelse(distance_to_islet >= 1, 1, abs(1/distance_to_islet))) |>
+  mutate(DistScoreSqrt = ifelse(distance_to_islet >= 1, 1, sqrt(abs(1/distance_to_islet)))) |>
+  filter(donor_type %in% c("RecentOnset", "sAAb+", "mAAb+", "NoDiabetes"), islet_type == "ICI") |>
+  select(donor_type, DistScore, case_id, cell_cluster_scaled, image_id, infiltration, cell_type, all_of(features_oi)) |>
+  pivot_longer(cols = all_of(features_oi), names_to = "channel", values_to = "MeanExprs")
+```
+
+## A2.2. Explorative: All macrophages expression changes
+Explorative: Expression changes for ALL Macrophages.
+```{r stats_islet_resident_macs}
+channels_to_plot <- c("CD16", "HLA_DR", "CD11c",  
+                     "CD163", "CD204", "CD206", 
+                     "HK1", "CS", "ATP5A", "LDHA", 
+                    "CD54", "CD73", "SMA", 
+                     "CD27", "PD1", "TIM3", "CD303")
+
+p <- islet_resident_macrophage |>  
+  ## now calcualte mean per donor_type and channel and case.
+  filter(channel %in% channels_to_plot) |>
+  group_by(donor_type, channel, case_id) |>
+  summarize(mean = mean(MeanExprs, na.rm = TRUE)) |>
+  # order by channels_to_plot
+  mutate(channel = factor(channel, levels = channels_to_plot)) |>
+  ggplot(aes(x = donor_type, y = mean, color = donor_type)) +
+  geom_boxplot(outlier.size = 1) +
+  labs(x = "Donor type", y = "Mean expression", title = "Mean expression of Myeloid markers in ICI") +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  facet_wrap(~channel, scales = "free_y") + 
+  scale_color_manual(values = palettes$stages)
+print(p)
+fn <- paste0(paste(today, "IsletResidentMyeloid_all", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+## A2.3. Myeloid 3: Expression Changes
+
+Plot Expression of major markers (CD16, HLA-DR, CD206, & CD163 along Progression.)
+-> Here first just Myeloid-3 (M1/M2)
+
+Figure 5 E + Ext Fig 8.
+```{r stats_myeloid-3}
+library(emmeans)
+channels1 <- c("CD16", "HLA_DR", "CD206", 
+               "CS", "HK1", "CD54")
+
+channels2 <- c("CD163", "CD11c", "CD204", 
+               "CD11b", "TIM3", "CD73")
+
+ll <- list(channels1, channels2)
+ll_name <- c("Major_markers", "Other_markers")
+
+purrr::map2(ll, ll_name, \(channels_to_plot, cur_title) {
+
+  exprs_dat <- macrophages_df_ici |> 
+    filter(channel %in% !!channels_to_plot) |>
+    filter(cell_cluster_scaled == "Myeloid_3") |> 
+    group_by(donor_type, channel, cell_type, case_id, image_id) |> 
+    summarize(exprs = mean(MeanExprs, na.rm = TRUE), .groups = "drop")
+  
+  exprs_dat <- exprs_dat  |> 
+    left_join(colData(spe) |> as_tibble() |> distinct(case_id, age_group.y, ICU_time_days.y), by = "case_id") |> 
+    as_tibble() |> 
+    mutate(ICU_time_days.y = ifelse(is.na(ICU_time_days.y), mean(ICU_time_days.y, na.rm = TRUE), ICU_time_days.y))
+
+  channels_oi <- c("CD16", "CD206", "CD54", "CS", "HK1", "HLA_DR")
+  p <- plot_expression_violin(exprs_dat = exprs_dat, 
+                              channels_oi = channels_to_plot, 
+                              cell_types = "Myeloid", 
+                              facet_by = "channel", 
+                              y_label = "Act. M1/M2-like expression",
+                              immune_adjust = TRUE)
+
+  fn <- paste0(paste(today, "Myeloid_3", cur_title, sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param_large))
+  print(p)
+  if (cur_title == "Major_markers") {
+    fig5f <- p
+    saveRDS(fig5f, file.path(paths$home_git, "figures", "fig5f.rds"))
+  }
+  if (cur_title == "Other_markers") {
+    extfig8f <- p
+    saveRDS(extfig8f, file.path(paths$home_git, "figures", "extfig8f.rds"))
+  }
+})
+```
+## A2.4. Expression Changes for all macrophages (inflamm. + activation markers)
+
+ALL Macrophages.
+```{r stats_all_macs}
+channels1 <- c("CD16", "HLA_DR", "CD206", "CS", "HK1", "CD54")
+channels2 <- c("CD163", "CD11c", "CD204", "CD11b", "TIM3", "CD73")
+
+ll <- list(channels1, channels2)
+ll_name <- c("Major_markers", "Other_markers")
+
+purrr::map2(ll, ll_name, \(channels_to_plot, cur_title){
+  exprs_dat <- macrophages_df_ici |> 
+    filter(channel %in% !!channels_to_plot) |>
+    filter(cell_cluster_scaled != "Myeloid_3") |> 
+    group_by(donor_type, channel, cell_type, case_id, image_id) |> 
+    summarize(exprs = mean(MeanExprs, na.rm = TRUE), .groups = "drop")
+
+  channels_oi <- c("CD16", "CD206", "CD54", "CS", "HK1", "HLA_DR")
+  p <- plot_expression_violin(exprs_dat = exprs_dat, 
+                            channels_oi = channels_to_plot, 
+                            cell_types = "Myeloid", 
+                            facet_by = "channel", 
+                            y_label = "Macrophage cell expression")
+  print(p)
+  # Stats.
+  fn <- paste0(paste(today, "Macrophages", cur_title, sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param_large))
+})
+```
+
+
+# A3: Changes in expression to islet distance for Myeloid cells
+
+## A3.1: Macrophages
+
+We observed that macrophage marker expression changes with distance to islet edge; already in ND.
+
+```{r myeloid-cells}
+## Calcualte Association to Distance to Edge for Myeloid-cell marker expression.
+
+## Scale all markers.
+macrophages_df_scaled <- macrophages_df  |>  
+  mutate(across(starts_with("HLA"), scale)) |> 
+  mutate(across(starts_with("CS"), scale)) |>
+  mutate(across(starts_with("TMEM"), scale))
+
+fm <- lmerTest::lmer(DistScore ~ HLA_DR + CD54 + CD16 + CD73 + CD206 + CS + (1 | case_id), 
+  data = macrophages_df_scaled |> filter(donor_type == "NoDiabetes"))
+summary(fm)$coefficients
+summary(fm)
+# Calculate R-squared values
+(r_squared <- MuMIn::r.squaredGLMM(fm))
+
+## only mAAb+ and RecentOnset (ICI)
+fm <- lmerTest::lmer(DistScore ~ HLA_DR + CD54 + CD16 + CD73 + CD206 + CS + (1 | case_id), 
+  data = macrophages_df_scaled |> filter(donor_type == "RecentOnset", islet_type == "ICI"))
+summary(fm)
+summary(fm)$coefficients
+# Calculate R-squared values
+(r_squared <- MuMIn::r.squaredGLMM(fm))
+# -> higher R2 -> Gradient is strengthened.
+
+## only mAAb+ and RecentOnset (IDI) -> Gradient lost.
+fm <- lmerTest::lmer(DistScore ~ HLA_DR + CD16 + CD163 + CD73 + CD206 + CS + (1 | case_id), 
+  data = macrophages_df_scaled |> filter(donor_type == "RecentOnset", islet_type == "IDI"))
+summary(fm)$coefficients
+summary(fm)
+# Calculate R-squared values
+(r_squared <- MuMIn::r.squaredGLMM(fm))
+```
+
+-> This gradient is already present in ND.
+-> It is built up with inflammation (due to influx of ICs) and 
+   lost upon beta-cell ablation. 
+
+## A3.2: PER STAGE: GRADIENT IN MARKER EXPRESSION ACROSS WITHIN/OUTSIDE ISLETS.
+
+CTRL Pancreas has islet-dependent micro-environment.
+
+First: ICI macrophages; aggregate by Islet.
+```{r}
+## only mAAb+ and RecentOnset (ICI)
+features_oi <- metadata(spe)$channels$Myeloid
+macrophages_islet <- macrophages_df |> 
+  filter(islet_type == "ICI") |>
+  select(donor_type, DistScore, image_id, case_id, infiltration, cell_type, all_of(features_oi)) |> 
+  group_by(donor_type, infiltration, case_id, image_id) |>
+  summarise(across(all_of(features_oi), \(x) mean(x, na.rm = TRUE)), .groups = "drop")  |> 
+  pivot_longer(cols = all_of(features_oi), names_to = "channel", values_to = "MeanExprs")
+```
+
+Reduced set of markers:
+```{r}
+features_oi <- c("HLA_DR", "CD163", "CD206", "CD16", "CD54", "CD11b")
+stages <- c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset")
+
+scale_color_brewer(palette = "Dark2")
+
+purrr::map(stages, \(cur_stage) {
+  # cur_stage <- "NoDiabetes"
+  exprs_dat <- macrophages_df |> 
+    select(donor_type, image_id, case_id, infiltration, cell_type, all_of(features_oi)) |>
+    filter(donor_type == !!cur_stage) |>
+    pivot_longer(cols = all_of(features_oi), names_to = "channel", values_to = "exprs") |>
+    filter(channel %in% features_oi) |> 
+    filter(infiltration %in% c("inside", "< 20 um", "20-40 um")) |> 
+    mutate(channel = factor(channel, levels = features_oi)) |> 
+    group_by(channel, image_id, donor_type, case_id, cell_type, infiltration) |>
+    summarize(exprs = mean(exprs, na.rm = TRUE), .groups = "drop")
+    
+  p_vals <- exprs_dat |>
+    tidyr::nest(data = -c(channel, cell_type, donor_type)) |> 
+    dplyr::mutate(test = purrr::map(data, \(.x) {
+      tt <- lmerTest::lmer(data = .x, exprs ~ infiltration + (1 | case_id))
+      m.emm <- emmeans::emmeans(tt, ~ infiltration, pbkrtest.limit = 10000)
+      m.emm |> 
+              emmeans::contrast("pairwise", adjust = "fdr") |> 
+              as_tibble()
+    })) |> 
+    tidyr::unnest(test) 
+
+p_vals <- p_vals |> 
+  mutate(
+    group1 = stringr::str_trim(stringr::str_split_fixed(contrast, "\\s-\\s", 2)[, 1]),
+    group2 = stringr::str_trim(stringr::str_split_fixed(contrast, "\\s-\\s", 2)[, 2]),
+    group2 = stringr::str_remove(group2, "\\("),
+    group2 = stringr::str_remove(group2, "\\)")
+  ) |> 
+  mutate(.y. = "exprs",
+          p = p.value,
+          statistic = t.ratio,
+          p.signif = cut(p, breaks = c(-Inf, 0.001, 0.01, 0.05, Inf), labels = c("***", "**", "*", ""))
+          ) |> 
+  select(channel, .y., group1, group2,
+        statistic, p, p.signif, cell_type)
+
+  macrophage_df_plot <- exprs_dat  |> 
+    group_by(infiltration, channel, cell_type, case_id) |>
+    summarise(exprs = mean(exprs, na.rm = TRUE))
+
+  # get max-y-value PER channel.
+  p_vals <- macrophage_df_plot  |> 
+      group_by(channel, cell_type) |> 
+      summarise(max = max(exprs), .groups = "drop") |>
+      mutate(pos_pvals = max*1.05) |> 
+      dplyr::right_join(p_vals, by = c("channel", "cell_type"))
+
+  stat.test <- exprs_dat  |> 
+    group_by(channel, cell_type) |> 
+    tukey_hsd(exprs ~ infiltration)  |> 
+    select(channel, cell_type, group1, group2) |> 
+    add_xy_position(x = "infiltration", step.increase = 0.07, dodge = 0.8) |> 
+    distinct()
+
+  # Combine formatting + P-value dataframe.
+  stat.test.test <- p_vals |> 
+    left_join(stat.test, by = c("channel", "cell_type", "group1", "group2")) |> 
+    filter(p < 0.05) |> 
+    mutate(y.position = max * 1.3) |> 
+    group_by(channel, cell_type)  |> 
+    mutate(y.position = first(y.position) * (1 + (0.1) * (row_number() - 1)))  |> 
+    ungroup()
+  
+    # Plot.
+  p <- ggviolin(macrophage_df_plot, x = "infiltration", y = "exprs", fill = "infiltration", 
+          facet.by = "channel", palette = palettes$batch, 
+          draw_quantiles = c(0.25, 0.5, 0.75), add = "point", 
+          add.params = list(width = 0.1, alpha = 1, size = 3)) + 
+    stat_pvalue_manual(stat.test.test, label = "p.signif", tip.length = 0.05,
+                      size = 10, label.size = 10, vjust = 0.5) + 
+    facet_wrap(~ channel, scales = "free_y") +
+    labs(x = "Distance to islet", y = "Myeloid cell expression",
+         title = cur_stage) + 
+    mytheme$large_new() + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+            legend.position = "none")+ 
+    geom_line(aes(group = case_id), alpha = 0.3) + 
+    scale_y_continuous(expand = expansion(mult = c(0, 0.1))) + 
+     scale_fill_brewer(palette = "Set2")
+  
+  print(p)
+
+  fn <- paste0(paste(today, "Myeloid_distance_markers", cur_stage, sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+  if (cur_stage == "NoDiabetes") {
+    fig5c <- p
+    saveRDS(fig5c, file.path(paths$home_git, "figures", "fig5c.rds"))
+  } 
+})
+```
+
+-> I could show a micrograph for MS.
+
+## A3.3: Macrophage Expression Changes to Islet Distance (ALL STAGES)
+
+Show for markers along ALL stages.
+Figure Supp 8b.
+```{r plot-macro-distance-expression}
+# Show just between "Islet" and "Peri-Islet"
+features_oi <- c("HLA_DR", "CD16", "CD163", 
+                 "CD206", "CD54", "CD11b")
+
+exprs_dat <- macrophages_df |> 
+  select(donor_type, DistScore, image_id, case_id, infiltration, cell_type, all_of(features_oi)) |>
+  pivot_longer(cols = all_of(features_oi), names_to = "channel", values_to = "exprs") |>
+  filter(channel %in% features_oi) |> 
+  filter(infiltration %in% c("inside", "< 20 um")) |> 
+  mutate(channel = factor(channel, levels = features_oi)) |> 
+  filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration"))
+
+exprs_dat_islet <- exprs_dat  |> 
+  group_by(donor_type, channel, case_id,cell_type, image_id, infiltration) |> 
+  summarise(exprs = mean(exprs, na.rm = TRUE), .groups = "drop")
+
+p_vals <- exprs_dat_islet |>
+  tidyr::nest(data = -c(channel, cell_type, donor_type)) |> 
+  dplyr::mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(data = ., exprs ~ infiltration + (1 | case_id))))) |> 
+  tidyr::unnest(test) |> 
+  filter(effect == "fixed", term != "(Intercept)") |> 
+  mutate(term = stringr::str_remove(term, "infiltration"))
+
+p_vals <- p_vals |> 
+  mutate(.y. = "exprs",
+          group1 = "inside", group2 = term,
+          p = p.value,
+          p.adj = p.adjust(p, method = "fdr"),
+          p.signif = cut(p.adj, breaks = c(-Inf, 0.001, 0.01, 0.05, Inf), labels = c("***", "**", "*", ""))
+          ) |> 
+  select(channel, .y., group1, group2,
+          statistic, p, p.adj, p.signif, cell_type, donor_type, estimate)
+
+macrophage_df_plot <- exprs_dat  |> 
+  group_by(infiltration, channel, donor_type, cell_type, case_id) |>
+  summarise(exprs = mean(exprs, na.rm = TRUE), .groups = "drop")
+
+# get max-y-value PER channel.
+p_vals <- macrophage_df_plot  |> 
+    group_by(channel, cell_type, donor_type) |> 
+    summarise(max = max(exprs), .groups = "drop") |>
+    mutate(pos_pvals = max*1.05) |> 
+    dplyr::right_join(p_vals, by = c("channel", "cell_type", "donor_type"))
+
+## Ggpubr for appropriate formatting.
+stat.test <- exprs_dat  |> 
+  group_by(channel, cell_type, donor_type) |> 
+  t_test(exprs ~ infiltration, ref.group = "inside") |> 
+  adjust_pvalue()  |> 
+  add_significance("p.adj") |> 
+  add_xy_position(x = "donor_type", group = "infiltration", step.increase = 0.07, dodge = 0.8) |> 
+  select(-c(statistic, p, p.adj))
+
+## Adjust y-position coordinates.
+stat.test.test <- p_vals |>
+  left_join(stat.test, by = c("channel", "cell_type", "donor_type", ".y.", "group1", "group2")) |> 
+  mutate(y.position = max * 1.3) |> 
+  mutate(y.position = ifelse(group2 == "< 20 um", y.position*1.05, y.position))
+
+# Plot.
+p <- ggviolin(macrophage_df_plot, x = "donor_type", y = "exprs", fill = "infiltration", 
+        facet.by = "channel", palette = palettes$batch[1:2],
+        draw_quantiles = c(0.25, 0.5, 0.75), add = "point", 
+        add.params = list(width = 0.1, alpha = 1, size = 3)) + 
+  stat_pvalue_manual(stat.test.test, label = "p.signif", tip.length = 0.1,
+                    size = 10, label.size = 10, vjust = 0.5) + 
+  facet_wrap(~ channel, scales = "free_y") +
+  labs(x = "Stage", y = "Myeloid cell expression") + 
+  mytheme$large_new() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "top")+ 
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1)))
+
+print(p)
+fn <- paste0(paste(today, "Myeloid_distance_markers", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+extfig8b <- p
+saveRDS(extfig8b, file.path(paths$home_git, "figures", "extfig8b.rds"))
+```
+
+## A3.4: DISTANCE TO ISLET EDGE X PROGRESSION:
+
+Plot Changes in Markers along Progression. 
+
+```{r}
+## Features of progression per Islet Distance.
+features_oi <- c("HLA_DR", "CD54", "CD16", 
+                "CS", "CD206", "HK1")
+
+## Aggregated by case.
+macrophages_df_plot <- macrophages_df |> 
+  filter(donor_type %in% c("RecentOnset", "sAAb+", "mAAb+", "NoDiabetes"), islet_type == "ICI") |>
+  select(donor_type, DistScore, infiltration, cell_type, case_id, all_of(features_oi)) |> 
+  filter(infiltration %in% c("inside", "< 20 um", "20-40 um")) |>
+  # group by case_id and donor_type and channel
+  group_by(donor_type, infiltration, case_id) |>
+  summarize(across(all_of(features_oi), \(x) mean(x, na.rm = TRUE))) |>
+  pivot_longer(cols = all_of(features_oi), names_to = "channel", values_to = "MeanExprs")
+
+p <- macrophages_df_plot |> 
+  ggplot(aes(x = infiltration, y = MeanExprs, color = donor_type)) +
+  geom_boxplot() +
+  #geom_jitter(width = 0.2, alpha = 0.5) +
+  labs(x = "Distance to islet edge", y = "exprs", title = "Upregulation Markers Islet", color = "Distance to islet edge") + 
+  mytheme$standard() + 
+  facet_wrap(~channel, scales = "free_y") + 
+  # rotate x-axsi ticks
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  scale_color_manual(values = palettes$stages)
+
+print(p)
+fn <- paste0(paste(today, "Myeloid_markers", "Progression", "Macrophages", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+# A4: Insulitic Islets
+
+## A4.1: Expression changes between Insulitic and Non-Insulitic Islets:
+
+```{r}
+### Prepare the data
+immune_insulitic <- exprs_df |> 
+  filter(islet_type == "ICI", cell_type %in% c("Myeloid"))
+
+# Relabel Insulitic islets.
+fn <- file.path(paths$folder_out, "13_MarkerExpression_cells_Immune", "insulitic_images.rds")
+
+if (file.exists(fn)) {
+  image_ids <- readRDS(fn)
+  immune_insulitic <- immune_insulitic |> 
+    mutate(insulitic = if_else(image_id %in% image_ids, "insulitis", "non-insulitis"))
+}
+```
+
+Compare Expression for cDCs.
+```{r}
+## Compare expression for cDCs first:
+## Select Peri-islet + Inside only.
+## Compare between Insulitic and Non-Insulitic.
+features_oi <- c("CD11c", "CD27", "CD54", "CS", "HLA_DR", "TIM3", "TMEM173")
+
+# Group by image_id and calculate mean expression.
+immune_insulitic_cdc <- immune_insulitic |> 
+  filter(islet_type == "ICI", donor_type == "RecentOnset") |>
+  filter(cell_cluster_scaled == "Myeloid_4") |> 
+  select(image_id, insulitic, donor_type, case_id, cell_cluster_scaled, all_of(features_oi)) |> 
+  mutate(insulitic = factor(insulitic, levels = c("insulitis", "non-insulitis"))) |>
+  group_by(image_id, insulitic, donor_type, case_id, cell_cluster_scaled) |>
+  summarize(across(all_of(features_oi), \(x) mean(x, na.rm = TRUE)), .groups = "drop")
+
+
+# N = 17; un-matched.
+immune_insulitic_cdc |> 
+  dplyr::distinct(case_id) |> 
+  dplyr::count()
+
+# N=10 matched.
+## Make intra-donor comparisons. Select only donors with both insulitic and non-insulitic islets.
+case_ids <- immune_insulitic_cdc |> 
+  dplyr::distinct(case_id, insulitic) |>
+  dplyr::count(case_id) |> filter(n == 2) |> pull(case_id)
+
+length(case_ids)
+
+stats <- immune_insulitic_cdc |>
+  filter(case_id %in% case_ids) |>
+  select(image_id, insulitic, donor_type, case_id, cell_cluster_scaled, all_of(features_oi)) |> 
+  pivot_longer(cols = all_of(features_oi), names_to = "channel", values_to = "value") |>
+  tidyr::nest(data = -c(cell_cluster_scaled, channel)) |>
+  dplyr::mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(data = ., value ~ insulitic + (1 | case_id))))) |>
+  tidyr::unnest(test) |>
+  filter(term != "(Intercept)", effect == "fixed") |>
+  arrange(p.value) |> 
+  mutate(p.adj = p.adjust(p.value, method = "fdr")) |> 
+  mutate(insulitic = stringr::str_remove(term, "insuliticnon-")) |> 
+  mutate(insulitic = factor(insulitic, levels = c("insulitis", "non-insulitis")))
+stats
+```
+
+Plot differences.
+Part of suppl. fig.
+```{r insulitic_cdc_expression}
+df <- immune_insulitic_cdc |> 
+  filter(case_id %in% case_ids) |>
+  mutate(insulitic = ifelse(insulitic == "insulitis", "Insulitic", "Non-Insulitic")) |>
+  mutate(insulitic = factor(insulitic, levels = c("Insulitic", "Non-Insulitic"))) |> 
+  mutate(cell_type = "Myeloid_4")
+
+## Number of images with insulitic islets. N=80.
+df |> nrow()
+
+p <- plot_ici_insulitic_expression(df = df, features_oi = c("HLA_DR", "CD54", "TIM3"), 
+                                    cell_types = "Myeloid_4", 
+                                    cur_var = "insulitic", x_var = "insulitic",
+                                    group1 = "Insulitic", group2 = "Non-Insulitic", 
+                                    facet_by = "channel",
+                                    y_label = "cDC expression", cur_palette = palettes$colors[1:2]) + 
+                                    mytheme$standard_new() + 
+                                    geom_line(aes(group = case_id), alpha = 0.5, color = "black") + 
+                                    theme(legend.position = "none")
+print(p)
+fn <- paste0(paste(today, "Expression_Insulitic_cDCs", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+extfig9e <- p
+saveRDS(extfig9e, file.path(paths$home_git, "figures", "extfig9e.rds"))
+```
+
+
+Compare Expression of My3 between Insulitic vs Non-Insulitic islets.
+```{r insulitic_My3_expression}
+features_oi <- c("HK1", "CD54", "CS", "CD163", "CD11c", "CD206", "HLA_DR", "CD16", "TMEM173")
+
+immune_insulitic_my3 <- immune_insulitic |> 
+  filter(islet_type == "ICI", donor_type == "RecentOnset") |>
+  filter(cell_cluster_scaled == "Myeloid_3") |> 
+  select(image_id, insulitic, donor_type, case_id, cell_cluster_scaled, all_of(features_oi)) |> 
+  group_by(image_id, insulitic, donor_type, case_id, cell_cluster_scaled) |>
+  summarize(across(all_of(features_oi), \(x) mean(x, na.rm = TRUE)), .groups = "drop")
+
+df <- immune_insulitic_my3 |> 
+  mutate(insulitic = ifelse(insulitic == "insulitis", "Insulitic", "Non-Insulitic")) |>
+  mutate(insulitic = factor(insulitic, levels = c("Insulitic", "Non-Insulitic"))) |> 
+  mutate(cell_type = "Myeloid_3")
+
+p <- plot_ici_insulitic_expression(df = df, features_oi = features_oi,
+                                    cell_types = "Myeloid_3", 
+                                    cur_var = "insulitic", x_var = "insulitic",
+                                    group1 = "Insulitic", group2 = "Non-Insulitic", 
+                                    facet_by = "channel",
+                                    y_label = "M1/M2-like act. expression", cur_palette = palettes$colors[1:2]) + 
+                                    mytheme$standard_new() + 
+                                    geom_line(aes(group = case_id), alpha = 0.5, color = "black") + 
+                                    theme(legend.position = "none")
+
+print(p)
+fn <- paste0(paste(today, "Expression_Insulitic_My3", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```

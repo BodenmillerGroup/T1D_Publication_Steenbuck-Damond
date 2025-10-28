@@ -1,0 +1,1318 @@
+---
+title: "08_ClustersImmune_II_cells_Immune"
+author: "Nathan Steenbuck"
+date: "Created: 11 June, 2024; Compiled: `r format(Sys.time(), '%d %b, %Y')`"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+if (rstudioapi::isAvailable()) {
+  script_name <- basename(rstudioapi::getSourceEditorContext()$path)
+} else {
+  script_name <- knitr::current_input()
+}
+
+cur_user <- Sys.info()[["user"]]
+script_name <- "08_ClustersImmuneII_cells_Immune.Rmd"
+
+if (cur_user == "ubuntu") {
+  source(file.path("/", "mnt", "central_nas", "projects", 
+    "type1_diabetes", "nathan", "T1D_Vol", "T1D_analysis", 
+    "analysis", "helpers.R"))
+  #n_cores <- future::availableCores() - 1
+  n_cores <- 4
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  knitr::opts_knit$set(root_dir = paths$home_data)
+} else {
+  source(file.path("/", "home", "nsteen", "scripts", "T1D_analysis", "analysis", "helpers.R"))
+  n_cores <- 8
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  paths$folder_script <- paths$cluster_folder_script
+  paths$folder_in <- paths$cluster_folder_in
+  paths$folder_out <- paths$cluster_home 
+  knitr::opts_knit$set(root_dir = paths$cluster_home)
+}
+
+seed <- 123456
+set.seed(seed)
+options <- furrr::furrr_options(seed = seed)
+paths$prev <- paste("08_CellTypesNonImmune", paths$object_type, paths$panel_type, sep = "_")
+knitr::opts_chunk$set(echo = TRUE)
+do_print <- FALSE
+```
+
+
+# **Goal**
+
+In scripts 05 to 08, cell types are attributed to all cells in the dataset
+in an iterative way:
+
+- `05_CellCategories_cells_Immune`: Attribution of main cell categories 
+(immune, islet, exocrine, ...).
+- `06_CellTypesImmune_cells_Immune`: Attribution of main cell 
+types to immune cells (Lymphocyte, Myeloid, Neutrophil).
+- `07_ClustersImmune_cells_Immune`: Further separation of immune cell types 
+into clusters.
+- `08_CellTypesNonImmune_cells_Immune`: Attribution of cell types
+to non-immune cells (Beta, Alpha, Exocrine, ...).
+- `08_CellTypesIslet_cells_Immune`: Re-attribution of islet cells
+to cell types based on clustering results from the previous step. This is used to increase
+accuracy of islet cell type attribution.
+- `08_CellTypesIslet_cells_ImmuneII`(this script): Attribution of rare & specific immune cell clusters
+like T-reg and T-EMRAs.
+
+In previous scripts, each cell in the dataset was attributed a cell category 
+(immune, islet, ...) and a cell type (Lymphocyte, Myeloid, ...).
+
+The goals of this script are to add additional granularity to T-cells, which were previously missed.
+During the analysis, we observed very rare T-EMRA and T-reg.
+To this end, this cell populations are added to the T-CD8 and T-CD4 
+subpopulations respectively. 
+
+The following steps are performed in the current script:
+
+### A1: T-reg identification. 
+In the pilot project we defined T-regs as:
+- Positive: CD4, CD3e
+- High: HELIOS, FoxP3, ICOS.
+- Negative: GZMB,CD57,CD8.
+Further we observe high expression of CD7, CD45RO, intermediate expression of PD-1 and CD45RA & low expression of TCF-7.  
+
+Unfortunately, in the current study we did not include HELIOS and ICOS in the panel.
+In the current study T-regs are mixed with recently activated T-naive. 
+The latter upregulate FoxP3, which is co-expressed with CD3e in T-CD4, T-CD8, T-DN.
+Notably only in T-CD4 few cells do not stronlgy co-express CD3e and FoxP3.
+We thus fit GAMs to CD3e and FoxP3 and identified T-regs via the residuals.
+
+### A2: T-CD4 cluster merging.
+We manually merged clusters based on expression profiles and image review.
+
+### A3: T-EMRA identification.
+
+Previously we identified T-CD8 - CD45RA+ cells as one cluster.
+However, we clearly observed two subpopulations:
+T-EMRA: CD45RA+, CD57+, GZMB+, CD27-, CD8+ (rare)
+T-naive: CD45RA+, CD57-, GZMB-, CD27+, CD8+
+
+We will thus subcluster T-CD8-5 (naive) into the 2 following subpopulations. 
+Note, we did not have sufficient markers to differentiate potential T-SCMs (also CD45RA+).
+
+
+# **Settings**  
+
+## Load packages
+
+```{r packages, results='hide'}
+suppressPackageStartupMessages(c(
+  library(data.table),
+  library(dplyr),
+  library(SpatialExperiment),
+  library(parallel),
+  library(SingleCellExperiment),
+  library(RSpectra),
+  library(scuttle)
+))
+```
+
+## Paths and settings
+
+```{r settings}
+# Paths
+if (!dir.exists(paths$folder_script)) dir.create(paths$folder_script)
+plotsave_param$path <- paths$folder_script
+plotsave_param_large$path <- paths$folder_script
+
+# Misc settings
+today <- gsub("-", "", Sys.Date())
+```
+
+##  Read in the data
+
+Load the SpatialExperiment (SPE) object saved at the previous step.
+
+```{r load-data}
+fn_spe <- file.path(paths$folder_out, paths$prev, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+spe <- readRDS(fn_spe)
+print(spe)
+```
+
+
+## Methods and assays
+
+Select channels (`channels_clust`), assays (`assay_sel`) and clustering methods (`methods_sel`) to use.
+
+```{r select-methods-assays}
+methods_sel <- c("Leiden6")
+
+assay_sel <- c("exprs", "scaled")
+names(assay_sel) <- c("exprs", "scaled")
+writeLines(c("Assays:", assay_sel[assay_sel %in% assayNames(spe)]))
+
+dimred_sel <- c("UMAP") # , "tSNE")
+writeLines(c("\nReduced dimensions:", dimred_sel))
+
+plot_variables <- c("stages", "cases")
+names(plot_variables) <- c("donor_type", "case_id")
+writeLines("\nVariables to plot:")
+print(plot_variables)
+
+channels <- rownames(spe)[!(grepl("DNA|H3", rownames(spe)))]
+cat(c("\nChannels:", channels[channels %in% rownames(spe)]))
+cat(c("\nNumber of channels:", length(channels)))
+```
+
+## Subset T-cells
+
+```{r subset-immune-cells}
+cells_oi <- c("T_CD4", "T_CD8", "T_DN")
+features_oi <- c("FoxP3", "CD4", "CD3e", "CD8a",
+                 "PD1", "TIM3", "GranB", 
+                 "CD45RO", "CD45RA", "CD7", "CD27", "CD103",
+                 "CD56", "CD57", "CD73",
+                 "LDHA", "HK1", "CS", "ATP5A", "TMEM173")
+            
+t_cells <- spe[, spe$cell_type %in% cells_oi]
+t_cells <- t_cells[features_oi, t_cells$donor_type != "Pancreatitis"]
+
+## Get DF.
+exprs_df <- as_tibble(makePerCellDF(t_cells, features = features_oi, assay.type = "exprs", use.dimred = FALSE)) |> 
+  select(all_of(features_oi), case_id, donor_type, distance_to_islet, image_id, cell_id, cell_type, cell_cluster_scaled) |> 
+  filter(donor_type != "Pancreatitis")
+```
+
+## A1: T-reg identification
+### Plot FoxP3 vs CD3e  
+
+```{r plot-foxp3-cd3e}
+# Plot FoxP3 by Cell Type
+p <- exprs_df |> 
+  ggplot(aes(x = FoxP3, color = cell_type)) +
+  geom_density() +
+  theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14)) + 
+  labs(title = "FoxP3 expression by cell type", x = "FoxP3", y = "Density") +
+  mytheme$standard_new()
+
+if (do_print) print(p)
+fn <- paste0(paste(today, "FoxP3", "CellType", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+## Show FoxP3 expression by T-CD4 subcluster.
+## Highest in T-CD4-10 (recently-activated T-CD4-naive)
+p <- exprs_df |> 
+  mutate(cell_cluster_scaled = ifelse(cell_type == "T_CD4", cell_cluster_scaled, "T")) |>
+  ggplot(aes(x = FoxP3, color = cell_cluster_scaled)) +
+  geom_density() +
+  mytheme$standard()
+if (do_print) print(p)
+
+# By cell-type (CD3e)
+p <- exprs_df |> 
+  ggplot(aes(x = CD3e, color = cell_type)) +
+  geom_density() +
+  mytheme$standard()
+
+if (do_print) print(p)
+fn <- paste0(paste(today, "CD3e", "CellType", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+## Donor-type. FoxP3 upregulation in mAAb+/REC. 
+## Likely reflective of activation. 
+exprs_df |> 
+  filter(cell_type == "T_CD4") |>
+  ggplot(aes(x = FoxP3, color = donor_type)) +
+  geom_density() +
+      mytheme$standard()
+  scale_color_manual(values = palettes$stages)
+```
+
+
+Visualize strong correlation between CD3e and FoxP3 expression.
+```{r plot-cd3-foxp3}
+purrr::map(list("T_CD4", "T_CD8", "T_DN"), \(cur_cell) {
+  p <- exprs_df |> 
+    filter(cell_type == cur_cell) |>
+    ggplot(aes(x = CD3e, y = FoxP3)) +
+    geom_point() +
+    ggplot2::geom_smooth(method = "gam", se = TRUE, level = 0.99999) + 
+    geom_density_2d() +
+    ggtitle(paste(cur_cell, ": CD3e vs FoxP3", sep = " "))+
+    # increase font-size
+    theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14)) +
+    mytheme$standard()
+
+  if (do_print) print(p)
+  fn <- paste0(paste(today, "CD3e", "FoxP3", cur_cell, sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param))
+})
+```
+
+```{r linear-models-foxp3-markers}
+## Linear Model for T_DN & T-CD8: 75 % of variance explained.
+## LM for T-CD4 = 67% -> Observe residuals.
+summary(lm(FoxP3 ~ CD3e, data = exprs_df |> filter(cell_type == "T_DN")))
+summary(lm(FoxP3 ~ CD3e, data = exprs_df |> filter(cell_type == "T_CD8")))
+summary(lm(FoxP3 ~ CD3e, data = exprs_df |> filter(cell_type == "T_CD4")))
+
+# Also high spearman.
+cor(exprs_df[exprs_df$cell_type == "T_CD4", ]$FoxP3, exprs_df[exprs_df$cell_type == "T_CD4", ]$CD3e, method = "spearman")
+cor(exprs_df[exprs_df$cell_type == "T_CD8", ]$FoxP3, exprs_df[exprs_df$cell_type == "T_CD8", ]$CD3e, method = "spearman")
+
+# Comparison to CD4/CD8a.
+summary(lm(FoxP3 ~ CD4, data = exprs_df |> filter(cell_type == "T_CD4")))
+summary(lm(FoxP3 ~ CD8a, data = exprs_df |> filter(cell_type == "T_CD8")))
+```
+
+```{r cd3-foxp3-correlation-plot}
+# Plot CD3e vs FoxP3 correlation in CD4s.
+p <- exprs_df |> 
+  filter(cell_type == "T_CD4") |>
+  ggplot(aes(x = CD4, y = FoxP3)) +
+  geom_point() +
+  ggplot2::geom_smooth(method = "gam", se = TRUE, level = 0.99999) + 
+  geom_density_2d() +
+  ggtitle(paste("CD4", ": CD4 vs FoxP3", sep = " "))+
+  # increase font-size
+  theme(axis.text = element_text(size = 12),
+  axis.title = element_text(size = 14)) +
+  mytheme$standard()
+
+if (do_print) print(p)
+fn <- paste0(paste(today, "CD4", "FoxP3", "T_CD4", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+p <- exprs_df |> 
+  filter(cell_type == "T_CD8") |>
+  ggplot(aes(x = CD8a, y = FoxP3)) +
+  geom_point() +
+  ggplot2::geom_smooth(method = "gam", se = TRUE, level = 0.99999) + 
+  geom_density_2d() +
+  ggtitle(paste("CD8", ": CD8a vs FoxP3", sep = " "))+
+  # increase font-size
+  theme(axis.text = element_text(size = 12),
+  axis.title = element_text(size = 14)) +
+  mytheme$standard()
+
+if (do_print) print(p)
+fn <- paste0(paste(today, "CD8a", "FoxP3", "T_CD8", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+Fit GAM to CD3e and FoxP3 and identify T-regs via the residuals.
+```{r cd3-foxp3-residuals}
+## Calculate Residuals for T-CD4 (FoxP3 ~ CD3e)
+
+# T-CD4
+exprs_df_cd4 <- exprs_df |> filter(cell_type == "T_CD4")
+model_tcd4 <- mgcv::gam(FoxP3 ~ CD3e, family = gaussian(), data = exprs_df_cd4)
+
+# Calculate the fitted values & residuals
+fitted_values_tcd4 <- predict(model_tcd4, type = "response")
+
+exprs_df_cd4 <- exprs_df_cd4 |>
+  mutate(fitted_values = as.numeric(fitted_values_tcd4)) |>
+  mutate(residuals = FoxP3 - fitted_values)
+
+## Repeat for T_CD8
+exprs_df_cd8 <- exprs_df |> filter(cell_type == "T_CD8")
+model_tcd8 <- mgcv::gam(FoxP3 ~ CD3e, family = gaussian(), data = exprs_df_cd8)
+
+#Calculate the fitted values & residuals
+fitted_values_tcd8 <- predict(model_tcd8, type = "response")
+
+exprs_df_cd8 <- exprs_df_cd8  |> 
+  mutate(fitted_values = as.numeric(fitted_values_tcd8)) |>
+  mutate(residuals = FoxP3 - fitted_values)
+
+## Repeat for T-DN:
+exprs_df_tdn <- exprs_df |> filter(cell_type == "T_DN")
+model_tdn <- mgcv::gam(FoxP3 ~ CD3e, family = gaussian(), data = exprs_df_tdn)
+
+#Calculate the fitted values
+fitted_values_tdn <- predict(model_tdn, type = "response")
+
+# Calculate residuals
+exprs_df_tdn <- exprs_df_tdn |>
+  mutate(fitted_values = as.numeric(fitted_values_tdn)) |>
+  mutate(residuals = FoxP3 - fitted_values)
+```
+
+Define Threshold via 99.9% quantile of T-CD8 FoxP3 ~ CD3e residuals.
+Then Plot residuals and classify T-regs.
+```{r classify-tregs}
+## Define Threshold (99.9% quantile).
+thresh <- quantile(exprs_df_cd8$residuals, probs = 0.99)
+
+## Y-intercept (minimal FoxP3 expression)
+y_int <- 1
+
+# Joint tibble
+joint_df <- bind_rows(exprs_df_cd8, exprs_df_cd4, exprs_df_tdn)
+
+p <- joint_df |> 
+  ggplot(aes(x = residuals, y = FoxP3, color = cell_type)) +
+  geom_point(size = 1, alpha = 0.2) +
+  geom_density_2d() +
+  mytheme$standard() +
+  ggtitle("T_CD4 vs T_CD8: FoxP3 residuals") + 
+  geom_vline(xintercept = thresh, linetype = "dashed") + 
+  geom_hline(yintercept = y_int, linetype = "dashed")
+
+if (do_print) print(p)
+fn <- paste0(paste(today, "FoxP3", "Residuals", "T_CD4_CD8_DN", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+
+Match information to T_CD4 SCE. Add T-regs.
+
+```{r match-to-tcd4-sce}
+features_oi <- c("FoxP3", "CD4", "CD3e", 
+                 "PD1", "TIM3", "GranB", 
+                 "CD45RO", "CD45RA", "CD7", "CD27", "CD103",
+                 "CD56", "CD57", "CD73",
+                 "LDHA", "HK1", "CS", "ATP5A", "TMEM173")
+## Get T-CD4
+t_cd4_sce <- t_cells[features_oi, t_cells$cell_type == "T_CD4"]
+
+## Match the residuals to the T_CD4 cells.
+exprs_df_cd4 <- exprs_df_cd4 |> 
+  mutate(t_regs = ifelse(residuals > thresh & FoxP3 > y_int, "Tregs", "non-tregs"))
+
+## Correct order.
+cell_ids <- exprs_df_cd4$cell_id
+t_cd4_sce <- t_cd4_sce[, cell_ids]
+t_cd4_sce$t_regs <- exprs_df_cd4$t_regs
+t_cd4_sce$cell_cluster_scaled <- ifelse(t_cd4_sce$t_regs == "Tregs", "Treg", t_cd4_sce$cell_cluster_scaled)
+```
+
+# A2: T-CD4 cluster merging
+
+## Image Review
+Get T-CD4 clusters and merge them based on expression profiles and image review.
+
+```{r}
+cur_assay <- "scaled"
+df_img <- scuttle::makePerCellDF(
+  x = t_cd4_sce,
+  assay.type = cur_assay,
+  features = features_oi,
+  use.coldata = c("cell_type", "donor_type", "case_id", "image_id", "cell_cluster_scaled"),
+  use.dimred = TRUE
+)  |> as_tibble(rownames = "cell_id") |> 
+  dplyr::select(cell_cluster_scaled, cell_id, cell_type, donor_type, image_id, case_id,  all_of(features_oi))
+```
+
+Search for images with T-CD4 cluster abundances.
+```{r abundance-tcd4}
+df_img |> 
+  dplyr::count(cell_cluster_scaled) |> 
+  arrange(n)
+
+df_img |> 
+  dplyr::count(image_id, donor_type, cell_cluster_scaled) |> 
+  dplyr::filter(cell_cluster_scaled == "T_CD4_7") |> 
+  arrange(desc(n))
+
+df_img |> 
+  dplyr::count(image_id, donor_type, cell_cluster_scaled) |> 
+  dplyr::filter(cell_cluster_scaled == "T_CD4_5") |> 
+  arrange(desc(n))
+
+df_img |> 
+  dplyr::count(image_id, donor_type, cell_cluster_scaled) |> 
+  dplyr::filter(cell_cluster_scaled == "T_CD4_3") |> 
+  arrange(desc(n))
+
+df_img |> 
+  dplyr::count(image_id, donor_type, cell_cluster_scaled) |> 
+  dplyr::filter(cell_cluster_scaled == "T_CD4_10") |> 
+  arrange(desc(n))
+
+df_img |> 
+  dplyr::count(image_id, donor_type, cell_cluster_scaled) |> 
+  dplyr::filter(cell_cluster_scaled == "T_CD4_4") |> 
+  arrange(desc(n))
+
+df_img |> 
+  dplyr::count(image_id, donor_type, cell_cluster_scaled) |> 
+  dplyr::filter(cell_cluster_scaled == "T_CD4_13") |> 
+  arrange(desc(n))
+
+df_img |> 
+  dplyr::count(image_id, donor_type, cell_cluster_scaled) |> 
+  dplyr::filter(cell_cluster_scaled == "T_CD4_8") |> 
+  arrange(desc(n))
+
+df_img |> 
+  dplyr::count(image_id, donor_type, cell_cluster_scaled) |> 
+  dplyr::filter(cell_cluster_scaled == "T_CD4_11") |> 
+  arrange(desc(n))
+
+df_img |> 
+  dplyr::count(image_id, donor_type, cell_cluster_scaled) |> 
+  dplyr::filter(cell_cluster_scaled == "Treg") |> 
+  arrange(desc(n))
+```
+
+### Select cluster(s) and assay to show
+
+```{r viz-lympho-clust-select}
+# viz_clust <- c(21, 9, 11, 12, 2, 20, 1, 5, 3, 4) #c(3, 17, 21) NULL
+all_channels <- rownames(spe)
+t_cd4_viz <- spe[, spe$cell_type %in% c("T_CD4")]
+t_cd4_viz <- t_cd4_viz[, colnames(t_cd4_sce)]
+t_cd4_viz$cell_cluster_scaled <- t_cd4_sce$cell_cluster_scaled
+
+viz_clust <- c(21, 9, 11, 12, 2, 20, 1, 5, 3, 4)
+viz_method <- "cell_cluster_scaled"
+viz_assay <- "scaled"
+```
+
+### Load images and masks
+
+```{r viz-lympho-cluster-load}
+if (!is.null(viz_clust)) {
+  library(cytomapper)
+  nb_images <- 14
+  image_extension <- ".tiff"
+  clust_name <- viz_method
+
+  # Subset the SCE
+  sce_viz <- t_cd4_viz
+
+  set.seed(123)
+  image_sub <- sort(sample(
+    unique(sce_viz$image_fullname),
+    min(length(unique(sce_viz$image_fullname)), nb_images)))
+  
+  image_sub <- unique(c(image_sub, "6347_Immune_ROI_021.tiff", # "6422_Immune_ROI_039.tiff", 
+                "6228_Immune_ROI_029.tiff", "6424_Immune_ROI_064.tiff", 
+                "8011_Immune_ROI_017.tiff", "6514_Immune_ROI_005.tiff", "6225_Immune_ROI_053.tiff", "6225_Immune_ROI_043.tiff", "6225_Immune_ROI_057.tiff",
+                "6328_Immune_ROI_076.tiff", "6328_Immune_ROI_078.tiff", # "6328_Immune_ROI_001.tiff",
+                "6533_Immune_ROI_051.tiff", "6209_Immune_ROI_057.tiff", "6506_Immune_ROI_060.tiff", 
+                "6310_Immune_ROI_006.tiff", # "6043_Immune_ROI_014.tiff",  # Leiden2: 10
+                "6228_Immune_ROI_082.tiff", "6247_Immune_ROI_072.tiff",
+                # T-CD4-7
+                "6512_Immune_ROI_060.tiff", "6123_Immune_ROI_043.tiff", "6512_Immune_ROI_058.tiff",
+                # T-CD4-5
+                "6310_Immune_ROI_006.tiff", "6533_Immune_ROI_051.tiff", "6450_Immune_ROI_007.tiff",
+                # T-CD4-3
+                "6414_Immune_ROI_020.tiff", "6224_Immune_ROI_073.tiff", "6450_Immune_ROI_038.tiff",
+                # T-CD4-10
+                "6310_Immune_ROI_006.tiff", "6123_Immune_ROI_043.tiff", "6505_Immune_ROI_042.tiff", 
+                # T-CD4-4
+                "6310_Immune_ROI_026.tiff", "6414_Immune_ROI_054.tiff", "6178_Immune_ROI_029.tiff",
+                # T-CD4-13
+                "6405_Immune_ROI_059.tiff", "6450_Immune_ROI_007.tiff", "6433_Immune_ROI_052.tiff",
+                # T-CD4-8
+                "6310_Immune_ROI_006.tiff", "6178_Immune_ROI_029.tiff", "6550_Immune_ROI_025.tiff",
+                # T-CD4-11
+                "6228_Immune_ROI_029.tiff", "6228_Immune_ROI_025.tiff", "6520_Immune_ROI_029.tiff",
+                # T-reg:
+                "6550_Immune_ROI_037.tiff", "6429_Immune_ROI_056.tiff", "6534_Immune_ROI_039.tiff"
+                ))
+
+  # Folders
+  folder_images <- file.path(paths$folder_in, "img", paths$panel_type)
+  folder_masks <- file.path(paths$folder_in, "masks_cells",
+                            paths$panel_type, "whole-cell")
+  
+  image_sub <- image_sub[image_sub %in% unique(sce_viz$image_fullname)]
+  images <- cytomapper::loadImages(file.path(folder_images, image_sub))
+  cytomapper::channelNames(images) <- all_channels
+  # Add image names to metadata
+  mcols(images)$ImageName <- names(images)
+  mcols(images)$ImageName <- paste0(mcols(images)$ImageName)
+
+  # Load images and masks
+  #images <- yoloader(
+  #  x = sce_viz,
+  #  image_dir = folder_images,
+  #  image_names = image_sub,
+  #  type = "stacks"
+  #)
+
+  masks <- yoloader(
+    x = sce_viz,
+    image_dir = folder_masks,
+    image_names = image_sub,
+    as.is = TRUE,
+    type = "masks"
+  )
+  
+  sce_viz <- sce_viz[, sce_viz$image_fullname %in% image_sub]
+  sce_viz$ImageName <- gsub(image_extension, "", sce_viz$image_fullname)
+}
+```
+
+
+### Cytoviewer app.
+```{r cytoviewer}
+if (!is.null(viz_clust)) {
+  library(cytoviewer)
+  sce_viz[[clust_name]] <- as.factor(sce_viz[[clust_name]])
+  app <- cytoviewer(image = images, 
+                    mask = masks, 
+                    object = sce_viz,
+                    img_id = "ImageName", 
+                    cell_id = "cell_number")
+
+  if (interactive()) {
+    shiny::runApp(app)
+  }
+}
+```
+
+```{r consensus-heatmap}
+purrr::walk(assay_sel, \(cur_assay) {
+  # cur_assay <- "scaled"
+  clust_name <- paste("cell_type", cur_assay, sep = "_")
+
+  # Summarize the data
+  hm <- summarize_heatmap(t_cd4_sce[, t_cd4_sce$cell_type != "Ambiguous"],
+                          expr_values = cur_assay,
+                          cluster_by = "cell_cluster_scaled",
+                          channels = features_oi)
+
+  # Display the heatmap
+  fn <- file.path(paths$folder_script, paste0(paste(today, "T_CD4_clusters_first", cur_assay,
+                     "Heatmap", sep = "_"), ".png"))
+  # plotsave_param
+  png(fn, width = 1200, height = 800)
+  p <- ComplexHeatmap::Heatmap(hm, name = "Scaled expression", 
+                               col= viridis::viridis(100),
+                               show_row_names = TRUE, show_column_names = TRUE,
+                               cluster_rows = TRUE, cluster_columns = TRUE,
+                               row_names_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"),
+                               column_names_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"), 
+                               heatmap_legend_param = list(legend_direction = "horizontal",
+                                                           title_position = "topcenter",
+                                                           title_gp = grid::gpar(fontsize = 40, fontfamily = "Arial"),
+                                                           labels_gp = grid::gpar(fontsize = 40, fontfamily = "Arial")),                             
+                              row_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for rows
+                              column_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for columns
+                              row_names_side = "left",
+                              row_dend_side = "right")                              
+  ComplexHeatmap::draw(p, heatmap_legend_side = "top", 
+                       padding = unit(c(12, 12, 2, 2), "mm"))  # right and bottom padding
+  dev.off()
+})
+```
+
+## Cluster Merging.
+Checked by images:
+- No CD4+ cells show clear CD45RA expression.
+
+Review: get CD73+ T-cells.
+
+Given expression profiles and image review we joined the following clusters:
+T-CD4-1: T-CD4 other: non-activated T-CD4 memory.
+2 + 9: T-EM-like low act.
+T-CD4-3 + 12 (lowly activated PD1+ T-CD4 memory)
+T-CD4-5 + 7 (activated PD1+ T-CD4 memory)
+T-CD4-10: (activated T-CD4 memory PD1low)
+T-CD4-8: (lowly activated T-CD4 memory PD1low)
+T-CD4-11(T-CD4-Other) -> segmentation errors.
+T-CD4-4 (T-CM-like T-CD4)
+T-CD4-6 (T-EM-like T-CD4)
+T-CD4-13 (CD73+ T-CD4 memory)
+
+```{r assign-clusters}
+t_cd4_sce$cell_cluster_scaled <- 
+  ifelse(t_cd4_sce$cell_cluster_scaled == "T_CD4_1", "T_CD4_1", 
+    ifelse(t_cd4_sce$cell_cluster_scaled %in% c("T_CD4_2", "T_CD4_9"), "T_CD4_2", 
+        ifelse(t_cd4_sce$cell_cluster_scaled %in% c("T_CD4_3", "T_CD4_12"), "T_CD4_3", 
+          ifelse(t_cd4_sce$cell_cluster_scaled == "T_CD4_4", "T_CD4_4", 
+            ifelse(t_cd4_sce$cell_cluster_scaled %in% c("T_CD4_5", "T_CD4_7"), "T_CD4_5", 
+                ifelse(t_cd4_sce$cell_cluster_scaled == "T_CD4_6", "T_CD4_6", 
+                  ifelse(t_cd4_sce$cell_cluster_scaled == "T_CD4_10", "T_CD4_7",
+                    ifelse(t_cd4_sce$cell_cluster_scaled == "T_CD4_8", "T_CD4_8", 
+                      ifelse(t_cd4_sce$cell_cluster_scaled %in% c("T_CD4_11"), "T_CD4_Other", 
+                        ifelse(t_cd4_sce$cell_cluster_scaled == "T_CD4_13", "T_CD4_9", 
+                          ifelse(t_cd4_sce$cell_cluster_scaled == "Treg", "T_CD4_10", 
+                                t_cd4_sce$cell_cluster_scaled)))))))))))
+```
+
+## Run dimensionality reduction T-CD4
+
+**UMAP**
+```{r}
+# remove CD57, CD56, LDHA, HK1, CS, ATP5A, TMEM173, CD73, TIM3.
+# keep CD103 + CD45RA to show that no clear naive or T-RM are present.
+features_oi <- features_oi[!features_oi %in% c("CD57", "CD56", "CD103",
+                                                "LDHA", "CS", "HK1", "ATP5A")]
+# features_oi <- features_oi[!features_oi %in% c("CD57", "CD56")]
+t_cd4_sce <- t_cd4_sce[features_oi, ]
+```
+
+T-CD4 UMAP.
+```{r run-UMAP2}
+set.seed(222)
+purrr::walk(assay_sel, \(cur_assay) {
+  dimred_name <- paste("UMAP_T_CD4", cur_assay, sep = "_")
+  
+  #if (!dimred_name %in% reducedDimNames(sce_imm)) {
+    cur_umap <- uwot::umap(t(assay(t_cd4_sce, cur_assay)))
+    colnames(cur_umap) <- c("UMAP1", "UMAP2")
+    rownames(cur_umap) <- colnames(assay(t_cd4_sce, cur_assay))
+    reducedDim(t_cd4_sce, dimred_name) <<- cur_umap
+    remove(cur_umap)
+  #}
+})
+```
+
+### Reduced dimensions
+
+Plot consensus cell clusters on reduced dimensions.
+
+```{r consensus-dimred}
+cur_dat <- scuttle::makePerCellDF(t_cd4_sce[, t_cd4_sce$cell_type != "Ambiguous"],
+                                  use_dimred = TRUE) |>
+  mutate(case_id = factor(case_id, levels = unique(t_cd4_sce$case_id)),
+         donor_type = factor(donor_type, levels = unique(t_cd4_sce$donor_type))) |>
+  arrange(case_id, donor_type)
+
+purrr::walk(assay_sel, \(cur_assay) {
+  dimred_name <- paste("UMAP_T_CD4", cur_assay, sep = "_")
+
+  p <- plot_dim_red(cur_dat, dimred_name, "cell_cluster_scaled",
+                    sample = FALSE, size = 0.5, alpha = 1,
+                    palette = palettes$colors)
+  if (do_print) print(p)
+
+  fn <- paste0(paste(today, "T_CD4_clusters", dimred_name,
+                      sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param))
+})
+```
+
+### Heatmap
+
+Change here to ComplexHeatmap.
+```{r consensus-heatmap}
+purrr::walk(assay_sel, \(cur_assay) {
+  # cur_assay <- "scaled"
+  clust_name <- paste("cell_type", cur_assay, sep = "_")
+
+  # Summarize the data
+  hm <- summarize_heatmap(t_cd4_sce[, t_cd4_sce$cell_type != "Ambiguous"],
+                          expr_values = cur_assay,
+                          cluster_by = "cell_cluster_scaled",
+                          channels = features_oi)
+
+  # Display the heatmap
+  fn <- file.path(paths$folder_script, paste0(paste(today, "T_CD4_clusters", cur_assay,
+                     "Heatmap", sep = "_"), ".png"))
+  # plotsave_param
+  png(fn, width = 1200, height = 800)
+  p <- ComplexHeatmap::Heatmap(hm, name = "Scaled expression", 
+                               col= viridis::viridis(100),
+                               show_row_names = TRUE, show_column_names = TRUE,
+                               cluster_rows = TRUE, cluster_columns = TRUE,
+                               row_names_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"),
+                               column_names_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"), 
+                               heatmap_legend_param = list(legend_direction = "horizontal",
+                                                           title_position = "topcenter",
+                                                           title_gp = grid::gpar(fontsize = 40, fontfamily = "Arial"),
+                                                           labels_gp = grid::gpar(fontsize = 40, fontfamily = "Arial")),                             
+                              row_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for rows
+                              column_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for columns
+                              row_names_side = "left",
+                              row_dend_side = "right")                              
+  ComplexHeatmap::draw(p, heatmap_legend_side = "top", 
+                       padding = unit(c(12, 12, 2, 2), "mm"))  # right and bottom padding
+  dev.off()
+})
+```
+
+Fig 5 A. Cluster Expression profiles of T-CD4 subtypes.
+
+```{r fig5a-heatmap}
+cur_assay <- "scaled"
+clust_name <- paste("cell_type", cur_assay, sep = "_")
+
+# Summarize the data
+hm <- summarize_heatmap(t_cd4_sce,
+                        expr_values = cur_assay,
+                        cluster_by = "cell_cluster_scaled",
+                        channels = features_oi)
+
+ct_anno <- as.data.frame(table(t_cd4_sce$cell_cluster_scaled))
+rownames(ct_anno) <- ct_anno$Var1
+# sort as in the heatmap
+ct_anno <- ct_anno[rownames(hm), ]
+cell_type_counts <- ct_anno$Freq
+names(cell_type_counts) <- ct_anno$Var1
+
+breaks <- c(0, 0.5, 0.7, 1) 
+colors <- viridis::viridis(4) 
+col_fun <- circlize::colorRamp2(breaks, colors)
+
+# Create row annotation for cell type counts
+row_anno <- ComplexHeatmap::rowAnnotation(
+  "Cell Counts" = ComplexHeatmap::anno_barplot(cell_type_counts, 
+                         gp = grid::gpar(fill = "skyblue", col = "black"),
+                         border = TRUE,
+                         width = grid::unit(4, "cm"),
+      axis_param = list(gp = grid::gpar(fontsize = 25)),
+),       
+  show_annotation_name = TRUE,
+  annotation_name_gp = grid::gpar(fontsize = 30),
+  annotation_name_side = "top",
+  annotation_name_rot = 0,
+  annotation_name_offset = unit(c(0.5, 0.5), "cm")
+)
+
+saveRDS(hm, file.path(paths$home_git, "figures", "CH_fig4a.rds"))
+saveRDS(cell_type_counts, file.path(paths$home_git, "figures", "CH_fig4a_anno.rds"))
+
+# Display the heatmap
+fn <- file.path(paths$folder_script, paste0(paste(today, "T_CD4_clusters", cur_assay,
+                "Heatmap", sep = "_"), ".png"))
+# plotsave_param
+png(fn, width = 1200, height = 800)
+p <- ComplexHeatmap::Heatmap(hm, name = "Scaled expression", 
+                              col= col_fun,
+                              show_row_names = TRUE, show_column_names = TRUE,
+                              cluster_rows = TRUE, cluster_columns = TRUE,
+                              row_names_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"),
+                              column_names_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"), 
+                              heatmap_legend_param = list(legend_direction = "horizontal",
+                                                          title_position = "topcenter",
+                                                          title_gp = grid::gpar(fontsize = 40, fontfamily = "Arial"),
+                                                          labels_gp = grid::gpar(fontsize = 40, fontfamily = "Arial")),                             
+                            row_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for rows
+                            column_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for columns
+                            row_names_side = "left",
+                            row_dend_side = "right") + 
+      row_anno
+
+ComplexHeatmap::draw(p, heatmap_legend_side = "top", 
+                      padding = unit(c(12, 12, 2, 12), "mm"))  # right and bottom padding
+dev.off()
+```
+
+GET UMAP.
+
+```{r}
+cur_assay <- "scaled"
+df_img <- scuttle::makePerCellDF(
+  x = t_cd4_sce,
+  assay.type = cur_assay,
+  features = features_oi,
+  use.coldata = c("cell_type","donor_type", "case_id", "image_id", "cell_cluster_scaled"),
+  use.dimred = TRUE
+)  |> as_tibble(rownames = "cell_id") |> 
+  dplyr::select(cell_cluster_scaled, cell_id, cell_type, donor_type, image_id, case_id, starts_with("UMAP"), all_of(features_oi))
+```
+
+### Plot UMAP Channels
+Plot UMAP 
+```{r plot_umap}
+## Plot Channels.
+## pivot-longer.
+df_img_long <- df_img |>
+  tidyr::pivot_longer(cols = all_of(features_oi), names_to = "channel", values_to = cur_assay)
+
+## Plot Channels.
+dimred_name <- paste("UMAP_T_CD4", cur_assay, sep = "_")
+r <- plot_dim_red_channels(dat = df_img_long, size = 0.5, alpha = 0.5, force_points = TRUE, dimred = dimred_name, expr_values = cur_assay, channel = features_oi) +
+    theme(axis.text.x = element_blank(), axis.text.y = element_blank(), axis.title.x = element_blank(), axis.title.y = element_blank())
+
+fn <- paste(paste(today, "UMAP", "T_CD4", "channels", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, r), plotsave_param))
+```
+
+# A3: T-EMRA annotation
+
+Split CD45RA+ T-CD8 cells into T-EMRA and T-naive based on CD57 and GZMB expression.
+```{r split-cd45ra-cd8}
+## Extract T-CD8-5
+features_oi <- metadata(spe)$channels$T_CD8
+t_cells2 <- spe[features_oi, spe$cell_type %in% c("T_CD8")]
+t_cells2 <- t_cells2[, t_cells2$donor_type != "Pancreatitis"]
+t_cd45ra <- t_cells2[, t_cells2$cell_cluster_scaled == "T_CD8_5"]
+
+## CD45RA T-cells
+exprs_df <- as_tibble(makePerCellDF(t_cd45ra, features = features_oi, assay.type = "exprs", use.dimred = FALSE)) |> 
+    select(all_of(features_oi), case_id, donor_type, distance_to_islet, image_id, cell_id, cell_type, cell_cluster_scaled) |> 
+    filter(donor_type != "Pancreatitis")
+
+## T-CD8 all
+exprs_df_all <- as_tibble(makePerCellDF(t_cells2, features = features_oi, assay.type = "exprs", use.dimred = FALSE)) |> 
+    select(all_of(features_oi), case_id, donor_type, distance_to_islet, image_id, cell_id, cell_type, cell_cluster_scaled) |> 
+    filter(donor_type != "Pancreatitis")
+```
+
+Plot Expression of CD27 vs CD57 and CD27 vs GZMB.
+```{r expression-cd8-cd27-cd57}
+## Plot CD45RA vs CD57 (CD45RA)
+p <- exprs_df |> 
+  filter(cell_type == "T_CD8") |>
+  ggplot(aes(x = CD27, y = CD57, color = cell_type)) +
+  geom_point(alpha = 0.5, size = 0.1) +
+  geom_density2d() + 
+  ggtitle("CD27 vs CD57") +
+  mytheme$standard()
+# print(p)
+fn <- paste0(paste(today, "CD27", "CD57", "T_CD8_cd45ra", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+## Plot CD27 vs GZMB 
+q <- exprs_df  |> 
+  filter(cell_type == "T_CD8") |>
+  ggplot(aes(x = CD27, y = GranB, color = cell_type)) +
+  geom_point(alpha = 0.5, size = 0.1) +
+  geom_density2d() + 
+  ggtitle("CD27 vs GZMB") +
+  mytheme$standard()
+#print(q)
+fn <- paste0(paste(today, "CD27", "CD57", "T_CD8_cd45ra", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, q), plotsave_param))
+
+## Define Thresholds
+### CD57:
+thresh_cd57 <- pliman::otsu(exprs_df$CD57)
+p <- exprs_df |> 
+  ggplot(aes(x = CD57, color = cell_type)) +
+  geom_density() +
+  ggtitle("CD57 expression by cell type") +
+    geom_vline(xintercept = thresh_cd57, linetype = "dashed") + 
+  mytheme$standard()
+#print(p)
+fn <- paste0(paste(today, "CD57", "T_CD8_cd45ra", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+## GZMB separation.
+thresh_gzmb <- pliman::otsu(exprs_df$GranB)
+p <- exprs_df |> 
+  ggplot(aes(x = GranB, color = cell_type)) +
+  geom_density() +
+  ggtitle("GranB expression by cell type") +
+  mytheme$standard() + 
+    geom_vline(xintercept = thresh_gzmb, linetype = "dashed")
+# print(p)
+fn <- paste0(paste(today, "GZMB", "T_CD8_cd45ra", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+## define T-EMRA, based on CD57 alone.
+# -> CD57 has better SNR. 
+exprs_df <- exprs_df |> 
+  mutate(t_emra = ifelse(CD57 > thresh_cd57, "CD57_pos", "CD57_neg")) |> 
+  mutate(cell_cluster_scaled_x = ifelse(t_emra == "CD57_pos", "T-EMRA", "T-naive"))
+
+exprs_df  |> 
+    dplyr::count(cell_cluster_scaled_x)
+
+exprs_df |> 
+    dplyr::count(cell_cluster_scaled_x, donor_type)
+```
+
+
+## Heatmap all T-CD8
+```{r prep-heatmap-cd8}
+# Make sure they have the same order
+cell_ids <- t_cells2$cell_id
+
+exprs_df_joint <- exprs_df  |> 
+    select(cell_cluster_scaled_x, cell_id) |> 
+    right_join(exprs_df_all, by = "cell_id") |> 
+    mutate(cell_cluster_scaled = ifelse(is.na(cell_cluster_scaled_x), cell_cluster_scaled, cell_cluster_scaled_x)) |> 
+    as.data.frame()
+
+rownames(exprs_df_joint) <- exprs_df_joint$cell_id
+exprs_df_joint <- exprs_df_joint[cell_ids, ]
+t_cells2$cell_cluster_scaled <- exprs_df_joint$cell_cluster_scaled
+table(t_cells2$cell_cluster_scaled)
+```
+
+Plot Heatmap for all T-CD8.
+
+
+### Run dimensionality reduction
+
+Dimensionality reduction is run on all immune cells ( `t_cells2`).
+
+**UMAP**
+
+```{r run-UMAP3}
+set.seed(222)
+purrr::walk(assay_sel, \(cur_assay) {
+  dimred_name <- paste("UMAP_T_CD8", cur_assay, sep = "_")
+  
+  #if (!dimred_name %in% reducedDimNames(sce_imm)) {
+    cur_umap <- uwot::umap(t(assay(t_cells2, cur_assay)))
+    colnames(cur_umap) <- c("UMAP1", "UMAP2")
+    rownames(cur_umap) <- colnames(assay(t_cells2, cur_assay))
+    reducedDim(t_cells2, dimred_name) <<- cur_umap
+    remove(cur_umap)
+  #}
+})
+```
+
+
+### Reduced dimensions
+
+Plot consensus cell clusters on reduced dimensions
+
+```{r consensus-dimred2}
+cur_dat <- scuttle::makePerCellDF(t_cells2[, t_cells2$cell_type != "Ambiguous"],
+                                  use_dimred = TRUE) |>
+  mutate(case_id = factor(case_id, levels = unique(t_cells2$case_id)),
+         donor_type = factor(donor_type, levels = unique(t_cells2$donor_type))) |>
+  arrange(case_id, donor_type)
+
+purrr::walk(assay_sel, \(cur_assay) {
+    dimred_name <- paste("UMAP_T_CD8", cur_assay, sep = "_")
+
+    p <- plot_dim_red(cur_dat, dimred_name, "cell_cluster_scaled",
+                        sample = TRUE, size = 0.1, alpha = 1,
+                        palette = palettes$colors)
+    # if (do_print) print(p)
+
+    fn <- paste0(paste(today, "T_CD8_clusters", dimred_name,
+                        sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param))
+})
+```
+
+
+### Heatmap
+
+Change here to ComplexHeatmap.
+```{r consensus-heatmap2}
+purrr::walk(assay_sel, \(cur_assay) {
+  # cur_assay <- "scaled"
+  clust_name <- paste("cell_type", cur_assay, sep = "_")
+
+  # Summarize the data
+  hm <- summarize_heatmap(t_cells2[, t_cells2$cell_type != "Ambiguous"],
+                          expr_values = cur_assay,
+                          cluster_by = "cell_cluster_scaled",
+                          channels = features_oi)
+
+  # Display the heatmap
+  fn <- file.path(paths$folder_script, paste0(paste(today, "T_CD8_clusters", cur_assay,
+                     "Heatmap", sep = "_"), ".png"))
+  # plotsave_param
+  png(fn, width = 1200, height = 800)
+  p <- ComplexHeatmap::Heatmap(hm, name = "Scaled expression", 
+                               col= viridis::viridis(100),
+                               show_row_names = TRUE, show_column_names = TRUE,
+                               cluster_rows = TRUE, cluster_columns = TRUE,
+                               row_names_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"),
+                               column_names_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"), 
+                               heatmap_legend_param = list(legend_direction = "horizontal",
+                                                           title_position = "topcenter",
+                                                           title_gp = grid::gpar(fontsize = 40, fontfamily = "Arial"),
+                                                           labels_gp = grid::gpar(fontsize = 40, fontfamily = "Arial")),                             
+                              row_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for rows
+                              column_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for columns
+                              row_names_side = "left",
+                              row_dend_side = "right")                              
+  ComplexHeatmap::draw(p, heatmap_legend_side = "top", 
+                       padding = unit(c(12, 12, 2, 2), "mm"))  # right and bottom padding
+  dev.off()
+})
+```
+
+Fig 6 B:
+
+```{r}
+cur_assay <- "scaled"
+features_oi2 <- features_oi[!features_oi %in% c("CD56", "CD73","ATP5A", "LDHA",
+                                                "TMEM173")]
+
+# Summarize the data
+hm <- summarize_heatmap(t_cells2[, t_cells2$cell_type != "Ambiguous"],
+                        expr_values = cur_assay,
+                        cluster_by = "cell_cluster_scaled",
+                        channels = features_oi2)
+
+ct_anno <- as.data.frame(table(t_cells2$cell_cluster_scaled))
+rownames(ct_anno) <- ct_anno$Var1
+# sort as in the heatmap
+ct_anno <- ct_anno[rownames(hm), ]
+cell_type_counts <- ct_anno$Freq
+names(cell_type_counts) <- ct_anno$Var1
+
+breaks <- c(0, 0.5, 0.7, 1)
+colors <- viridis::viridis(4)
+col_fun <- circlize::colorRamp2(breaks, colors)
+
+# Create row annotation for cell type counts
+row_anno <- ComplexHeatmap::rowAnnotation(
+  "Cell Counts" = ComplexHeatmap::anno_barplot(cell_type_counts, 
+                          gp = grid::gpar(fill = "skyblue", col = "black"),
+                          border = TRUE,
+                          width = grid::unit(4, "cm"),
+      axis_param = list(gp = grid::gpar(fontsize = 25)),
+),    
+  show_annotation_name = TRUE,
+  annotation_name_gp = grid::gpar(fontsize = 30),
+  annotation_name_side = "top",
+  annotation_name_rot = 0,
+  annotation_name_offset = unit(c(0.5, 0.5), "cm")
+)
+
+saveRDS(hm, file.path(paths$home_git, "figures", "CH_fig4b.rds"))
+saveRDS(cell_type_counts, file.path(paths$home_git, "figures", "CH_fig4b_anno.rds"))
+
+# Display the heatmap
+fn <- file.path(paths$folder_script, paste0(paste(today, "T_CD8_clusters", cur_assay,
+                    "Heatmap", sep = "_"), ".png"))                                             
+
+# plotsave_param
+png(fn, width = 1200, height = 800)
+p <- ComplexHeatmap::Heatmap(hm, name = "Scaled expression", 
+                              col= col_fun,
+                              show_row_names = TRUE, show_column_names = TRUE,
+                              cluster_rows = TRUE, cluster_columns = TRUE,
+                              row_names_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"),
+                              column_names_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"), 
+                              heatmap_legend_param = list(legend_direction = "horizontal",
+                                                          title_position = "topcenter",
+                                                          title_gp = grid::gpar(fontsize = 40, fontfamily = "Arial"),
+                                                          labels_gp = grid::gpar(fontsize = 40, fontfamily = "Arial")),                             
+                            row_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for rows
+                            column_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for columns
+                            row_names_side = "left",
+                            row_dend_side = "right") + 
+      row_anno
+
+
+ComplexHeatmap::draw(p, heatmap_legend_side = "top", 
+                      padding = unit(c(12, 12, 2, 12), "mm"))  # right and bottom padding
+dev.off()
+```
+
+## Plot Channels
+
+```{r plot-dimred-channels, fig.height=10, fig.width=15}
+purrr::walk(assay_sel, \(cur_assay) {
+    dimred_name <- paste("UMAP_T_CD8", cur_assay, sep = "_")
+
+    # Prepare the data
+    cur_dat <- scuttle::makePerCellDF(t_cells2,
+                                        features = metadata(spe)$channels$T_CD8,
+                                        exprs_values = cur_assay) |>
+        select(c(all_of(metadata(spe)$channels$T_CD8),
+                paste0(dimred_name, ".1"), paste0(dimred_name, ".2")))
+
+    cur_dat <- cur_dat |>
+        tidyr::pivot_longer(cols = all_of(metadata(spe)$channels$T_CD8),
+                            names_to = "channel",
+                            values_to = cur_assay)
+
+    # Plot marker expression
+    p <- plot_dim_red_channels(cur_dat, dimred_name, cur_assay,
+                                metadata(spe)$channels$T_CD8, force_points = TRUE)
+
+    fn <- paste0(paste(today, dimred_name, "Channels", sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param_large))
+    # if (do_print) print(p)
+})
+```
+
+
+## Join with original SPE.
+
+### Join T-CD8 and T-CD4 SCEs
+```{r}
+# Make sure row order is preserved
+row_order <- rownames(colData(spe)[spe$cell_type == "T_CD4" & spe$donor_type != "Pancreatitis", ])
+t_cd4_sce <- t_cd4_sce[, order(match(colnames(t_cd4_sce), row_order))]
+
+# Add immune cell types and clusters
+colData(spe)[row_order, ]$cell_cluster_scaled <- t_cd4_sce$cell_cluster_scaled
+
+## Repeat for T-CD8
+row_order <- rownames(colData(spe)[spe$cell_type == "T_CD8" & spe$donor_type != "Pancreatitis", ])
+t_cells2 <- t_cells2[, order(match(colnames(t_cells2), row_order))]
+colData(spe)[row_order, ]$cell_cluster_scaled <- t_cells2$cell_cluster_scaled 
+```
+
+
+# A.4 Myeloid clusters
+
+## Get Myeloid Cells.
+```{r prep-myeloid-cells}
+features_oi <- metadata(spe)$channels$Myeloid
+myeloid_spe <- spe[, spe$cell_type == "Myeloid"]
+myeloid_spe <- myeloid_spe[features_oi, myeloid_spe$donor_type != "Pancreatitis"]
+
+unique(myeloid_spe$cell_cluster_scaled)
+```
+
+## Update Myeloid clusters
+
+### Put into Myeloid-other.
+```{r rename-myeloid-other}
+## Myeloid-Subclusters 5, 7, 11, 12 are grouped into "Myeloid_Other" - as these are not well defined clusters.
+# Instead, they are rare subclusters which have strong interaction with other cell types.
+
+# Myeloid-11 is CD57 positive, given its islet localization. 
+# Myeloid-12 is CD27 positive, given its interaction with likely CD27+ NK-cells.
+# Myeloid-5 is PD1+ given interaction with PD1+ T-cells
+# Myeloid-7 is CD303+ given interaction with CD303+ cells.
+colData(myeloid_spe)$cell_cluster_scaled <- 
+  ifelse(colData(myeloid_spe)$cell_cluster_scaled %in% c("Myeloid_5", "Myeloid_12", "Myeloid_11", "Myeloid_7"), "Myeloid_Other", 
+        colData(myeloid_spe)$cell_cluster_scaled)
+unique(myeloid_spe$cell_cluster_scaled)
+```
+Rename other clusters.
+
+Rename Myeloid-6 to Myeloid-5.
+Rename Myeloid-8 to Myeloid-6.
+Rename Myeloid-9 to Myeloid-7.
+Rename Myeloid-10 to Myeloid-8.
+
+```{r rename-myeloid-clusters}
+colData(myeloid_spe)$cell_cluster_scaled <- 
+  ifelse(colData(myeloid_spe)$cell_cluster_scaled == "Myeloid_6", "Myeloid_5", 
+        ifelse(colData(myeloid_spe)$cell_cluster_scaled == "Myeloid_8", "Myeloid_6", 
+          ifelse(colData(myeloid_spe)$cell_cluster_scaled == "Myeloid_9", "Myeloid_7", 
+            ifelse(colData(myeloid_spe)$cell_cluster_scaled == "Myeloid_10", "Myeloid_8", 
+              colData(myeloid_spe)$cell_cluster_scaled))))
+unique(myeloid_spe$cell_cluster_scaled)
+```
+
+### Heatmap.
+Change here to ComplexHeatmap.
+```{r consensus-heatmap3}
+# remove CD27, CD57, CD56, CD303
+new_features_oi <- features_oi[!features_oi %in% c("PD1", "CD57",  "CD56", "CD27", "CD303")]
+purrr::walk(assay_sel, \(cur_assay) {
+  # cur_assay <- "scaled"
+  clust_name <- paste("cell_type", cur_assay, sep = "_")
+
+  # Summarize the data
+  hm <- summarize_heatmap(myeloid_spe[, myeloid_spe$cell_type != "Ambiguous"],
+                          expr_values = cur_assay,
+                          cluster_by = "cell_cluster_scaled",
+                          channels = new_features_oi)
+
+  # Display the heatmap
+  fn <- file.path(paths$folder_script, paste0(paste(today, "Myeloid_clusters", cur_assay,
+                     "Heatmap", sep = "_"), ".png"))
+  # plotsave_param
+  png(fn, width = 1200, height = 800)
+  p <- ComplexHeatmap::Heatmap(hm, name = "Scaled expression", 
+                               col= viridis::viridis(100),
+                               show_row_names = TRUE, show_column_names = TRUE,
+                               cluster_rows = TRUE, cluster_columns = TRUE,
+                               row_names_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"),
+                               column_names_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"), 
+                               heatmap_legend_param = list(legend_direction = "horizontal",
+                                                           title_position = "topcenter",
+                                                           title_gp = grid::gpar(fontsize = 40, fontfamily = "Arial"),
+                                                           labels_gp = grid::gpar(fontsize = 40, fontfamily = "Arial")),                             
+                              row_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for rows
+                              column_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for columns
+                              row_names_side = "left",
+                              row_dend_side = "right")                              
+  ComplexHeatmap::draw(p, heatmap_legend_side = "top", 
+                       padding = unit(c(12, 12, 2, 2), "mm"))  # right and bottom padding
+  dev.off()
+})
+```
+
+Fig 4b. Myeloid Expression heatmap.
+
+```{r fig4a}
+new_features_oi <- features_oi[!features_oi %in% c("PD1", "CD57",  "CD56", "CD27", "CD303")]
+cur_assay <- "scaled"
+
+# Summarize the data
+hm <- summarize_heatmap(myeloid_spe,
+                        expr_values = cur_assay,
+                        cluster_by = "cell_cluster_scaled",
+                        channels = new_features_oi)
+
+# Counts
+ct_anno <- as.data.frame(table(myeloid_spe$cell_cluster_scaled))
+rownames(ct_anno) <- ct_anno$Var1
+ct_anno <- ct_anno[rownames(hm), ]
+cell_type_counts <- ct_anno$Freq
+names(cell_type_counts) <- ct_anno$Var1
+
+breaks <- c(0, 0.5, 0.7, 1)  # Define custom breaks for the color scale
+colors <- viridis::viridis(4) 
+# Create a color function with more emphasis on the lower values
+col_fun <- circlize::colorRamp2(breaks, colors)
+
+# Create row annotation for cell type counts
+row_anno <- ComplexHeatmap::rowAnnotation(
+  "Cell Counts" = ComplexHeatmap::anno_barplot(cell_type_counts, 
+                         gp = grid::gpar(fill = "skyblue", col = "black"),
+                         border = TRUE,
+                         width = grid::unit(4, "cm"),
+      axis_param = list(gp = grid::gpar(fontsize = 25)),
+), show_annotation_name = TRUE,
+  annotation_name_gp = grid::gpar(fontsize = 30),
+  annotation_name_side = "top",
+  annotation_name_rot = 0,
+  annotation_name_offset = unit(c(0.5, 0.5), "cm")
+    # Adjust title size here
+)
+
+saveRDS(hm, file.path(paths$home_git, "figures", "CH_fig5a.rds"))
+saveRDS(cell_type_counts, file.path(paths$home_git, "figures", "CH_fig5a_anno.rds"))
+
+# Display the heatmap
+fn <- file.path(paths$folder_script, paste0(paste(today, "Myeloid_clusters2", cur_assay,
+                    "Heatmap", sep = "_"), ".png"))
+png(fn, width = 1200, height = 800)
+p <- ComplexHeatmap::Heatmap(heatmaply::normalize(hm), name = "Scaled expression", 
+                              col= col_fun,
+                              show_row_names = TRUE, show_column_names = TRUE,
+                              cluster_rows = TRUE, cluster_columns = TRUE,
+                              row_names_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"),
+                              column_names_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"), 
+                              heatmap_legend_param = list(legend_direction = "horizontal",
+                                                          title_position = "topcenter",
+                                                          title_gp = grid::gpar(fontsize = 40, fontfamily = "Arial"),
+                                                          labels_gp = grid::gpar(fontsize = 40, fontfamily = "Arial")),                             
+                            row_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for rows
+                            column_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for columns
+                            row_names_side = "left",
+                            row_dend_side = "right") + 
+      row_anno
+
+ComplexHeatmap::draw(p, heatmap_legend_side = "top", 
+                      padding = unit(c(12, 20, 2, 12), "mm"))   # right and bottom padding
+
+dev.off()
+```
+
+
+Missing: UMAP of Myeloid channels.
+
+## Join with original SPE.
+
+### Join T-CD8 and T-CD4 SCEs
+```{r}
+# Make sure row order is preserved
+row_order <- rownames(colData(spe)[spe$cell_type == "Myeloid" & spe$donor_type != "Pancreatitis", ])
+myeloid_spe <- myeloid_spe[, order(match(colnames(myeloid_spe), row_order))]
+
+# Add immune cell types and clusters
+colData(spe)[row_order, ]$cell_cluster_scaled <- myeloid_spe$cell_cluster_scaled
+```
+
+## Save the updated SCE object
+
+Contains all attributed cell types and cell categories
+
+```{r save-spe}
+fn_spe <- file.path(paths$folder_script, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+print(spe)
+saveRDS(spe, fn_spe)
+# spe <- readRDS(fn_spe)
+```

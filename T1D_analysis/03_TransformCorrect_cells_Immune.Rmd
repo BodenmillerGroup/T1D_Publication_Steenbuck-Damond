@@ -1,0 +1,331 @@
+---
+title: "03_TransformCorrect_cells_Immune"
+author: "Nathan Steenbuck, Nicolas Damond"
+date: "Created: 19 May, 2022; Compiled: `r format(Sys.time(), '%d %b, %Y')`"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+if (rstudioapi::isAvailable()) {
+  script_name <- basename(rstudioapi::getSourceEditorContext()$path)
+} else {
+  script_name <- knitr::current_input()
+}
+
+script_name <- "03_TransformCorrect_cells_Immune.Rmd"
+cur_user <- Sys.info()[["user"]]
+
+## cur_user == "ubuntu" indicates working on the VM.
+## Else; working on the Cluster.
+if (cur_user == "ubuntu") {
+  source(file.path("/", "mnt", "central_nas", "projects", 
+    "type1_diabetes", "nathan", "T1D_Vol", "T1D_analysis", 
+    "analysis", "helpers.R"))
+  n_cores <- 4
+  future::plan(future::multisession(workers = n_cores))
+  paths <- getPaths(script_name)
+  knitr::opts_knit$set(root_dir = paths$home_data)
+} else {
+  source(file.path("/", "home", "nsteen", "scripts", "T1D_analysis", "analysis", "helpers.R"))
+  future::plan(future::multicore)
+  paths <- getPaths(script_name)
+  paths$folder_script <- paths$cluster_folder_script
+  paths$folder_in <- paths$cluster_folder_in
+  paths$folder_out <- paths$cluster_home 
+  knitr::opts_knit$set(root_dir = paths$cluster_home)
+}
+
+# Misc. Settings.
+seed <- 123456
+set.seed(seed)
+options <- furrr::furrr_options(seed = seed)
+options(future.globals.maxSize = 40 * 1024 * 1024 * 1024)
+knitr::opts_chunk$set(echo = TRUE)
+paths$prev <- paste("02_SpilloverCompensation", paths$object_type, paths$panel_type, sep = "_")
+```
+
+
+
+# **Goals**
+
+**1. Counts transformations**  
+IMC data can be transformed to achieve more symmetric intensity distributions with more similar ranges across markers.  
+
+**2. Batch correction**
+Batch correction can correct potential technical variation between samples before applying clustering algorithms. 
+Here, [fastMNN](https://marionilab.github.io/FurtherMNN2018/theory/description.html) is used to correct for batch effects.
+
+
+
+# **Settings**  
+
+## Load packages
+
+```{r packages, results='hide'}
+suppressPackageStartupMessages(c(
+  library(SpatialExperiment),
+  library(dplyr),
+  library(batchelor),
+  library(BiocParallel),
+  library(harmony),
+  library(tictoc),
+  library(ggplot2),
+  library(scater),
+  library(tictoc)
+))
+```
+
+## Paths and settings
+
+```{r settings}
+# Paths
+if (!dir.exists(paths$folder_script)) dir.create(paths$folder_script)
+plotsave_param$path <- paths$folder_script
+plotsave_param_large$path <- paths$folder_script
+
+# Misc settings
+today <- gsub("-", "", Sys.Date())
+```
+
+##  Read in the data
+
+Import the SpatialExperiment (SPE) object generated in the first analysis script.
+
+```{r load-data}
+fn_spe <- file.path(paths$folder_out, paths$prev, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+spe <- readRDS(fn_spe)
+print(spe)
+```
+
+## Remove uncompensated counts
+
+Remove `raw` (uncompensated) counts (not needed anymore).
+
+```{r remove-raw-counts}
+if ("raw" %in% assayNames(spe)) {
+  assay(spe, "raw") <- NULL
+}
+```
+
+
+
+# **Data transformation**
+
+IMC data can be transformed to achieve more symmetric intensity distributions with more similar ranges across markers. 
+In line with CyTOF data, IMC data is often arcsinh-transformed. 
+However, the choice of the so called "cofactor" has to be adjusted for IMC data due its lower average intensity. 
+IMC data are often arcsinh-transformed using a cofactor of 1. 
+
+## Arcsinh transformation
+
+Here, we will arsinh transform the data using a cofactor of 1.  
+Other transormation methods, such as log transformation can also be used. 
+For visualization purpose, arcsinh-transformed data can be further scaled using z-score standardization.
+
+### Cell counts
+
+```{r asinh-transf}
+# Arcsinh
+if (!"exprs" %in% assayNames(spe))
+  assay(spe, "exprs") <- asinh(counts(spe) / 1)
+```
+
+## Quantile normalization
+
+Alternatively, the raw data can be scaled between 0 and 1 after clipping outlying intensities to the 99.9th percentile value.
+
+### Cell counts
+
+```{r scaled-transf}
+# Define the censor value
+censor_val <- 0.999
+
+# Calculate quantile
+if (!"scaled" %in% assayNames(spe)) {
+  quant <- apply(assay(spe, "counts"), 1, quantile, probs = censor_val)
+  
+  # Normalize
+  assay(spe, "scaled") <- apply(assay(spe, "counts"), 2, function(x) x / quant)
+  
+  # Clip values 0-1
+  assay(spe, "scaled")[assay(spe, "scaled") > 1] <- 1
+  assay(spe, "scaled")[assay(spe, "scaled") < 0] <- 0
+}
+```
+
+## Other transformations
+
+Other transformations, such as log or Z-score, can be applied but are currently not used in this analysis workflow.
+
+### Log-transformation
+
+```{r log-transf}
+# if (!"logcounts" %in% assayNames(spe))
+#   assay(spe, "logcounts") <- log(counts(spe) +
+#                                    min(counts(spe)[counts(spe) != 0]))
+```
+
+### Z-score
+
+```{r z-cells}
+# if (!"z-scaled" %in% assayNames(spe))
+#   assay(spe, "z-scaled") <- t(scale(t(assay(spe, "exprs"))))
+```
+
+## Save the updated SPE object
+
+Contains the new counts transformations.
+
+```{r save-sce1}
+print(assayNames(spe))
+fn_spe <- file.path(paths$folder_script, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+saveRDS(spe, fn_spe)
+```
+
+
+
+# **Batch correction**
+
+Batch correct donors (95 donors), using arcsinh-transformed counts (`exprs`) as starting values.
+
+## Harmony: Case-id
+We also attempted to run Harmony with **case-id** or **batch** as batch variable.
+This was too harsh integration and was not further pursued.
+
+## Run PCA.
+PCA is applied and the data is reduced to 30 PCs. 
+```{r perform_pca}
+channels_to_correct <- !(grepl("DNA|H3", rownames(spe)))
+exprs_values <- "exprs"
+
+if (!"PCA" %in% reducedDimNames(spe)) {
+  spe <- scater::runPCA(spe,
+                        exprs_values = exprs_values,
+                        subset_row = channels_to_correct,
+                        ncomponents = 30,  
+                        BSPARAM = BiocSingular::ExactParam(),
+                        name = "PCA",
+                        scale = FALSE) 
+}
+```
+
+
+## **FastMNN**
+
+Batch correction is performed with [FastMNN](http://bioconductor.org/packages/release/bioc/vignettes/batchelor/inst/doc/correction.html#3_mutual_nearest_neighbors) 
+from the [batchelor package](https://bioconductor.org/packages/devel/bioc/html/batchelor.html).  
+
+
+### fastMNN Parameters
+
+Define the channels to correct and the subset of cells to use to calculate the batch effect (see `?"batchelor-restrict"`).
+This is used later in fastMNN.
+The H3 and DNA channels are not used, as we do not expect cell type specific variance for these channels.
+This is used as a simple feature selection step.
+
+```{r fastMNN-parameters}
+# Define the subset of cells per donor to use to calculate the batch effect -> nb_cells * 95 
+nb_cells <- 1000
+
+set.seed(seed)
+cell_restrict <- as.data.frame(cbind(rn = rownames(colData(spe)),
+                                     case_id = colData(spe)$case_id)) |> 
+  group_by(case_id, .add = TRUE) |>
+  sample_n(nb_cells) |>
+  pull(rn)
+
+# Subset the SPE to the channels to correct.
+spe_sub <- spe[, cell_restrict]
+```
+
+### Run FastMNN
+For now, we subset SPE to 1000 cells per donor. These are thought to be representative of the donor.
+
+Repeat for Case_id and Batch.
+Works better for Case_id variable.
+
+```{r fastMNN-run-caseid, message=FALSE}
+do_fast_mnn <- TRUE
+method_name <- "fastMNN"
+batch_variables <- c("case_id") # , "batch")
+
+## Run FastMNN for both batch variables.
+results <- furrr::future_map(batch_variables, \(batch_variable) {
+  assay_name <- paste0(method_name, "_", batch_variable)
+  message(assay_name)
+  if (!assay_name %in% assayNames(spe)) {
+    do_fast_mnn <- TRUE
+    set.seed(seed)
+    # Correct by donor
+    tic("FastMNN")
+    spe_mnn <- fastMNN(spe,
+                       batch = spe[[batch_variable]],
+                       restrict = list(cell_restrict),
+                       subset.row = channels_to_correct,
+                       assay.type = "exprs",
+                       d = 40,
+                       auto.merge = TRUE,
+                       correct.all = TRUE,
+                       cos.norm = FALSE,
+                       BPPARAM = MulticoreParam(),
+                       BSPARAM = BiocSingular::ExactParam())
+    toc()
+    # Extract metdata related to batch correction
+    metadata_merge <- metadata(spe_mnn)$merge.info
+    list("spe_mnn" = spe_mnn, "metadata" = metadata_merge)
+  }
+}, .options = options) |> purrr::set_names(batch_variables)
+
+## Add the corrected counts to the SPE.
+assay_name1 <- paste0(method_name, "_", batch_variables[[1]])
+# assay_name2 <- paste0(method_name, "_", batch_variables[[2]])
+
+assay(spe,  assay_name1) <- as.matrix(assay(results[[1]][["spe_mnn"]], "reconstructed"))
+# assay(spe, assay_name2) <- as.matrix(assay(results[[2]][["spe_mnn"]], "reconstructed"))
+
+metadata_merges <- list("Donor" = results[[1]][["metadata"]]) # , "Batch" = results[[2]][["metadata"]])
+```
+
+### Check fastMNN output
+
+Check lost variance per merge step. Samples are first ranked based on the lost 
+variance. As rule of thumb, values over 10% should be investigated further. 
+Then, the magnitude of the batch effect is displayed.
+
+```{r fastMNN-lostvariance}
+batch_lostvar <- NULL
+if (do_fast_mnn == TRUE) {
+  batch_lostvar <- purrr::map(.x = metadata_merges, .f = \(metadata_m) {
+    # Display lost variance
+    colmax <- colMaxs(metadata_m$lost.var)
+    names(colmax) <- colnames(metadata_m$lost.var)
+    print(colmax[order(colmax, decreasing = TRUE)])
+  }) |> purrr::set_names(batch_variables)
+}
+print(batch_lostvar)
+```
+
+Display the magnitude of the batch effect.
+
+```{r fastMNN-batch-magnitude}
+batch_magnitude <- NULL
+if (do_fast_mnn == TRUE) {
+  batch_magnitude <- purrr::map(.x = metadata_merges, .f = \(metadata_m) {
+    cur_dat <- DataFrame(left = metadata_m$left, right = metadata_m$right, 
+                         batch.size = metadata_m$batch.size, 
+                         max_lost_var = rowMax(metadata_m$lost.var))
+  }) |> purrr::set_names(batch_variables)
+}
+print(batch_magnitude)
+```
+
+### Save SPE
+
+```{r save-sce4}
+print(assayNames(spe))
+print(reducedDimNames(spe))
+fn_spe <- file.path(paths$folder_script, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+saveRDS(spe, fn_spe)
+```

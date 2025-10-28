@@ -1,0 +1,1816 @@
+---
+title: "24_BetaCellsAssociations_cells_Islet"
+author: "Nathan Steenbuck"
+date: "Created: 24 May, 2025; Compiled: `r format(Sys.time(), '%d %b, %Y')`"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+if (rstudioapi::isAvailable()) {
+  script_name <- basename(rstudioapi::getSourceEditorContext()$path)
+} else {
+  script_name <- knitr::current_input()
+}
+
+cur_user <- Sys.info()[["user"]]
+script_name <- "24_BetaCellsAssociations_cells_Islet.Rmd"
+
+if (cur_user == "ubuntu") {
+  source(file.path("/", "mnt", "central_nas", "projects", "type1_diabetes", 
+                   "nathan", "T1D_Vol", "T1D_analysis", "analysis", "helpers.R"))
+  #n_cores <- future::availableCores() - 1
+  n_cores <- 4
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  knitr::opts_knit$set(root_dir = paths$home_data)
+  do_print <- FALSE
+} else {
+  source(file.path("/", "home", "nsteen", "scripts", "T1D_analysis", "analysis", "helpers.R"))
+  n_cores <- 8
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  paths$folder_script <- paths$cluster_folder_script
+  paths$folder_in <- paths$cluster_folder_in
+  paths$folder_out <- paths$cluster_home 
+  knitr::opts_knit$set(root_dir = paths$cluster_home)
+  do_print <- TRUE
+}
+
+seed <- 123456
+set.seed(seed)
+options <- furrr::furrr_options(seed = seed)
+paths$prev <- paste("08_SubclusteringBeta", paths$object_type, paths$panel_type, sep = "_")
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+# **Goal**
+
+# **A0: Settings**
+
+## Load packages
+
+```{r packages, results='hide'}
+suppressPackageStartupMessages(c(
+  library(data.table),
+  library(dplyr),
+  library(SpatialExperiment),
+  library(scuttle),
+  library(parallel),
+  library(patchwork),
+  library(tidyr)
+))
+```
+
+## Paths and settings
+
+```{r settings}
+# Paths
+if (!dir.exists(paths$folder_script)) dir.create(paths$folder_script)
+plotsave_param$path <- paths$folder_script
+plotsave_param_large$path <- paths$folder_script
+
+# Misc settings
+today <- gsub("-", "", Sys.Date())
+```
+
+##  Read in the data
+
+Load the SpatialExperiment (SPE) object saved at the previous step.
+
+```{r load-data}
+fn_spe <- file.path(paths$folder_out, paths$prev, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+spe <- readRDS(fn_spe)
+print(spe)
+```
+
+## Parameters
+
+**Note: this step has to be manually adapted**  
+
+- Define the assay(s) of interest.  
+- Define the markers to keep for marker expression analysis.  
+
+```{r parameters}
+# Censor value for counts scaling
+censor_val <- 0.999
+
+# Select assays and reduced dimensions
+assay_sel <- c("exprs", "scaled")
+writeLines(c("Assay:", assay_sel[assay_sel %in% assayNames(spe)]))
+
+# Variables to plot
+plot_variables <- c("donor_type", "case_id")
+names(plot_variables) <- c("stages", "cases")
+cat("\nVariables to plot:", plot_variables)
+plot_variables_stages <- plot_variables["stages"]
+
+# List of cell types to plot
+celltypes <- names(metadata(spe)$channels)
+names(celltypes) <- celltypes
+
+# Color palette
+palette_ct <- palettes$colors[seq_along(celltypes)]
+names(palette_ct) <- celltypes
+
+# All channels to display
+channels <- unique(unlist(metadata(spe)$channels))
+beta_channels <- metadata(spe)$channels$Beta
+```
+
+# **A1: Prepare Data and Test Association with Age**
+
+## A1.0: Prepare beta-cell expression data.
+```{r prep-data}
+## Cell-type resolved expression.
+metadata_oi <- c("cell_type", "age", "diabetes_duration", "case_id", "image_id", "islet_id", "donor_type",
+                  "distance_to_islet", "BMI", "islet_area", "gender", "race", "batch", "HbA1c", "cell_id", 
+                  "islet_parent", "islet_closest", "cell_category")
+
+exprs_dat <- makePerCellDF(spe, features = channels,
+                           assay.type = "exprs", 
+                           use.coldata = metadata_oi,
+                           use.dimred = FALSE) |> 
+    filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset")) |>
+    filter(cell_type %in% c("Beta", "Alpha", "Delta", "Epsilon", "Gamma", "Endothelial", "IsletLike", "Other", "Ambiguous")) |>
+    mutate(case_id = factor(case_id, levels = metadata(spe)$cases),
+           donor_type = factor(donor_type, levels = metadata(spe)$stages)) |>
+    arrange(cell_type, case_id, donor_type) |> 
+    as_tibble()
+
+## Aggregate by Islet 
+exprs_islet <- exprs_dat |>
+  group_by(across(all_of(metadata_oi))) |>
+  summarize(across(all_of(channels), \(x) mean(x, na.rm = TRUE)), .groups = "drop")
+
+## Aggregate by ROI.
+exprs_image <- exprs_dat |>
+  group_by(image_id, case_id, donor_type, cell_type, 
+           age, gender, batch, BMI, race, 
+            cell_category, diabetes_duration, 
+            HbA1c) |>
+  summarize(across(all_of(channels), \(x) mean(x, na.rm = TRUE)), .groups = "drop")
+```
+
+## A1.1: Marker tests.
+### A1.1.1: Find high expression of ER-stress cells.
+Expression in ER-stress cells, including ambiguous cells. 
+Used to check if highly ER-stressed cells are wrongly assigned. 
+Images were manually checked. 
+Cant seem to find evidence for that.
+-> XBP1: higher in alpha-cells/Endothelial cells.
+
+```{r test-cells-ER-stress}
+## Show ROIs with high XBP1 expression
+exprs_islet |> 
+  select(XBP1, donor_type, cell_type, image_id) |> 
+  filter(cell_type != "Endothelial") |> 
+  arrange(desc(XBP1))
+
+# ROIs just for Endothelial cells:
+exprs_islet |> 
+  select(XBP1, donor_type, cell_type, image_id) |> 
+  filter(cell_type == "Endothelial") |> 
+  arrange(desc(XBP1))
+
+## Show ROIs with high ERN1 expression
+exprs_islet |> 
+  select(ERN1, donor_type, cell_type, image_id) |> 
+  arrange(desc(ERN1))
+```
+
+XBP1: Most high expression in ND/sAAb+. Very few in REC. 
+ERN1: Similar pattern, but more in REC.
+-> If in REC, case 6534.
+-> ERN1 (= IRE1a-P)
+
+### A1.1.2: Identify cases with few beta-cells.
+Delete cases with few beta-cells (< 10 cells) to delete later downstream.
+
+```{r few-beta-cells}
+to_del <- exprs_dat |> 
+  filter(cell_type == "Beta") |> 
+  dplyr::count(case_id, donor_type) |> 
+  arrange(n) |> 
+  filter(n < 10) |> 
+  pull(case_id)
+
+print(to_del)
+print("Cases with less than 10 beta-cells.")
+```
+
+### A1.1.3: How many beta-cell markers are downregulated?
+
+```{r downregulated-beta-markers}
+# How many beta-cell markers are in total upregulated/downregulated? (24/28) across cells.
+# Exceptions: ERN1/Ki67 - usually low signal intensity.
+# ADAR (basically equal, but still lower).
+# B2M, HLA-ABC (higher).
+exprs_dat |> 
+  filter(cell_type == "Beta") |> 
+  group_by(donor_type) |> 
+  summarize(across(all_of(beta_channels), \(x) mean(x, na.rm = TRUE)), .groups = "drop") |> 
+  pivot_longer(cols = all_of(beta_channels), names_to = "channel", values_to = "value") |> 
+  pivot_wider(names_from = donor_type, values_from = value) |> 
+  mutate(difference_rec = RecentOnset - NoDiabetes) |> 
+  mutate(difference_sAAb = `sAAb+` - NoDiabetes) |>
+  mutate(difference_mAAb = `mAAb+` - NoDiabetes) |>
+  arrange(desc(difference_rec)) |> 
+  filter(!channel %in% c("ARX", "PDL1"))
+
+### If we aggregate by case_id + islet_id, then 22/28 are downregulated. 
+### Expections are: HLA-ABC, B2M, ADAR (+), CHGA (+), ERN1, Ki67.
+### Note: Ki67 has hard to detect expression levels in beta-cells (if any). 
+temp <- exprs_dat |> 
+  filter(cell_type == "Beta") |> 
+  group_by(donor_type, case_id, image_id) |> 
+  summarize(across(all_of(beta_channels), \(x) mean(x, na.rm = TRUE)), .groups = "drop") |> 
+  filter(!case_id %in% to_del) |> 
+  group_by(donor_type, case_id) |>
+  summarize(across(all_of(beta_channels), \(x) mean(x, na.rm = TRUE)), .groups = "drop") |>
+  group_by(donor_type) |> 
+  summarize(across(all_of(beta_channels), \(x) mean(x, na.rm = TRUE)), .groups = "drop") |> 
+  pivot_longer(cols = all_of(beta_channels), names_to = "channel", values_to = "value") |> 
+  pivot_wider(names_from = donor_type, values_from = value) |> 
+  mutate(difference_rec = RecentOnset - NoDiabetes) |> 
+  mutate(difference_sAAb = `sAAb+` - NoDiabetes) |>
+  mutate(difference_mAAb = `mAAb+` - NoDiabetes) |>
+  mutate(difference_rec_mAAb = RecentOnset -`mAAb+`) |>
+  mutate(difference_mAAb_sAAb = `mAAb+` - `sAAb+`) |>
+  arrange(desc(difference_rec)) |> 
+  filter(!channel %in% c("ARX", "PDL1"))
+
+temp |> dplyr::count(difference_rec > 0)
+temp |> dplyr::count(difference_mAAb > 0)
+temp |> dplyr::count(difference_sAAb > 0)
+temp |> dplyr::count(difference_rec_mAAb > 0) ## 16 vs 12.
+temp |> dplyr::count(difference_mAAb_sAAb > 0) # 22 vs 6.
+```
+
+For sAAb+ we observe slight indications towards less production of new hormones, i.e. ProINS + IAPP (also detect ProIAPP), but 
+still efficient (even more) efficient than in ND. 
+That is higher levels of INS (slightly), Cpep, and PCSK1.
+Note: all these are not significant, but indicate a trend.
+
+From mAAb+ + REC all are downregulated in comparison to ND. 
+
+Between stages:
+- REC upregulation vs mAAb+: HLA-ABC, B2M, CHGA, ADAR, Ki67, ERN1, CAIX, C3, PCSK1, FoxA2, ECad, NKX2_2, NFkB (N = 12).
+- mAAb+ upregulation vs sAAb+: HLA-ABC, SYP, CD9 (N = 3).
+
+
+### A1.1.4: Dysregulations across stages.
+-> UNUSED CURRENTLY. 
+CONTAINS TESTS FOR MONOTONIC ASSOCIATIONS WITH BAYESIAN APPROACH.
+
+#### Linear models:
+```{r}
+## Test downregulation across ROIs:
+df_roi <- exprs_dat |> 
+  filter(cell_type == "Beta") |> 
+  filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset")) |>
+  group_by(donor_type, case_id, image_id) |>
+  summarize(across(all_of(beta_channels), \(x) mean(x, na.rm = TRUE)), .groups = "drop") |> 
+  pivot_longer(cols = all_of(beta_channels), names_to = "channel", values_to = "expression") |> 
+  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages[1:4], ordered = TRUE)) |> 
+  mutate(donor_type_num = as.numeric(donor_type)) |> 
+  filter(!channel %in% c("PDL1", "Ki67", "ARX"))
+
+## Stop if donor_type is not ordered
+is.ordered(df_roi$donor_type)
+
+## Like this we test for signature contrasts.
+full_contrasts_stages <- purrr::map(beta_channels[!beta_channels %in% c("PDL1", "Ki67", "ARX")], \(channel_oi){
+  message("Testing channel: ", channel_oi)
+  #channel_sym <- rlang::sym(.x); channel_oi <- "PCSK1"
+  test_data <- df_roi |> dplyr::filter(channel == channel_oi)
+
+  lmer_test <- lmerTest::lmer(data = test_data, expression ~ donor_type + (1 | case_id))
+  em <- emmeans::emmeans(lmer_test, ~ donor_type, pbkrtest.limit = 10000)
+  contrasts <- emmeans::contrast(em, method = "consec", adjust = "none", pbkrtest.limit = 10000) |>
+    broom.mixed::tidy() |> mutate(channel = channel_oi) |> select(-null.value)
+
+  # Linear association.  
+  bind_rows(broom::tidy(lmer_test) |> filter(term == "donor_type.L") |> mutate(channel = channel_oi) |> select(-effect, -group) |> mutate(contrast = "Linear"), 
+            contrasts)
+}) |> bind_rows()
+
+
+## Full computed p-values for all channels.
+saab <- full_contrasts_stages |> filter(grepl("^\\(sAAb+", contrast)) |> arrange(p.value) |> mutate(p.adj = p.adjust(p.value, method = "fdr"))
+maab <- full_contrasts_stages |> filter(grepl("^\\(mAAb+", contrast)) |> arrange(p.value) |> mutate(p.adj = p.adjust(p.value, method = "fdr"))
+recent_onset <- full_contrasts_stages |> filter(grepl("^\\RecentOnset", contrast)) |> arrange(p.value) |> mutate(p.adj = p.adjust(p.value, method = "fdr"))
+
+monotonic <- full_contrasts_stages  |> filter(term == "donor_type.L") |> arrange(p.value) |> mutate(p.adj = p.adjust(p.value, method = "fdr"))
+
+## Test for differences across stages with LMM with factor-coding.
+p_vals_progression <- df_roi |> 
+  tidyr::nest(data = -c(channel)) |>
+  mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(data = ., 
+    expression ~ as.numeric(donor_type) + (1 | case_id))))) |>
+  tidyr::unnest(test) |> 
+  filter(term != "(Intercept)", effect == "fixed") |> 
+  mutate(p.adj = p.adjust(p.value, method = "fdr")) |> 
+  select(channel, term, estimate, statistic, p.value, p.adj) |> 
+  arrange(p.adj)
+```
+
+#### Bayesian models:
+```{r bayesian-association}
+bayes_tests <- FALSE
+if (bayes_tests){
+
+  library(tidybayes)
+  library(brms)
+  ## Try different family models (acat, sratio, cumulative).
+  set.seed(222)
+
+  plan(multicore, workers = 8)
+
+  #----- Loop across channels: -----
+  purrr::map(beta_channels, \(.x){
+    # .x <- "PCSK1"
+    # Calculate Bayesian hierarchical model for each channel.
+    model_brms <- brms::brm(
+      expression ~ mo(donor_type) + (1 | case_id),
+      data = df_roi |> filter(channel == .x),
+      family = gaussian(),
+      iter = 2000, warmup = 1000, chains = 4, # Increase iter + warmup later for more stable estimates.
+        seed = 123, future = TRUE, cores = 8, verbose = TRUE
+    )
+    
+    # Significance for model (monotonic association).
+    sexit_result <- bayestestR::sexit(model_brms) |> as_tibble() |> 
+      dplyr::rename("contrast" = Parameter)
+
+    # Extract full posterior draws of marginal means (= donor-type).
+    em <- emmeans::emmeans(model_brms_iapp, ~ donor_type, epred = TRUE, reformula = NA) |> # epred = prediction at response scale; reformula = NA (no random effects)
+      emmeans::contrast(method = "consec", adjust = "none") |> # consecutive comparisons (ND vs sAAb+, sAAb+ vs mAAb+, mAAb+ vs REC ...)
+      tidybayes::gather_emmeans_draws() #extracts the full posterior draws for each contrast 
+
+    # This are the posterior draws for all coefficients. 
+    # posterior::as_draws_df(model_brms_iapp)
+
+    # Define ROPE: This is the width of the region of practical equivalence (ROPE) based on the standard deviation of IAPP expression.
+    ## -> basically null-hypothesis.
+    sd_iapp <- df_roi |> filter(channel == "IAPP") |> summarise(sd = sd(expression)) |> pull(sd)
+    rope_width <- 0.05 * sd_iapp 
+
+  # Run sexit() for each contrast
+  ## That is, we test if the posterior draws of the marginal means are significantly different from the ROPE.
+  ## p-value equivalent for bayesian.
+    probs_df <- em %>%
+      group_by(contrast) %>%
+      summarise(sexit_result = list(bayestestR::sexit(.value, significant = rope_width))) %>%
+      tidyr::unnest_wider(sexit_result)
+
+    bind_rows(probs_df, sexit_result) |> mutate(channel = .x)
+  })
+}
+```
+
+
+## **A1.2: Age-association**
+Sort into age-groups.
+< 13 years, >= 13 years.
+
+Take averaged by Islet expression levels per channel.
+Delete cases with few beta-cells (< 10 cells) to delete later downstream.
+```{r add-endotype}
+channels_oi <- c(metadata(spe)$channels$Beta)
+
+beta_cells <- exprs_image |> 
+  filter(cell_type == "Beta") |> 
+  filter(!case_id %in% to_del) |>
+  select(-cell_type) |> 
+  pivot_longer(cols = all_of(c(channels)), names_to = "channel", values_to = "value") |> 
+  mutate(endotype = case_when(age < 13 ~ "T1D1", TRUE ~ "T1D2")) |>
+  filter(channel %in% channels_oi) |> 
+  # mutate(diabetes_duration = ifelse(is.na(diabetes_duration), 0, diabetes_duration)) |> 
+  mutate(endotype = factor(endotype, levels = c("T1D2", "T1D1"))) |> 
+  filter(!channel %in% c("ARX", "PDL1", "Ki67"))
+```
+
+### A1.2.1: Include diabetes duration as a covariate.
+Run Linear mixed effects model.  
+
+Use REC and test for differences in age-groups. 
+Adjust for diabetes-duration.
+- value ~ endotype + diabetes_duration + (1 | case_id)
+
+```{r age-rec-diabetes-duration}
+# mixed-effects model:
+# compare ND vs REC.
+res_lmm <- beta_cells |> 
+  mutate(channel = ifelse(channel == "ERN1", "IRE1a-P", channel)) |>
+  filter(donor_type == "RecentOnset") |>
+  tidyr::nest(data = -c(channel)) |>
+  dplyr::mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(data = ., 
+    value ~ endotype + diabetes_duration + (1 | case_id))))) |> 
+  tidyr::unnest(test) |> 
+  filter(term !="(Intercept)", effect == "fixed") |>
+  arrange(p.value) |> 
+  mutate(endotype = stringr::str_remove(term, "endotype")) |>
+  filter(!term == "diabetes_duration") |> 
+  mutate(p.adj = p.adjust(p.value, method = "fdr")) |> 
+  mutate(logpadj = -log10(p.adj))
+
+p <- res_lmm |>  
+  filter(p.value < 0.5) |> 
+  mutate(direction = ifelse(estimate < 0, ">= 13 years", "< 13 years")) |>
+  ggplot(aes(x = forcats::fct_reorder(channel, -abs(statistic)), y = logpadj, 
+             fill = direction)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(x = "Channel", y = "-log10(p.adj)") + 
+  mytheme$standard_new() + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") + 
+  scale_fill_manual("Age Group", values = palettes$colors[1:2])
+
+# Effects for young donors.
+fn <- paste0(paste(today, "LMM", "Beta", "T1D1", "RecentOnset", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+print(p)
+
+extfig3e <- p
+saveRDS(extfig3e, file.path(paths$home_git, "figures", "extfig3e.rds"))
+```
+-> Including age by groups yields no significant effects.
+
+### A1.2.1: Run LMM with age as a continuous variable.
+
+Include age as a continuous variable. 
+Include age and donor-type as fixed-effect.
+
+Do not consider disease-duration, as model fit across stage.
+
+```{r age-association-stages-continuous}
+# Subset to beta-cells.
+beta_cells <- exprs_image |> 
+  filter(cell_type == "Beta") |> 
+  filter(donor_type != "LongDuration") |>
+  filter(!case_id %in% to_del) |>
+  select(-cell_type) |> 
+  pivot_longer(cols = all_of(channels), names_to = "channel", values_to = "value") |> 
+  filter(channel %in% channels_oi) |> 
+  # mutate(diabetes_duration = ifelse(is.na(diabetes_duration), 0, diabetes_duration)) |> 
+  filter(!channel %in% c("ARX", "PDL1", "Ki67"))
+
+# mixed-effects model:
+# value ~ age + donor_type + (1 | case_id)
+res_lmm <- beta_cells |> 
+  tidyr::nest(data = -c(channel)) |>
+  dplyr::mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(data = ., 
+    value ~ donor_type + age + (1 | case_id))))) |> 
+  tidyr::unnest(test) |> 
+  filter(term !="(Intercept)", effect == "fixed") |>
+  arrange(p.value) |> 
+  mutate(term = stringr::str_remove(term, "donor_type")) |>
+  filter(!term %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset")) |>
+  mutate(p.adj = p.adjust(p.value, method = "fdr")) |> 
+  mutate(logpadj = -log10(p.adj))
+
+## Plot the results.
+p <- res_lmm |>  
+  mutate(direction = ifelse(estimate > 0, "Younger donors", "Older donors")) |>
+  ggplot(aes(x = forcats::fct_reorder(channel, -abs(statistic)), y = logpadj, fill = direction)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(x = "Channel", y = "log p.adj") + 
+  mytheme$standard_new() + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") + 
+  scale_fill_manual("Age", values = palettes$colors[1:2])
+
+# Effects for young donors.
+fn <- paste0(paste(today, "LMM", "Beta", "T1D1", "Progression", "continuous", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+print(p)
+```
+
+### A1.2.2: Run LMM with age as an ordinal variable.
+Model as above, but age-group as ordinal variable (< 13 years, >= 13 years).
+value ~ endotype + donor_type + (1 | case_id).
+
+```{r age-association-stages-ordinal}
+beta_cells <- exprs_image |> 
+  filter(cell_type == "Beta") |> 
+  filter(donor_type != "LongDuration") |>
+  filter(!case_id %in% to_del) |>
+  select(-cell_type) |> 
+  mutate(endotype = case_when(age < 13 ~ "T1D1", TRUE ~ "T1D2")) |>
+  mutate(endotype = factor(endotype, levels = c("T1D1", "T1D2"))) |>
+  pivot_longer(cols = all_of(channels), names_to = "channel", values_to = "value") |> 
+  filter(channel %in% channels_oi) |> 
+  # mutate(diabetes_duration = ifelse(is.na(diabetes_duration), 0, diabetes_duration)) |> 
+  filter(!channel %in% c("ARX", "PDL1", "Ki67"))
+
+# Mixed-effects model:
+res_lmm <- beta_cells |> 
+  filter(donor_type != "LongDuration") |>
+  tidyr::nest(data = -c(channel)) |>
+  dplyr::mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(data = ., 
+    value ~ donor_type + endotype + (1 | case_id))))) |> 
+  tidyr::unnest(test) |> 
+  filter(term !="(Intercept)", effect == "fixed") |>
+  arrange(p.value) |> 
+  mutate(term = stringr::str_remove(term, "donor_type")) |>
+  filter(!term %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset")) |>
+  mutate(p.adj = p.adjust(p.value, method = "fdr")) |> 
+  mutate(logpadj = -log10(p.adj)) |> 
+  select(channel, effect, term, estimate, p.adj, statistic, logpadj)
+
+# Plot the results.
+p <- res_lmm |>  
+  mutate(channel = ifelse(channel == "ERN1", "IRE1a-P", channel)) |>
+  mutate(direction = ifelse(estimate < 0, "< 13 years", ">= 13 years")) |>
+  ggplot(aes(x = forcats::fct_reorder(channel, -abs(statistic)), y = logpadj, 
+             fill = direction)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(x = expression(beta ~ "-cell marker"), y = "log p.adj") + 
+  mytheme$standard_new() + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") + 
+  scale_fill_manual("Age groups (years)", values = palettes$colors50[c(9, 12)], labels = c("< 13", ">= 13")) +
+  coord_flip() + 
+  theme(legend.position = "top")
+
+# Effects for young donors.
+plotsave_param2 <- plotsave_param
+plotsave_param2$width <- plotsave_param$height
+plotsave_param2$height <- plotsave_param$width
+fn <- paste0(paste(today, "LMM", "Beta", "T1D1", "Progression", "ordinal", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param2))
+print(p)
+
+rev_supplfig1c <- p
+saveRDS(rev_supplfig1c, file.path(paths$home_git, "figures", "rev_supplfig1c.rds"))
+
+## Plot of C3 across stages and age-groups.
+p <- beta_cells |>
+  filter(channel == "C3") |> 
+  mutate(age_group = ifelse(age < 13, "< 13 years", ">= 13 years")) |>
+  group_by(donor_type, age_group, case_id) |>
+  summarize(value = mean(value, na.rm = TRUE), .groups = "drop")  |> 
+  mutate(donor_type = case_when(donor_type == "NoDiabetes" ~ "Control",
+                                donor_type == "sAAb+" ~ "sAAb+",
+                                donor_type == "mAAb+" ~ "mAAb+",
+                                donor_type == "RecentOnset" ~ "Onset")) |>
+  mutate(donor_type = factor(donor_type, levels = c("Control", "sAAb+", "mAAb+", "Onset"))) |>
+  ggplot(aes(x = donor_type, y = value, fill = age_group)) +
+  geom_boxplot(position = position_dodge(width = 0.75), outliers = FALSE) +
+  geom_point(aes(color = age_group), 
+             position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.75), 
+             size = 2, alpha = 0.7) +
+  scale_color_manual(name = "", values = c("black", "black")) +
+  labs(x = "Stage", y = expression(beta ~ "-cell C3 normalized counts")) + 
+  mytheme$standard_new() + 
+  scale_fill_manual("Age groups (years)", values = palettes$colors50[c(9, 12)], labels = c("< 13", ">= 13")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  guides(color = "none") + 
+  theme(legend.position = "top")
+
+print(p)
+fn <- paste0(paste(today, "Boxplot", "Beta", "C3", "AgeGroup", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+rev_supplfig1d <- p
+saveRDS(rev_supplfig1d, file.path(paths$home_git, "figures", "rev_supplfig1d.rds"))
+```
+
+# **A2: Check association with GRS2**
+
+Check expresssion association with higher genetic risk?
+
+## A2.1: Prepare data for GRS2 analysis.
+```{r prepare-data-grs2-analysis}
+# Get unique Case-IDs.
+metadata_oi <- c("case_id", "donor_type", "age", "mIAA", "GADA", "number_of_AAbs",
+                                "IA2A", "ZnT8A", "diabetes_duration", "batch")
+
+case_stages <- colData(spe)[, metadata_oi] |> 
+  as_tibble() |> 
+  dplyr::distinct() |> 
+  mutate(age_group = if_else(age >= 13, "old", "young")) |>
+  mutate(age_group = factor(age_group, levels = c("young", "old"))) |>
+  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages))
+
+# Get GRS2. 
+grs2 <- readxl::read_xlsx(file.path(paths$folder_in, "grs2.xlsx")) |> 
+  dplyr::right_join(case_stages, by = "case_id") |> 
+  dplyr::select(all_of(metadata_oi), age_group, GRS2_score, batch, GRS2_percentile) |> 
+  mutate(GRS2_score = as.numeric(GRS2_score)) |>
+  mutate(GRS2_percentile = as.numeric(GRS2_percentile))
+```
+
+### A2.1.1: Check GRS2 data.
+```{r check-grs2-correlation}
+## Print overview of GRS2 data.
+# 1: How many non-NA/NA values? Barplot per Donor-Type.
+# A: Around 80% have GRS2 data.
+p <- grs2 |> 
+  mutate(is_na = ifelse(is.na(GRS2_score), "NA", "non-NA")) |>
+  dplyr::count(donor_type, is_na) |> 
+    filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration")) |>
+  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages)) |>
+  ggplot(aes(x = donor_type, y = n, fill = as.factor(is_na))) +
+  geom_bar(stat = "identity") +
+  labs(x = "Stage", y = "Count available GRS2 data", fill = "GRS2 Score") +
+  mytheme$standard_new() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# 2. How high are the GRS2 scores across stages? Do Barplots with GRS2 scores per Donor-Type.
+# A: GRS2 scores are as expected higher along progression. sAAb+ barely higher.
+q <- grs2 |> 
+  filter(!is.na(GRS2_score)) |> 
+  filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration")) |>
+  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages)) |>
+  ggplot(aes(x = donor_type, y = GRS2_score)) +
+  geom_boxplot() +
+  geom_point()+
+  labs(x = "Stage", y = "GRS2 Score") +
+  mytheme$standard_new() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# 3. How do they correlate with age?
+# A: higher scroes in REC + sAAb+ (check if non GADAs.)
+r <- grs2 |> 
+  filter(!is.na(GRS2_score)) |> 
+  filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration")) |>
+  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages)) |>
+  ggplot(aes(x = donor_type, y = GRS2_score, fill = age_group)) +
+  geom_boxplot(position = position_dodge(width = 0.9)) +
+  geom_point(position = position_dodge(width = 0.9)) +
+  labs(x = "Stage", y = "GRS2 Score") +
+  mytheme$standard_new() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# 4. Which percentile do they belong to?
+s <- grs2 |> 
+  filter(!is.na(GRS2_score)) |> 
+  filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration")) |>
+  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages)) |>
+  ggplot(aes(x = donor_type, y = GRS2_percentile, fill = age_group)) +
+  geom_boxplot(position = position_dodge(width = 0.9)) +
+  geom_point(position = position_dodge(width = 0.9)) +
+  labs(x = "Stage", y = "GRS2 Percentile") +
+  mytheme$standard_new() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  ylim(0, 100)
+
+# For sAAb+: Which auto-antibodies donors have which grs2 scores. 
+# We have 4 with GADA and GRS2_percentiles >= 20. 
+# mIAA GRS2s are low.
+p_sAAb <- grs2 |> 
+  filter(donor_type == "sAAb+") |> 
+  pivot_longer(cols = c("GADA", "IA2A", "ZnT8A", "mIAA"), 
+             names_to = "autoantibody", values_to = "titer") |>
+  filter(titer == "1") |> 
+  mutate(autoantibody = factor(autoantibody, 
+                                levels = c("GADA", "IA2A", "ZnT8A", "mIAA"))) |>
+  ggplot(aes(y = GRS2_percentile, x = autoantibody, fill = age_group)) +
+  geom_boxplot(position = position_dodge(width = 0.75), outliers = FALSE) +
+  geom_point(aes(color = age_group), 
+             position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.75), 
+             size = 2, alpha = 0.7) + 
+  mytheme$standard_new() + 
+  scale_color_manual(values = palettes$colors[1:2]) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  
+
+# 6. How does GRS2 correlate with diabetes duration in this dataset?
+# A: They are midly correlated. Take into account.
+rec <- grs2 |> 
+  filter(donor_type == "RecentOnset") |> 
+  ggplot(aes(x = diabetes_duration, y = GRS2_percentile, fill = age_group)) +
+  geom_point(aes(color = age_group)) + 
+  mytheme$standard_new() + 
+  geom_smooth(method = "lm", se = FALSE, aes(color = age_group)) +
+  scale_color_manual(values = palettes$colors[1:2]) +
+  labs(x = "Diabetes Duration (years)", y = "GRS2 Percentile") + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+fig <- cowplot::plot_grid(p, q, r, s, p_sAAb, rec, ncol = 3, nrow = 2)
+fn <- paste0(paste(today, "GRS2", "Barplot", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, fig), plotsave_param_large))
+print(fig)
+```
+
+## A2.2: Check association of GRS2 with beta-cell markers.
+
+```{r check-grs2-association}
+## Set Factors. Set caucasian as base level (largest group in dataset).
+beta_cells <- exprs_image |> 
+  left_join(grs2, by = c("case_id", "donor_type", "age", "diabetes_duration", "batch")) |>
+  filter(cell_type == "Beta") |> 
+  filter(donor_type != "LongDuration") |>
+  filter(!case_id %in% to_del) |>
+  select(-cell_type) |> 
+  pivot_longer(cols = all_of(channels), names_to = "channel", values_to = "value") |> 
+  filter(channel %in% channels_oi) |> 
+  # mutate(diabetes_duration = ifelse(is.na(diabetes_duration), 0, diabetes_duration)) |> 
+  filter(!channel %in% c("ARX", "PDL1", "Ki67"))
+
+# Mixed-effects model:
+# No effect of GRS2 percentile on beta-cell markers in recent-onsets. Tried in different combinations.
+# e.g. by adding disease_duration, age_group.
+res_lmm <- beta_cells |> 
+  filter(donor_type == "RecentOnset") |>
+  tidyr::nest(data = -c(channel)) |>
+  dplyr::mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(data = ., 
+    value ~ GRS2_percentile + (1 | case_id))))) |> 
+  tidyr::unnest(test) |> 
+  filter(term !="(Intercept)", effect == "fixed") |> 
+  arrange(p.value) |> 
+  mutate(p.adj = p.adjust(p.value, method = "fdr")) |> 
+  mutate(logpadj = -log10(p.adj)) |> 
+  select(channel, effect, term, estimate, p.value, p.adj, statistic, logpadj) |> 
+  arrange(desc(logpadj))
+
+## FIXME: add barplot figure if required.
+res_lmm
+```
+
+-> No major effects of GRS2 on beta-cell markers in recent-onsets.
+Also, tested influnece in sAAb+. Similarly, no major effects.
+
+# **A3: Check association with other co-variates**
+
+Check expression across stages, i.e. NoDiabetes, sAAb+, mAAb+, RecentOnset, and check for association to:
+**race (ethnicity)**, **gender (sex)**, **BMI**, **Overweight**, i.e. BMI >= 25 vs < 25, and **BMIhigh**, i.e. obese (BMI >= 30).
+Also, **ICU_time**, **cold-ischemia time** (=transit_time_minutes) and **cause-of-death**.
+Note: only 10 total cases with BMI >= 30, so this is barely robust.
+
+Other co-variates are warm-ischemia, life-style and treatment were not tested. 
+These were either not available or too diverse to test.
+
+## **A3.1: Add additional co-variates.**
+
+First: Load in full metadata, which also contains the covariates such as serotypes, ICU time, cold-ischemia time.
+These are all downloaded from the nPOD dataportal. (Time: 2025-06-01).
+
+```{r check-metadata-oi}
+library(childsds)
+
+# downtime minutes = NA everywhere.
+# 
+case_stages <- colData(spe)[, c("case_id", "donor_type", "age", "race", "gender", "diabetes_duration", "BMI")] |> 
+  as_tibble() |> 
+  dplyr::distinct() |> 
+  mutate(age_group = if_else(age >= 13, "old", "young")) |>
+  mutate(age_group = factor(age_group, levels = c("young", "old"))) |>
+  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages))
+
+fn_cases_full <- file.path(paths$folder_in, "cases_full.xlsx")
+cases_full <- readxl::read_excel(fn_cases_full) |> 
+  mutate(case_id = as.character(case_id)) |> 
+  select(age_years, height_cm, weight_kg,
+        case_id, BMI, transit_time_minutes, ICU_time_days, cause_of_death, 
+        clinical_history, admission_course, hemodiluted_status, case_recovery_type) |> 
+  right_join(case_stages, by = c("case_id")) |> 
+  select(-BMI.x) |> 
+  dplyr::rename(BMI = "BMI.y") |> 
+  mutate(transfusion = ifelse(grepl("transfusion|Transfusion", admission_course), "Yes", "No")) |>
+  mutate(transfusion = ifelse(hemodiluted_status == "Yes", "Yes", transfusion))
+
+cases_full |> dplyr::count(transfusion)
+
+## 2 cases are missing. CVID-19 cases.
+cases_full <- cases_full |> 
+  filter(case_id %in% metadata(spe)$cases)
+```
+
+
+## A3.1.1: Calculate BMI percentiles.
+BMI needs to be age-adjusted for pediatric cases for more accurate classification.
+Use the CDC reference data to calculate BMI percentiles.
+
+Split into < 20 years and >= 20 years.
+Use the `childsds` package to calculate BMI percentiles.
+
+```{r cdc-bmi-percentiles}
+library(childsds)
+pediatric_cases <- cases_full |> 
+  filter(age < 20) |> 
+  arrange(age) |> 
+  select(case_id, age, BMI, height_cm, gender, weight_kg)
+
+pediatric_cases$bmi_percentile <- sds(pediatric_cases$BMI, 
+   age = pediatric_cases$age, 
+   sex = pediatric_cases$gender, 
+   male = "Male", female = "Female", 
+   ref = cdc.ref, 
+   item = "bmi", 
+   type = "perc")
+
+pediatric_cases <- pediatric_cases |> 
+  mutate(class_weight = case_when(bmi_percentile < 0.05 ~ "Underweight",
+                                 (bmi_percentile >= 0.05 & bmi_percentile < 0.85) ~ "Healthy weight",
+                                 (bmi_percentile >= 0.85 & bmi_percentile < 0.95) ~ "Overweight",
+                                  bmi_percentile >= 0.95 ~ "Obese"))     
+
+non_pediatric_cases <- cases_full |> 
+  filter(age_years >= 20) |> 
+  arrange(age_years) |> 
+  select(case_id, age_years, BMI) |> 
+  mutate(class_weight = case_when(BMI < 18.5 ~ "Underweight",
+                                 (BMI >= 18.5 & BMI < 25) ~ "Healthy weight",
+                                 (BMI >= 25 & BMI < 30) ~ "Overweight",
+                                  BMI >= 30 ~ "Obese"))
+
+bmi_cases <- bind_rows(pediatric_cases, non_pediatric_cases) |> 
+  select(case_id, class_weight) |> 
+  arrange(case_id)
+```
+
+## A3.1.2: Clean Data and add metadata.
+Join Data. Clean Data further.
+```{r clean-data}
+## Clean data.
+beta_cell_image <- exprs_image |> 
+  left_join(cases_full) |> 
+  left_join(bmi_cases, by = "case_id") |>
+  mutate(transit_time_minutes = stringr::str_remove(transit_time_minutes, ".00 minutes")) |> 
+  mutate(ICU_time_days = stringr::str_remove(ICU_time_days, " days")) |> 
+  mutate(transit_time_minutes = abs(as.numeric(transit_time_minutes)),
+         ICU_time_days = as.numeric(ICU_time_days))
+
+## Set Factors. Set caucasian as base level (largest group in dataset).
+beta_cells <- beta_cell_image |> 
+  filter(cell_type == "Beta") |> 
+  mutate(Overweight = ifelse(class_weight %in% c("Overweight", "Obese"), "High", "Normal")) |>
+  mutate(Obese = ifelse(class_weight == "Obese", "High", "Normal")) |>
+  mutate(Overweight = factor(Overweight, levels = c("Normal", "High"))) |>
+  mutate(Obese = factor(Obese, levels = c("Normal", "High"))) |>
+  dplyr::rename(ethnicity = "race", sex = "gender") |> 
+  mutate(ethnicity = factor(ethnicity, levels = c("Caucasian", "Hispanic_Latino", "African_American"))) |>
+  filter(donor_type != "LongDuration") |>
+  filter(!case_id %in% to_del) |>
+  select(-cell_type) |> 
+  pivot_longer(cols = c(channels), names_to = "channel", values_to = "value") |> 
+  filter(channel %in% channels_oi) |> 
+  # mutate(diabetes_duration = ifelse(is.na(diabetes_duration), 0, diabetes_duration)) |> 
+  filter(!channel %in% c("ARX", "PDL1", "Ki67")) |> 
+  mutate(cause_of_death = case_when(
+    "Anoxia" == cause_of_death ~ "Anoxia",
+    grepl("Head Trauma", cause_of_death) ~ "Head Trauma",
+    grepl("DKA", cause_of_death) ~ "DKA",
+    grepl("Other", cause_of_death) ~ "Other",
+    TRUE ~ "Other"
+  )) |> 
+  mutate(cause_of_death = factor(cause_of_death, 
+    levels = c("Anoxia", "Head Trauma", "DKA", "Other"))) |> 
+  mutate(age_group = case_when(
+    age < 13 ~ "young",
+    age >= 13 ~ "old"
+  )) |> 
+  mutate(age_group = factor(age_group, levels = c("young", "old"))) |> 
+  mutate(sex = factor(sex, levels = c("Male", "Female")))  |> 
+  mutate(drug_use = ifelse(
+      grepl("Drug|drug|Alcohol|alcohol|MDMA|Amphetamine|amphetamine|Meth|meth|Marihuana|mariuhana|Cocaine|cocaine|Heroin|heroin|Crack|crack|Benzo|benzo|Nicotine|nicotine|smoking|Smoking", clinical_history), "yes", "no")) |> 
+  mutate(case_recovery_type = factor(case_recovery_type, levels = c("Organ Donor", "DCD Organ Donor"))) |> 
+  mutate(channel = ifelse(channel == "ERN1", "IRE1a-P", channel))
+
+beta_cells |> dplyr::distinct(case_id, drug_use) |> dplyr::count(drug_use)
+beta_cells |> dplyr::distinct(case_id, Obese, donor_type) |> dplyr::count(Obese, donor_type)
+beta_cells |> dplyr::distinct(case_id, Overweight, donor_type) |> dplyr::count(Overweight, donor_type)
+```
+
+
+## A3.2: Run LMM with co-variates.
+
+Test association of beta-cell expression with the co-variates.
+Use linear mixed-effects model.
+**- value ~ covariate + donor_type + (1 | case_id)**
+-> same results if adding "batch" as covariate.
+
+```{r check-metadata-lmm}
+metadata_oi <- c("BMI", "Overweight", "Obese", "ethnicity", "sex", 
+                 "transit_time_minutes", "ICU_time_days", "cause_of_death", "drug_use")
+
+# Mixed-effects model:
+res_lmm <- purrr::map(metadata_oi, \(covariate){
+  message("Testing covariate: ", covariate)
+  formula <- as.formula(paste("value ~ ", covariate, "+ age_group + donor_type + (1 | case_id)"))
+
+  if (covariate %in% c("transit_time_minutes", "ICU_time_days")) {
+    formula <- as.formula(paste0("value ~ log1p(", covariate, ") + age_group + donor_type + (1 | case_id) + (1 | batch)"))
+  }
+
+  res_lmm <- beta_cells |> 
+    tidyr::nest(data = -c(channel)) |>
+    dplyr::mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(data = ., 
+      formula)))) |> 
+    tidyr::unnest(test) |> 
+    filter(term !="(Intercept)", effect == "fixed") |>
+    arrange(p.value) |> 
+    mutate(term = stringr::str_remove(term, "donor_type")) |>
+    filter(!term %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset")) |>
+    mutate(p.adj = p.adjust(p.value, method = "fdr")) |> 
+    mutate(logpadj = -log10(p.adj)) |> 
+    mutate(covariate = covariate) |>
+    select(channel, effect, term, estimate, p.adj, statistic, covariate, logpadj)
+  res_lmm
+}) |> bind_rows() |>
+  arrange(covariate, desc(logpadj)) 
+
+res_lmm <- res_lmm |> 
+  mutate(covariate = factor(covariate, levels = metadata_oi))
+```
+
+## A3.3: Plot results 
+### A3.3.1: Plot results of the linear mixed-effects model.
+Plot results of the linear mixed-effects model.
+Use this as a supplementary figure, not Extended Figure.
+```{r plot-covariate-results, fig.width=15, fig.height=10}
+p <- res_lmm |>
+  filter(term != "age_groupT1D2") |> 
+  mutate(direction = ifelse(estimate > 0, "Higher", "Lower")) |>
+  ggplot(aes(x = forcats::fct_reorder(channel, -abs(statistic)), y = logpadj, 
+             fill = direction, color = term)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(x = "Channel", y = "-log10(p.adj)") + 
+  mytheme$standard_new() + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") + 
+  scale_fill_manual("Direction", values = palettes$colors[1:2]) +
+  facet_wrap(~ covariate, scales = "free_y", axes = "all")
+
+fn <- paste0(paste(today, "LMM", "Beta", "T1D1", "Progression", "covariates", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+print(p)
+```
+
+Heatmap-like:
+```{r heatmap-like}
+# Build a matrix-like grid: one row per feature, one column per (covariate×level) or numeric covariate
+panel <- res_lmm  |> 
+  mutate(channel = ifelse(channel == "ERN1", "IRE1a-P", channel)) |>
+  filter(term != "age_groupold") |> 
+  mutate(term = stringr::str_remove(term, "cause_of_death")) |>
+  mutate(term = stringr::str_remove(term, "Obese|ethnicity|Overweight|sex")) |>
+  mutate(col_key = if_else(is.na(term),
+                           covariate,                       
+                           paste(covariate, term, sep = ":")),
+        neglog10_p = -log10(p.adj),
+        sig = p.adj < 0.05,
+        direction = sign(estimate)) |> 
+  select(channel, col_key, estimate, p.adj, neglog10_p, sig) |> 
+  dplyr::mutate(col_key = stringr::str_remove(col_key, "BMI:|ICU_time_days:|transit_time_minutes:")) |> 
+  mutate(col_key = ifelse(col_key == "log1p(transit_time_minutes)", "log(Organ transit time)", col_key)) |> 
+  mutate(col_key = ifelse(col_key == "log1p(ICU_time_days)", "log(ICU time)", col_key)) |> 
+  mutate(col_key = ifelse(col_key == "cause_of_death:DKA", "Cause of death:DKA", col_key)) |> 
+  mutate(col_key = ifelse(col_key == "cause_of_death:Head Trauma", "Cause of death:Trauma", col_key)) |>
+  mutate(col_key = ifelse(col_key == "cause_of_death:Other", "Cause of death:Other", col_key)) |>
+  mutate(col_key = stringr::str_replace(col_key, "ethnicity", "Ethnicity")) |>
+  mutate(col_key = stringr::str_replace(col_key, "Obese:High", "Obese: >= 95 % BMI")) |> 
+  mutate(col_key = stringr::str_replace(col_key, "Overweight:High", "Overweight: >= 85 % BMI")) |> 
+  mutate(col_key = stringr::str_replace(col_key, "drug_use:drug_useyes", "Drug use: Yes"))
+
+p <- ggplot(panel, aes(col_key, channel, fill = neglog10_p)) +
+  geom_tile() +
+  scale_fill_distiller(
+    palette = "Blues",
+    direction = 1,                 # light → dark blue as values increase
+    limits = c(0, 1.5),                  # cap anything > thr at the top color
+    labels = c(0, 0.6, 1.2),
+    breaks = c(0, 0.6, 1.2),
+    na.value = "grey90",
+    guide = guide_colorbar(title.position = "top")
+  )+ 
+  labs(x = "Covariate : Level (or Numeric Covariate)", y = expression(beta ~ "-cell marker"),
+       fill = "-log10(p.adj)") +
+  mytheme$large_new() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+fn <- paste0(paste(today, "Heatmap", "EffectSize", "Covariates", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+print(p)
+
+rev_supplfig1a <- p
+saveRDS(p, file.path(paths$home_git, "figures", "rev_supplfig1a.rds"))
+```
+
+```{r}
+beta_cells |> 
+  tidyr::nest(data = -c(channel)) |>
+  mutate(test = purrr::map(data, 
+    \(.x) broom::tidy(lmerTest::lmer(data = .x, value ~  donor_type + age_group + cause_of_death + (1 | case_id))))) |> 
+  unnest(test) |> 
+  filter(effect == "fixed", term != "(Intercept)") |> arrange(p.value)
+
+beta_cells |> 
+  tidyr::nest(data = -c(channel)) |>
+  mutate(test = purrr::map(data, 
+    \(.x) broom::tidy(lmerTest::lmer(data = .x, value ~  donor_type + age_group + transit_time_minutes + (1 | case_id))))) |> 
+  unnest(test) |> 
+  filter(effect == "fixed", term != "(Intercept)") |> arrange(p.value)
+
+beta_cells |> 
+  tidyr::nest(data = -c(channel)) |>
+  mutate(test = purrr::map(data, 
+    \(.x) broom::tidy(lmerTest::lmer(data = .x, value ~  donor_type + age_group + ICU_time_days + (1 | case_id))))) |> 
+  unnest(test) |> 
+  filter(effect == "fixed", term != "(Intercept)") |> arrange(p.value)
+
+beta_cells |> 
+  tidyr::nest(data = -c(channel)) |>
+  mutate(test = purrr::map(data, 
+    \(.x) broom::tidy(lmerTest::lmer(data = .x, value ~ donor_type + age_group + case_recovery_type + (1 | case_id))))) |> 
+  unnest(test) |> 
+  filter(effect == "fixed", term != "(Intercept)") |> arrange(p.value)
+
+beta_cells |> 
+  tidyr::nest(data = -c(channel)) |>
+  mutate(test = purrr::map(data, 
+    \(.x) broom::tidy(lmerTest::lmer(data = .x, value ~ donor_type + age_group + sex + Overweight + (1 | case_id))))) |> 
+  unnest(test) |> 
+  filter(effect == "fixed", term != "(Intercept)") |> arrange(p.value)
+```
+
+```{r}
+save_final_spe <- FALSE
+if (save_final_spe){
+  fn_cases_full <- file.path(paths$folder_in, "cases_full.xlsx")
+  cases_full <- readxl::read_excel(fn_cases_full) |> 
+    mutate(case_id = as.character(case_id)) |> 
+    select(age_years, height_cm, weight_kg,
+          case_id, BMI, transit_time_minutes, ICU_time_days, cause_of_death, 
+          clinical_history, admission_course, hemodiluted_status, case_recovery_type)
+
+  cases_full_sub <- cases_full |> 
+    mutate(cause_of_death = case_when(
+      "Anoxia" == cause_of_death ~ "Anoxia",
+      grepl("Head Trauma", cause_of_death) ~ "Head Trauma",
+      grepl("DKA", cause_of_death) ~ "DKA",
+      grepl("Other", cause_of_death) ~ "Other",
+      TRUE ~ "Other"
+    )) |> 
+    mutate(cause_of_death = factor(cause_of_death, 
+      levels = c("Anoxia", "Head Trauma", "DKA", "Other"))) |> 
+    mutate(drug_use = ifelse(
+        grepl("Drug|drug|Alcohol|alcohol|MDMA|Amphetamine|amphetamine|Meth|meth|Marihuana|mariuhana|Cocaine|cocaine|Heroin|heroin|Crack|crack|Benzo|benzo|Nicotine|nicotine|smoking|Smoking", clinical_history), "yes", "no")) |> 
+    mutate(case_recovery_type = factor(case_recovery_type, levels = c("Organ Donor", "DCD Organ Donor"))) |> 
+    select(-c(hemodiluted_status, admission_course, clinical_history))
+
+  cases_full_sub <- cases_full_sub |> inner_join(bmi_cases, by = "case_id") |> 
+    mutate(transit_time_minutes = stringr::str_remove(transit_time_minutes, ".00 minutes")) |> 
+    mutate(ICU_time_days = stringr::str_remove(ICU_time_days, " days")) |> 
+    mutate(transit_time_minutes = abs(as.numeric(transit_time_minutes)),
+          ICU_time_days = as.numeric(ICU_time_days)) |> 
+    select(-BMI)
+
+  coldata_spe <- as_tibble(colData(spe)) |> 
+    mutate(age_group = case_when(
+      age < 13 ~ "< 13",
+      age >= 13 ~ ">= 13"
+    )) |> 
+    mutate(age_group = factor(age_group, levels = c("< 13", ">= 13")))
+
+  new_coldata <- coldata_spe |> left_join(cases_full_sub, by = c("case_id"))
+
+  ## Beta-cell.
+  sds <- readRDS(file.path(paths$folder_out, "28_PseudotimeAnalysisBeta_cells_Islet", paste0("cells", "_", "beta", "_", "Slingshot", ".rds")))
+  sds_coldata <- as_tibble(colData(sds)[, colnames(colData(sds)) != "slingshot"]) |> 
+    select(cell_id, pseudotime, case_id) |> 
+    dplyr::rename(pseudotime_beta = pseudotime) |> 
+    dplyr::mutate(pseudotime_beta = (pseudotime_beta - min(pseudotime_beta)) / (max(pseudotime_beta) - min(pseudotime_beta)))
+
+  final_coldata <- new_coldata |> 
+    left_join(sds_coldata, by = c("case_id", "cell_id"))
+
+  ## Correct ordering.
+  ordering_cells <- colData(spe)$cell_id
+  final_coldata_df <- DataFrame(final_coldata)
+  rownames(final_coldata_df) <- final_coldata_df$cell_id
+  final_coldata_df <- final_coldata_df[ordering_cells, ]
+
+  colData(spe) <- final_coldata_df
+
+  saveRDS(spe, file.path(paths$home_git, "data", "spe_Islet_full.rds"))
+}
+```
+
+**-> Results are not majorly changed by any potential confounding variable; including proxies for either cold or warm ischemia time!!**
+
+### A3.3.2: Transit-time vs HLA-ABC/IAPP.
+
+```{r}
+library(RColorBrewer); library(rstatix); library(ggpubr)
+temp_cols <- brewer.pal(n = 8, name = "Dark2")
+
+palettes$cause_of_death <- c("Anoxia" = temp_cols[1], 
+                             "Trauma" = temp_cols[2],
+                             "DKA" = temp_cols[3], 
+                             "Other" = temp_cols[4])
+
+palettes$stages2 <- palettes$stages
+names(palettes$stages2) <- c("Control", "sAAb+", "mAAb+", "Onset")
+
+p <- beta_cells |> 
+  filter(channel %in% c("HLA_ABC", "IAPP", "IRE1a-P")) |> 
+  group_by(case_id, donor_type, channel) |> 
+  summarize(transit_time_minutes = mean(transit_time_minutes, na.rm = TRUE), 
+            value = mean(value, na.rm = TRUE), .groups = "drop") |>
+    mutate(donor_type = case_when(
+    donor_type == "NoDiabetes" ~ "Control",donor_type == "sAAb+" ~ "sAAb+",
+    donor_type == "mAAb+" ~ "mAAb+", donor_type == "RecentOnset" ~ "Onset"
+  )) |>
+  mutate(donor_type = factor(donor_type, levels = c("Control", "sAAb+", "mAAb+", "Onset"))) |>
+  ggplot(aes(x = log1p(transit_time_minutes), y = value, color = donor_type)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = TRUE) + 
+  stat_cor(aes(label = ..r.label..), r.digits = 2, r.accuracy = 0.01,
+           method = "spearman", label.x.npc = "left", label.y.npc = 1, size = 10) +
+  labs(x = "log1p: Organ transit time (minutes)", y = expression(beta ~ "-cell normalized counts")) +
+  mytheme$large_new() +
+  scale_color_manual(name = "Stage", values = palettes$stages2) + 
+  facet_wrap(~ channel, scales = "free_y", axes = "all") + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+q <- beta_cells |> 
+  filter(channel %in% c("HLA_ABC", "IAPP", "IRE1a-P")) |> 
+  mutate(cause_of_death = ifelse(cause_of_death == "Head Trauma", "Trauma", as.character(cause_of_death))) |>
+  group_by(case_id, donor_type, channel, cause_of_death) |> 
+  summarize(value = mean(value, na.rm = TRUE), .groups = "drop") |> 
+    mutate(donor_type = case_when(
+    donor_type == "NoDiabetes" ~ "Control",donor_type == "sAAb+" ~ "sAAb+",
+    donor_type == "mAAb+" ~ "mAAb+", donor_type == "RecentOnset" ~ "Onset"
+  )) |>
+  mutate(donor_type = factor(donor_type, levels = c("Control", "sAAb+", "mAAb+", "Onset"))) |>
+  ggplot(aes(x = donor_type, y = value, fill = cause_of_death)) +
+  geom_boxplot(position = position_dodge(width = 0.75), outliers = FALSE) +
+  geom_point( position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.75), 
+             size = 2, alpha = 0.7) + 
+  mytheme$large_new() +
+  facet_wrap(~ channel, scales = "free_y", axes = "all") + 
+  scale_fill_manual(name = "Cause of death", values = palettes$cause_of_death) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  labs(x = "Stage", y = expression(beta ~ "-cell normalized counts"))
+
+fig <- p + q + 
+  plot_layout(nrow = 2, guides = "collect")
+
+plotsave_param_large2 <- plotsave_param_large
+plotsave_param_large2$height <- 500
+
+fn <- paste0(paste(today, "TransitTime", "HLA_ABC", "IAPP", "ERN1", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, fig), plotsave_param_large2))
+print(fig)
+
+rev_supplfig1b <- fig
+saveRDS(rev_supplfig1b, file.path(paths$home_git, "figures", "rev_supplfig1b.rds"))
+```
+
+
+
+### A3.3.2: Obesity vs HLA-ABC/IAPP.
+
+We observed lower HLA-ABC expression in overweight donors (BMI >= 85 % percentile).
+Plot scatterplot of HLA-ABC vs BMI + grouped boxplot across disease stages. 
+We generally expect more inflammation in obese individuals.
+
+```{r obesity-hla-abc}
+summary(lmerTest::lmer(value ~ donor_type + Overweight + age_group + (1 | case_id), data = beta_cells |> filter(channel == "HLA_ABC")))
+
+beta_cells |> 
+  tidyr::nest(data = -c(channel)) |>
+  dplyr::mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(data = ., 
+    value ~ donor_type + log1p(ICU_time_days) + age_group + (1 | case_id)
+  )))) |> 
+  tidyr::unnest(test) |> 
+  filter(term !="(Intercept)", effect == "fixed") |> 
+  arrange(p.value)
+
+p <- beta_cells |> 
+  filter(channel == "HLA_ABC") |> 
+  group_by(case_id, donor_type) |> 
+  summarize(BMI = mean(BMI, na.rm = TRUE), 
+            value = mean(value, na.rm = TRUE), .groups = "drop") |>
+  ggplot(aes(x = BMI, y = value, color = donor_type)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  geom_vline(xintercept = 25, linetype = "dashed", color = "black") +
+  geom_vline(xintercept = 30, linetype = "dashed", color = "black") +
+  labs(x = "BMI", y = "HLA-ABC expression") +
+  mytheme$standard_new() +
+  scale_color_manual(values = palettes$stages)
+
+print(p)
+fn <- paste0(paste(today, "HLA_ABC", "BMI", "Scatterplot", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+## HLA-ABC with Overweight.
+p <- beta_cells |> 
+  filter(channel == "HLA_ABC") |> 
+  group_by(case_id, donor_type, Overweight) |> 
+  summarize(value = mean(value, na.rm = TRUE), .groups = "drop") |>
+  ggplot(aes(x = donor_type, y = value, fill = Overweight)) +
+  geom_boxplot(position = position_dodge(width = 0.75)) +
+  geom_point(aes(color = Overweight), 
+             position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.75), 
+             size = 2, alpha = 0.7) +
+  labs(x = "Donor Type", y = "beta-cells HLA-ABC normalized counts") +
+  mytheme$standard_new() +
+  scale_fill_manual(values = palettes$colors[1:2]) +
+  scale_color_manual(values = c("black", "black")) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+print(p)
+fn <- paste0(paste(today, "HLA_ABC", "BMI", "Boxplot", "Overweight", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+## IAPP with Overweight.
+p <- beta_cells |> 
+  filter(channel == "IAPP") |> 
+  group_by(case_id, donor_type, Overweight) |> 
+  summarize(value = mean(value, na.rm = TRUE), .groups = "drop") |>
+  ggplot(aes(x = donor_type, y = value, fill = Overweight)) +
+  geom_boxplot(position = position_dodge(width = 0.75)) +
+  geom_point(aes(color = Overweight), 
+             position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.75), 
+             size = 2, alpha = 0.7) +
+  labs(x = "Donor Type", y = "beta-cells IAPP normalized counts") +
+  mytheme$standard_new() +
+  scale_fill_manual(values = palettes$colors[1:2]) +
+  scale_color_manual(values = c("black", "black")) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+print(p)
+fn <- paste0(paste(today, "IAPP", "BMI", "Boxplot", "Overweight", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+# **A.3: GADA titers**
+
+## A3.1: Load GADA titers and summarize.
+```{r load-gada-titers}
+aab_titers <- readxl::read_xlsx(file.path(paths$folder_in, "titers_AAb.xlsx")) |> 
+  dplyr::rename(gada_index = `GADA Index`, ia2a_index = `IA-2A Index`,
+                znt8_index = `ZnT8A Index`, mIAA_index = `IAA Index`, case_id = "CaseID",
+                gada_pos = "GADA", ia2a_pos = "IA2A", znt8a_pos = "ZnT8A",
+                mIAA_pos = "mIAA") |> 
+  mutate(case_id = as.character(case_id)) |>
+  dplyr::right_join(case_stages, by = "case_id") |> 
+  dplyr::left_join(cases_full, by = c("case_id", "age", "race", "gender", "diabetes_duration", "BMI", "age_group", "donor_type")) |>
+  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages)) |>
+  mutate(age_group = factor(age_group, levels = c("young", "old"))) |> 
+  filter(!is.na(gada_index) | gada_index != "NA") |> 
+  dplyr::rename("number_of_AAbs" = `nb Antibody`)
+
+# summarize and group - as for 6496 we have two GADA titers (there are very close together).
+gada_titers <- aab_titers |> 
+  filter(gada_pos == "Positive") |> 
+  select(case_id, number_of_AAbs, gada_index, donor_type, age, age_group, transfusion, gada_pos) |> 
+  group_by(case_id, donor_type, age, age_group, gada_pos, number_of_AAbs) |> 
+  summarize(gada_index = mean(gada_index, na.rm = TRUE), .groups = "drop")
+
+gada_titers |> print(n = "all")
+```
+
+
+## A3.2: Test correlation of GADA titers with beta-cell marker expressions.
+
+```{r test-beta-gada-titers}
+### Correlation with beta-cell expression levels.
+gada_df <- beta_cells |> 
+  inner_join(gada_titers, by = c("case_id", "donor_type", "age", "age_group"))
+  #  |> filter(age_group == "old")
+
+# LMM for GADA index association with beta-cell markers.
+gada_df |>
+  filter(donor_type == "sAAb+") |>
+  filter(!is.na(ICU_time_days) & !is.na(gada_index))
+
+res_lmm_gada_saab <- gada_df |>
+  filter(donor_type == "sAAb+") |>
+  mutate(ICU_time_days = ifelse(is.na(ICU_time_days), mean(ICU_time_days, na.rm = TRUE), ICU_time_days)) |>
+  mutate(cause_of_death = ifelse(cause_of_death == "Head Trauma", "Trauma", cause_of_death)) |>
+  tidyr::nest(data = -c(channel)) |>
+  dplyr::mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(data = ., 
+    value ~ log1p(gada_index) + cause_of_death + age_group + (1 | case_id))))) |> 
+  tidyr::unnest(test) |> 
+  filter(term !="(Intercept)", effect == "fixed") |> 
+  mutate(term_donor = paste(term, "sAAb+", sep = "_")) |> 
+  arrange(p.value) |> 
+  select(channel, term, term_donor, estimate, p.value)
+
+res_lmm_gada_saab |> 
+  filter(term == "log1p(gada_index)") |> 
+  mutate(p.adj = p.adjust(p.value, method = "fdr"))
+
+res_lmm_gada_maab <- gada_df |>
+  filter(donor_type == "mAAb+") |>
+  tidyr::nest(data = -c(channel)) |>
+  dplyr::mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(data = ., 
+    value ~ log1p(gada_index) + age_group + transfusion + (1 | case_id))))) |> 
+  tidyr::unnest(test) |> 
+  filter(term !="(Intercept)", effect == "fixed") |> 
+  arrange(p.value) |> 
+  mutate(term_donor = paste(term, "mAAb+", sep = "_")) |> 
+  select(channel, term, term_donor, estimate, p.value)
+
+res_lmm_gada <- res_lmm_gada_saab |> 
+  inner_join(res_lmm_gada_maab, by = c("channel", "term")) |>
+  filter(grepl("gada_index", term)) |>
+  select(channel, term, p.value.x, estimate.x, estimate.y, p.value.y, term_donor.x, term_donor.y) |> 
+  arrange(p.value.x, p.value.y)
+
+channels_test <- res_lmm_gada |> 
+  filter(p.value.x < 0.2 | p.value.y < 0.2) |>
+  pull(channel)
+```
+
+Test correlation of GADA titers with HbA1c.
+There are no associations of GADA titers with HbA1c in mAAb+ donors.
+
+### A3.2.1: Plot association of GADA titers with beta-cell markers.
+```{r gada-titers-association-barplot}
+res_lmm_gada_long <- res_lmm_gada |> 
+  filter(term == "log1p(gada_index)") |>
+  pivot_longer(cols = c("p.value.x", "p.value.y"), 
+             names_to = "p.value_type", values_to = "p.value") |> 
+  pivot_longer(cols = c("estimate.x", "estimate.y"), 
+             names_to = "estimate_type", values_to = "estimate") |>
+  pivot_longer(cols = c("term_donor.x", "term_donor.y"), 
+             names_to = "term_donor_type", values_to = "term_donor") |> 
+  filter((p.value_type == "p.value.x" & 
+         estimate_type == "estimate.x" & 
+         term_donor_type == "term_donor.x") |
+         (p.value_type == "p.value.y" & 
+         estimate_type == "estimate.y" & 
+         term_donor_type == "term_donor.y")) |>
+  select(-c(p.value_type, estimate_type))  |> 
+  distinct(channel, term, term_donor, estimate, p.value, term_donor)
+
+p <- res_lmm_gada_long |>
+  mutate(direction = ifelse(estimate < 0, "Lower Exp", "Higher Exp")) |>
+  group_by(term_donor) |> 
+  mutate(p.adj = p.adjust(p.value, method = "fdr")) |> 
+  ungroup() |> 
+  mutate(term_donor = factor(term_donor, 
+    levels = c("log1p(gada_index)_sAAb+", "log1p(gada_index)_mAAb+"))) |>
+  mutate(logpadj = -log10(p.adj)) |> 
+  ggplot(aes(x = forcats::fct_reorder(channel, -logpadj), y = logpadj, fill = direction)) +
+  geom_bar(stat = "identity") + 
+  labs(x = "Channel", y = "-log10(p.adj)") + 
+  mytheme$standard_new() + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") + 
+  facet_wrap(~term_donor, scales = "free_y")
+
+print(p)
+fn <- paste0(paste(today, "GADA", "Association", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+
+
+### A.3.2.2: How many markers are upregulated / downregulated in association with GADA titers?
+```{r}
+#### sAAb+:
+res_lmm_gada_long |> 
+  filter(term == "log1p(gada_index)") |> 
+  filter(term_donor == "log1p(gada_index)_sAAb+")  |> 
+  select(channel, estimate, p.value) |> 
+  mutate(direction = ifelse(estimate < 0, "Downregulated", "Upregulated")) |> 
+  group_by(direction) |> 
+  summarise(n = n())
+
+## Upregulated: 5 ( CD9, ProINS, SYP SYP, NKX2.2, ATPIF1, HLA-ABC)
+  # -> All very low association. 
+
+## Downregulated: 22
+  # -> Everything else.
+#---------------------------------------------------------------------
+#### mAAb+:
+res_lmm_gada_long |> 
+  filter(term == "log1p(gada_index)") |> 
+  filter(term_donor == "log1p(gada_index)_mAAb+")  |> 
+  select(channel, estimate, p.value) |> 
+  mutate(direction = ifelse(estimate < 0, "Downregulated", "Upregulated")) |> 
+  dplyr::count(direction)
+
+## Upregulated: 22... vs 5 downregulated. 
+res_lmm_gada_long |> 
+  filter(term == "log1p(gada_index)") |> 
+  filter(term_donor == "log1p(gada_index)_mAAb+")  |> 
+  select(channel, estimate, p.value) |> 
+  arrange(p.value)
+```
+
+### A.3.2.3: Scatterplots of GADA titers vs beta-cell marker expressions.
+```{r}
+## Correlation between TXNIP and other markers and GADA-titers.
+purrr::map(beta_cells |> distinct(channel) |> pull(channel), \(channel_oi) {
+  message("Testing channel: ", channel_oi)
+  p <- gada_df |> 
+    filter(channel == !!channel_oi) |> 
+    group_by(donor_type, case_id, age_group, ICU_time_days, number_of_AAbs) |> 
+    summarize(gada_index = mean(gada_index, na.rm = TRUE),
+              value = mean(value, na.rm = TRUE), .groups = "drop") |> 
+    # filter(age_group == "old") |>
+    # filter(number_of_AAbs == "2") |> 
+    ggplot(aes(x = log10(gada_index), y = value, color = log10(ICU_time_days))) +
+    geom_point(aes(shape = age_group)) + 
+    geom_smooth(method = "lm", se = TRUE, alpha = 0.03) + 
+    ggpubr::stat_cor(method = "spearman", label.x.npc = "left", label.y.npc = "top") +
+    labs(x = "GADA Index", y = paste0(channel_oi, " Expression")) + 
+    mytheme$standard_new() + 
+    # scale_color_manual(values = c("black", "red"), name = "Age Group", labels = c("< 13", ">= 13")) + 
+    scale_color_continuous(type = "viridis") + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+    facet_wrap(~donor_type, scales = "free_y")
+
+  fn <- paste0(paste(today, "GADA", "Association", channel_oi, sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param))
+  print(p)
+})
+```
+
+Unadjusted p-values:
+sAAb+: 
+ - < 0.001: TXNIP, 
+ - < 0.01: NFkB, XBP1.
+ - 0.01 - 0.1: PAX, PCSK1, IAPP, NKX6.1
+
+mAAb+: 
+- < 0.0001: HLA-ABC, 
+- < 0.001: NKX2.2 (??), 
+- < 0.1: ADAR, ProINS (upregulation ??), B2M, MX1, WFS1 
+
+RecentOnset:
+- no major associations.
+
+Note: 
+sAAb+: 25 sAAb+ GADA+ (1 condition)
+mAAb+: 9 GADA+ (4 conditions).
+RecentOnset: X GADA (11 conditions).
+
+Limitations: - TXNIP is very hard to detect in beta-cells, as levels are generally low.
+
+
+### A.3.2.4: Plot results for sAAb+ donors.
+
+```{r }
+###
+gada_df_oi <- gada_df |> 
+  filter(channel %in% c("TXNIP", "XBP1", "NFkB", "HLA_ABC", "ProINS", "NKX6_1")) |>
+  mutate(channel = factor(channel, 
+    levels = c("TXNIP", "XBP1", "NFkB", "NKX6_1", "ProINS", "HLA_ABC"))) |>
+  filter(donor_type %in% c("sAAb+"))
+
+p <- gada_df_oi |> 
+  # mutate(transfusion = ifelse(is.na(transfusion), "Unknown", transfusion)) |>
+  mutate(cause_of_death = ifelse(cause_of_death == "Head Trauma", "Trauma", cause_of_death)) |>
+  group_by(donor_type, case_id, age_group, channel, ICU_time_days, number_of_AAbs, cause_of_death) |> 
+  summarize(gada_index = mean(gada_index, na.rm = TRUE),
+            value = mean(value, na.rm = TRUE), .groups = "drop") |> 
+  mutate(gada_index = log1p(gada_index)) |>
+  ggpubr::ggscatter(x = "gada_index", y = "value", 
+                    add = "reg.line",  color = "age_group", # Add regression line
+                    add.params = list(color = "blue", fill = "lightgray"), # Customize reg. line
+                    conf.int = TRUE, size = 5) + # Add confidence interval
+  ggpubr::stat_cor(size = 10, method = "spearman", aes(label = ..r.label..), 
+                   label.x.npc = "left", label.y.npc = "top", r.accuracy = 0.01) +
+  mytheme$large_new() + 
+  # scale_color_manual(values = c("black", "red"), name = "Age Group", labels = c("< 13", ">= 13")) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  facet_wrap( ~ channel, scales = "free_y", axes = "all") + 
+  labs(x = "log10: GADA Index", 
+       y = expression(beta ~ "-cell normalized counts")) + 
+  scale_color_manual(values = palettes$colors50[c(9, 12)], name = "Age groups (years)", labels = c("< 13", ">= 13"))
+print(p)
+
+fn <- paste0(paste(today, "GADA", "Association", "sAAb+", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+saveRDS(p, file.path(paths$home_git, "figures", "rev_supplementaryfig7.rds"))
+
+
+## p-values sAAB+:
+res_lmm_gada_long |> 
+  filter(term == "log1p(gada_index)") |> 
+  filter(term_donor == "log1p(gada_index)_sAAb+") |> 
+  mutate(p.adj = p.adjust(p.value, method = "fdr")) |>
+  filter(channel %in% c("TXNIP", "HLA_ABC", "XBP1", "NFkB", "ProINS", "NKX6_1")) |> 
+  select(channel, estimate, p.value, p.adj) |> 
+  arrange(p.value)
+```
+
+
+
+## A.3.2.5: Check TXNIP expression in beta-cells.
+Check TXNIP expression in beta-cells across stages and age-groups.
+FIXME: delete later.
+```{r}
+# Examples for TXNIP expression in beta-cells. 
+exprs_dat |> 
+  select(image_id, donor_type, cell_type, TXNIP, cell_category)   |> 
+  filter(cell_category %in% c("islet")) |> 
+  group_by(image_id, donor_type) |> 
+  summarise(txnip = mean(TXNIP, na.rm = TRUE)) |> 
+  arrange(desc(txnip))
+
+tt <- gada_df |> 
+  filter(channel == "TXNIP") |> 
+  select(image_id, value, donor_type, age, BMI, gada_pos) |> 
+  arrange(desc(value)) |> 
+  pull(image_id)
+
+tt[1:30]
+
+beta_cells |> 
+  filter(channel == "TXNIP") |> 
+  group_by(case_id, donor_type, age, BMI) |> 
+  summarize(value = mean(value, na.rm = TRUE)) |> 
+  arrange(desc(value)) |> 
+  print(n = "all")
+
+# Examples for TXNIP expression in beta-cells. 
+gada_df |> 
+  filter(channel == "NFkB") |> 
+  select(image_id, value, donor_type, age, BMI, gada_pos) |> 
+  arrange(desc(value)) |> 
+  print(n = 30)
+
+# Check: 6397_Islet_070, 6362_Islet_061, 6420_Islet_023, 6123_Islet_005, 6421_Islet_002,
+# 6421_Islet_001, 6301_Islet_030, 6520_Islet_044, 6090_Islet_001, 6090_Islet_002
+# 6421_Islet_026, 6151_Islet_001, 6538_Islet_001, 6090_Islet_003, 6421_Islet_012
+# 6367_Islet_057, 6048_Islet_001, 6123_Islet_002, 6123_Islet_050, 6421_Islet_003
+```
+
+
+#### Load images and masks
+
+```{r viz-cDC-clust-select}
+all_channels <- rownames(spe)
+
+viz_clust <- NULL # c(22, 21, 9) # c(21, 9, 11, 12, 2, 20, 1, 5, 3, 4)
+viz_method <- "cell_type"
+viz_assay <- "scaled"
+```
+
+```{r viz-lympho-cluster-load}
+viz_clust <- TRUE
+if (!is.null(viz_clust)) {
+  nb_images <- 14
+  image_extension <- ".tiff"
+  clust_name <- viz_method
+  
+  # Subset the SCE
+  sce_viz <- spe
+
+  set.seed(seed)
+
+  image_sub <- sort(sample(
+    unique(sce_viz$image_fullname),
+    min(length(unique(sce_viz$image_fullname)), nb_images)))
+  
+  image_sub <- unique(c(image_sub, 
+    c("6397_Islet_ROI_070.tiff", "6362_Islet_ROI_061.tiff", "6420_Islet_ROI_023.tiff", "6123_Islet_ROI_005.tiff", "6421_Islet_ROI_002.tiff",
+    "6421_Islet_ROI_001.tiff", "6301_Islet_ROI_030.tiff", "6520_Islet_ROI_044.tiff", "6090_Islet_ROI_001.tiff", "6090_Islet_ROI_002.tiff",
+    "6421_Islet_ROI_026.tiff", "6151_Islet_ROI_001.tiff", "6538_Islet_ROI_001.tiff", "6090_Islet_ROI_003.tiff", "6421_Islet_ROI_012.tiff",
+    "6367_Islet_ROI_057.tiff", "6048_Islet_ROI_001.tiff", "6123_Islet_ROI_002.tiff", "6123_Islet_ROI_050.tiff", "6421_Islet_ROI_003.tiff"
+    )))
+
+  # Folders
+  folder_images <- file.path(paths$folder_in, "img", paths$panel_type)
+  folder_masks <- file.path(paths$folder_in, "masks_cells",
+                            paths$panel_type, "whole-cell")
+  
+  images <- cytomapper::loadImages(file.path(folder_images, image_sub))
+  cytomapper::channelNames(images) <- all_channels
+  # Add image names to metadata
+  mcols(images)$ImageName <- names(images)
+  mcols(images)$ImageName <- paste0(mcols(images)$ImageName)
+
+  # Load images and masks
+  #images <- yoloader(
+  #  x = sce_viz,
+  #  image_dir = folder_images,
+  #  image_names = image_sub,
+  #  type = "stacks"
+  #)
+
+  masks <- yoloader(
+    x = sce_viz,
+    image_dir = folder_masks,
+    image_names = image_sub,
+    as.is = TRUE,
+    type = "masks"
+  )
+  
+  sce_viz <- sce_viz[, sce_viz$image_fullname %in% image_sub]
+  sce_viz$ImageName <- gsub(image_extension, "", sce_viz$image_fullname)
+}
+```
+
+### Cytoviewer app.
+```{r cytoviewer}
+library(cytoviewer)
+sce_viz[[clust_name]] <- as.factor(sce_viz[[clust_name]])
+app <- cytoviewer(image = images, 
+                  mask = masks, 
+                  object = sce_viz,
+                  img_id = "ImageName", 
+                  cell_id = "cell_number")
+
+if (interactive()) {
+  # shiny::runApp(app)
+}
+```
+
+## A.3.3: Spillover-free test for TXNIP.
+
+Remove beta-cells that are next to Acinar cells, 
+and then test again for association.
+
+```{r}
+spe_sub_sub <- spe[, spe$cell_type %in% c("Beta", "Acinar")]
+
+## Aggregate across 
+spe_sub_agg <- imcRtools::aggregateNeighbors(
+  spe_sub_sub,
+  "neighborhood",
+  aggregate_by = c("metadata"),
+  count_by = "cell_type",
+  proportions = FALSE,
+  assay_type = NULL,
+  subset_row = NULL,
+  statistic = c("mean", "median", "sd", "var"),
+  name = NULL
+)
+
+### 
+spe_sub_agg <- spe_sub_agg[, spe_sub_agg$cell_type == "Beta"]
+
+### Now, subset to only Beta-cells that are NOT next to Acinar cells.
+table(spe_sub_agg$aggregatedNeighbors$Acinar)
+
+spe_sub_agg_free <- spe_sub_agg[, spe_sub_agg$aggregatedNeighbors$Acinar == 0]
+spe_sub_agg_with <- spe_sub_agg[, spe_sub_agg$aggregatedNeighbors$Acinar > 0]
+```
+
+```{r}
+channels_oi <- metadata(spe)$channels$Beta
+channels <- channels_oi[!channels_oi %in% c("PDL1", "Ki67", "ARX")]
+
+spillover_free <- scuttle::makePerCellDF(spe_sub_agg_free, features = channels, assay.type = "exprs", 
+        use.coldata = c("case_id", "image_id", "donor_type", "age"), use.dimred = FALSE) |> 
+  filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset")) |>
+  mutate(case_id = factor(case_id, levels = metadata(spe)$cases),
+         donor_type = factor(donor_type, levels = metadata(spe)$stages)) |>
+  mutate(age_group = if_else(age >= 13, "old", "young")) |> 
+  mutate(age_group = factor(age_group, levels = c("young", "old")))  |> 
+  arrange(case_id, donor_type) |> 
+  as_tibble()
+
+with_pot_spillover <- scuttle::makePerCellDF(spe_sub_agg_with, features = channels, assay.type = "exprs", 
+        use.coldata = c("case_id", "image_id", "donor_type", "age"), use.dimred = FALSE) |> 
+  filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset")) |>
+  mutate(case_id = factor(case_id, levels = metadata(spe)$cases),
+         donor_type = factor(donor_type, levels = metadata(spe)$stages)) |>
+  mutate(age_group = if_else(age >= 13, "old", "young")) |> 
+  mutate(age_group = factor(age_group, levels = c("young", "old")))  |> 
+  arrange(case_id, donor_type) |> 
+  as_tibble()
+```
+
+## Run mixed linear model for each channel.
+
+```{r}
+res_lmm_free <- spillover_free |> 
+  group_by(case_id, image_id, donor_type, age_group) |> 
+  summarise(across(all_of(channels), ~ mean(.x, na.rm = TRUE)), .groups = "drop") |> 
+  pivot_longer(cols = all_of(channels), 
+               names_to = "channel", values_to = "value") |>
+  tidyr::nest(data = -channel) |> 
+  dplyr::mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(data = ., 
+    value ~ donor_type + age_group + (1 | case_id))))) |> 
+  tidyr::unnest(test)  |> 
+  filter(term != "(Intercept)", effect == "fixed")
+
+res_lmm_free |> filter(channel %in% c("NFkB", "TXNIP", "XBP1", "IAPP")) |> arrange(p.value)
+```
+
+```{r}
+res_lmm_with <- with_pot_spillover |> 
+  group_by(case_id, image_id, donor_type, age_group) |> 
+  summarise(across(all_of(channels), ~ mean(.x, na.rm = TRUE)), .groups = "drop") |> 
+  pivot_longer(cols = all_of(channels), 
+               names_to = "channel", values_to = "value") |>
+  tidyr::nest(data = -channel) |> 
+  dplyr::mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(data = ., 
+    value ~ donor_type + age_group + (1 | case_id))))) |> 
+  tidyr::unnest(test)  |> 
+  filter(term != "(Intercept)", effect == "fixed")
+
+res_lmm_with |> filter(channel %in% c("NFkB", "TXNIP", "XBP1", "IAPP")) |> arrange(p.value)
+```
+
+Do observe p.value drop for TXNIP, but 
+
+-> Again observe that p.value drop for TXNIP, but not for other channels.
+
+
+### Add GADA titers.
+```{r load-gada-titers}
+metadata_oi <- c("case_id", "donor_type", "age", "mIAA", "GADA", "number_of_AAbs",
+                                "IA2A", "ZnT8A", "diabetes_duration", "batch")
+
+case_stages <- colData(spe)[, metadata_oi] |> 
+  as_tibble() |> 
+  dplyr::distinct() |> 
+  mutate(age_group = if_else(age >= 13, "old", "young")) |>
+  mutate(age_group = factor(age_group, levels = c("young", "old"))) |>
+  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages))
+
+
+aab_titers <- readxl::read_xlsx(file.path(paths$folder_in, "titers_AAb.xlsx")) |> 
+  dplyr::rename(gada_index = `GADA Index`, ia2a_index = `IA-2A Index`,
+                znt8_index = `ZnT8A Index`, mIAA_index = `IAA Index`, case_id = "CaseID",
+                gada_pos = "GADA", ia2a_pos = "IA2A", znt8a_pos = "ZnT8A",
+                mIAA_pos = "mIAA") |> 
+  mutate(case_id = as.character(case_id)) |>
+  dplyr::right_join(case_stages, by = "case_id") |> 
+  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages)) |>
+  mutate(age_group = factor(age_group, levels = c("young", "old"))) |> 
+  filter(!is.na(gada_index) | gada_index != "NA")
+
+# summarize and group - as for 6496 we have two GADA titers (there are very close together).
+gada_titers <- aab_titers |> 
+  filter(gada_pos == "Positive", donor_type == "sAAb+") |> 
+  select(case_id, gada_index, donor_type, age, age_group, GADA, batch) |> 
+  group_by(case_id, donor_type, age, age_group, GADA, batch) |> 
+  summarize(gada_index = mean(gada_index, na.rm = TRUE), .groups = "drop")
+
+gada_titers |> 
+  print(n = "all")
+```
+
+Test correlation of GADA titers with beta-cell marker expressions.
+
+```{r test-beta-gada-titers}
+### Correlation with beta-cell expression levels.
+gada_df <- spillover_free |> 
+  inner_join(gada_titers, by = c("case_id", "donor_type", "age", "age_group")) |> 
+  select(case_id, image_id, donor_type, age_group, gada_index, batch, all_of(channels)) |>
+  group_by(case_id, image_id, donor_type, age_group, gada_index, batch) |> 
+  summarise(across(all_of(channels), ~ mean(.x, na.rm = TRUE)), .groups = "drop") |> 
+  pivot_longer(cols = all_of(channels), 
+               names_to = "channel", values_to = "value") |> 
+  inner_join(cases_full |> distinct(case_id, transfusion), by = "case_id")
+  #  |> filter(age_group == "old")
+
+# LMM for GADA index association with beta-cell markers.
+## Similar results, both with batch blocking and without.
+res_lmm_gada <- gada_df |> 
+  tidyr::nest(data = -c(channel)) |>
+  dplyr::mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(data = ., 
+    value ~ log1p(gada_index) + transfusion + age_group + (1 | case_id))))) |> 
+  tidyr::unnest(test) |> 
+  filter(term !="(Intercept)", effect == "fixed") |> 
+  arrange(p.value)
+
+channels_test <- res_lmm_gada |> 
+  filter(term == "log1p(gada_index)") |>
+  mutate(p.adj = p.adjust(p.value, method = "fdr")) |> 
+  mutate(logpadj = -log10(p.adj)) |> 
+  select(channel, effect, term, estimate, p.value, p.adj, statistic, logpadj) |> 
+  arrange(desc(logpadj)) |> 
+  filter(p.value < 0.2) |>
+  pull(channel)
+
+res_lmm_gada |> 
+  filter(term == "log1p(gada_index)") |>
+  mutate(p.adj = p.adjust(p.value, method = "fdr")) |> filter(p.adj < 0.05)
+```
+
+
+```{r}
+## Correlation between TXNIP and other markers and GADA-titers.
+purrr::map(channels_test, \(channel_oi) {
+  message("Testing channel: ", channel_oi)
+  p <- gada_df |> 
+    filter(channel == !!channel_oi) |> 
+    group_by(donor_type, case_id, age_group, transfusion) |> 
+    summarize(gada_index = mean(gada_index, na.rm = TRUE),
+              value = mean(value, na.rm = TRUE), .groups = "drop") |> 
+    # (age_group == "old") |>
+    ggplot(aes(x = log1p(gada_index), y = value)) +
+    geom_point(aes(color = age_group, shape = transfusion)) + 
+    geom_smooth(method = "lm", se = TRUE) + 
+    ggpubr::stat_cor(method = "spearman", label.x.npc = "left", label.y.npc = "top") +
+    labs(x = "log1p: GADA Index", y = paste0(channel_oi, " Expression")) + 
+    mytheme$standard_new() + 
+    scale_color_manual(values = c("black", "red"), name = "GADA Positive") + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+  fn <- paste0(paste(today, "GADA", "Association", channel_oi, "acinarfree", sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param))
+  print(p)
+})
+```
+
+**-> Importantly, TXNIP corelation to GADA index even after removing
+many beta-cells, which may show POTENTIAL spillover from acinar cells.**

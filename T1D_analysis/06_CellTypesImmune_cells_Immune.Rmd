@@ -1,0 +1,1493 @@
+---
+title: "06_CellTypesImmune_cells_Immune"
+author: "Nicolas Damond, Nathan Steenbuck"
+date: "Created: 08 June, 2022; Compiled: `r format(Sys.time(), '%d %b, %Y')`"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+```{r setup, include=FALSE}
+if (rstudioapi::isAvailable()) {
+  script_name <- basename(rstudioapi::getSourceEditorContext()$path)
+} else {
+  script_name <- knitr::current_input()
+}
+
+cur_user <- Sys.info()[["user"]]
+script_name <- "06_CellTypesImmune_cells_Immune.Rmd"
+
+if (cur_user == "ubuntu") {
+  source(file.path("/", "mnt", "central_nas", "projects", 
+    "type1_diabetes", "nathan", "T1D_Vol", "T1D_analysis", 
+    "analysis", "helpers.R"))
+  #n_cores <- future::availableCores() - 1
+  n_cores <- 4
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  knitr::opts_knit$set(root_dir = paths$home_data)
+  do_print <- FALSE
+} else {
+  source(file.path("/", "home", "nsteen", "scripts", "T1D_analysis", "analysis", "helpers.R"))
+  n_cores <- 8
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  paths$folder_script <- paths$cluster_folder_script
+  paths$folder_in <- paths$cluster_folder_in
+  paths$folder_out <- paths$cluster_home 
+  knitr::opts_knit$set(root_dir = paths$cluster_home)
+  do_print <- TRUE
+}
+
+seed <- 123456
+set.seed(seed)
+options <- furrr::furrr_options(seed = seed)
+paths$prev <- paste("05_CellCategories", paths$object_type, paths$panel_type, sep = "_")
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+# **Goal**
+
+In scripts 05 to 08, cell types are attributed to all cells in the dataset
+in an iterative way:
+
+- `05_CellCategories_cells_Immune`: Attribution of main cell categories 
+(immune, islet, exocrine, ...).
+- `06_CellTypesImmune_cells_Immune`(this script): Attribution of main cell 
+types to immune cells (Lymphocyte, Myeloid, Neutrophil).
+- `07_ClustersImmune_cells_Immune`: Further separation of immune cell types 
+into clusters.
+- `08_CellTypesNonImmune_cells_Immune`: Attribution of cell types
+to non-immune cells (Beta, Alpha, Exocrine, ...).
+- `08_CellTypesIslet_cells_Immune`: Re-attribution of islet cells
+to cell types based on clustering results from the previous step.
+- `08_CellTypesIslet_cells_ImmuneII`: Attribution of rare & specific immune cell clusters
+like T-reg and T-EMRAs.
+
+Specifically, the goal of the current script is to attribute immune cell types 
+to cells that have been attributed the `immune` category in the previous 
+script.
+
+This is performed in several steps:
+
+1. Unsupervised clustering using two approaches (*i)* PhenoGraph and (*ii)* 
+Shared-nearest neighbors (SNN) + Leiden community detection on two different 
+count transformations (`exprs` and `scaled`). Only immune cell markers are used
+for clustering.
+
+2. For each of the four clustering results (two approaches X two count 
+transformations), clusters are manually merged into cell categories based on
+marker expression.
+
+3. Consensus cell categories are attributed by majority vote: if the cell 
+type is the same for three or more of the four approaches, this category is 
+attributed to the cell. If not, the cell is categorized as `ambiguous`.
+
+Concretely, immune cells are divided in the following "cell types": 
+`Lymphocyte`, `Myeloid`, `Neutrophil`, and `Other`. These cell types are stored
+in the `colData(spe)$cell_type` column.
+
+In the next script, Lymphocytes will be further separated into more specific
+cell types (`T_CD4`, `B`, `NK`, ...).
+
+
+# **Settings**  
+
+## Load packages
+
+```{r packages, results='hide'}
+suppressPackageStartupMessages(c(
+  library(data.table),
+  library(dplyr),
+  library(SpatialExperiment),
+  library(parallel),
+  library(purrr),
+  library(furrr)
+))
+```
+
+## Paths and settings
+
+```{r settings}
+# Paths
+if (!dir.exists(paths$folder_script)) dir.create(paths$folder_script)
+plotsave_param$path <- paths$folder_script
+plotsave_param_large$path <- paths$folder_script
+
+# Misc settings
+today <- gsub("-", "", Sys.Date())
+```
+
+##  Read in the data
+
+Load the SpatialExperiment (SPE) object saved at the previous step.
+
+```{r load-data}
+fn_spe <- file.path(paths$folder_out, paths$prev, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+spe <- readRDS(fn_spe)
+print(spe)
+```
+
+
+## Methods and assays
+
+Select channels (`channels_clust`), assays (`assay_sel`) and clustering methods (`methods_sel`) to use.
+
+```{r select-methods-assays}
+methods_sel <- c("Pheno2", "Leiden2")
+
+assay_sel <- c("fastMNN_case_id", "scaled")
+names(assay_sel) <- c("exprs", "scaled")
+writeLines(c("Assays:", assay_sel[assay_sel %in% assayNames(spe)]))
+
+dimred_sel <- c("UMAP") # , "tSNE")
+writeLines(c("\nReduced dimensions:", dimred_sel))
+
+channels <- rownames(spe)[!(grepl("DNA|H3", rownames(spe)))]
+cat(c("\nChannels:", channels[channels %in% rownames(spe)]))
+cat(c("\nNumber of channels:", length(channels)))
+all_channels <- rownames(spe)
+```
+
+### Select the channels for clustering
+
+Only immune cell markers are used for clustering.
+
+```{r select-channels-clustering}
+channels_clust <- c("MPO", "CD16", "CD11b", "HLA_DR", "CS", "CD57", "CD163",
+                    "CD20", "CD45RA", "CD56", "CD54", "CD3e", "CD11c", "ATP5A",
+                    "CD73", "CD7", "GranB", "LDHA", "TMEM173", "CD45RO", "HK1",
+                    "CD27", "CD8a", "PD1", "FoxP3", "Arg1", "CD103", "CD4",
+                    "CD204", "TIM3", "CD303", "CD206", "CD66b", "CD15")
+cat(c("\nChannels used for unsupervised clustering:",
+      channels_clust[channels_clust %in% rownames(spe)]))
+```
+
+## Extract immune cells
+
+The clustering is performed only on immune cells (`sce_imm`).
+
+```{r spe-extract}
+# Extract the metadata (to avoid conflicts when merging the SCEs)
+meta <- metadata(spe)
+spatial_coords <- spatialCoords(spe)
+colpairs <- colPairs(spe)
+```
+
+```{r extract-immune-cells}
+# Subset the SPE (immune cells only)
+sce_imm <- spe[channels_clust, spe$cell_category == "immune"]
+
+# Convert to SingleCellExperiment
+sce_imm <- as(sce_imm, "SingleCellExperiment")
+```
+
+
+
+# **Dimensionality reduction**
+
+Dimensionality reduction is performed on immune cells only.
+
+
+## Packages
+
+Change the path to the FIt-SNE source file below if needed.  
+
+```{r packages2, results='hide'}
+suppressPackageStartupMessages(c(
+  library(ggplot2),
+  library(uwot),
+  library(scuttle),
+  library(viridis)
+))
+#source(file.path("", "home", "ubuntu", "Git", "FIt-SNE", "fast_tsne.R"),
+#       chdir = TRUE)
+```
+
+## Run dimensionality reduction
+
+### Remove existing dimreds
+
+```{r remove-reduced-dims}
+reducedDims(sce_imm) <- NULL
+```
+
+### Run UMAP
+
+UMAP for every selected assay, only if there is no object with the same name in `reducedDimNames(sce_imm)`.  
+
+```{r run-UMAP}
+purrr::walk(assay_sel, \(cur_assay) {
+  dimred_name <- paste("UMAP", "immune", cur_assay, sep = "_")
+  print(dimred_name)
+  
+  # Run UMAP
+  if ((!dimred_name %in% reducedDimNames(sce_imm)) & ("UMAP" %in% dimred_sel)) {
+    cur_umap <- uwot::umap(t(assay(sce_imm, cur_assay)),
+                             n_threads = n_cores)
+    colnames(cur_umap) <- c("UMAP1", "UMAP2")
+    rownames(cur_umap) <- colnames(assay(sce_imm, cur_assay))
+    reducedDim(sce_imm, dimred_name) <<- cur_umap
+  }
+})
+```
+
+### Subset SCE
+
+```{r subset-sce-imm}
+## Select 90.000 cells for Leiden2-clustering
+# Cells per case
+nb_cells <- 1000
+
+# Subset the SPE object (nb_cells per case)
+set.seed(seed)
+cell_subset <- as_tibble(cbind(rn = rownames(colData(sce_imm)),
+                                case_id = colData(sce_imm)$case_id)) |> 
+  group_by(case_id) |>
+  sample_n(nb_cells, replace = TRUE) |>
+  pull(rn) |>
+  unique()
+
+# Keep the subset cell ids in SPE metadata
+meta[["subset_immune"]] <- sort(as.vector(cell_subset))
+```
+
+```{r subset-sce-imm2}
+sce_sub <- sce_imm[channels_clust, colnames(sce_imm) %in% meta$subset_immune]
+sce_not <- sce_imm[channels_clust, !(colnames(sce_imm) %in% colnames(sce_sub))]
+```
+
+
+## Plot marker expression
+
+```{r plot-dimred-channels, fig.height=10, fig.width=15}
+purrr::walk(assay_sel, \(cur_assay) {
+  purrr::walk(dimred_sel, \(cur_dimred) {
+    dimred_name <- paste(cur_dimred, "immune", cur_assay, sep = "_")
+
+    # Prepare the data
+    cur_dat <- scuttle::makePerCellDF(sce_sub,
+                                      features = channels_clust,
+                                      exprs_values = cur_assay,
+                                      use_dimred = TRUE) |>
+      dplyr::select(c(all_of(channels_clust), 
+      paste0(dimred_name, ".1"), paste0(dimred_name, ".2")))
+
+    cur_dat <- cur_dat |>
+      tidyr::pivot_longer(cols = all_of(channels_clust),
+                          names_to = "channel",
+                          values_to = cur_assay)
+    
+    # Plot marker expression
+    p <- plot_dim_red_channels(cur_dat, dimred_name, cur_assay,
+                               channels) # , force.points = TRUE)
+
+    fn <- paste0(paste(today, dimred_name, "Channels", sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param_large))
+    if (do_print) print(p)
+  })
+})
+```
+
+
+
+# **Clustering**
+
+Unsupervised clustering is performed by generating a nearest-neighbor graph followed by community detection (using either Louvain or Leiden algorithms).
+
+## Settings
+
+### Load packages
+
+```{r packages3, results='hide'}
+suppressPackageStartupMessages(c(
+  library(scater),
+  library(scran),
+  library(igraph),
+  library(Rphenoannoy),
+  library(clustree),
+  library(patchwork),
+  library(ranger),
+  library(foreach),
+  library(doParallel),
+  library(BiocParallel)
+))
+```
+
+
+## **Clustering: PhenoGraph**
+
+Unsupervised clustering is performed with the [PhenoGraph](https://doi.org/10.1016/j.cell.2015.05.047) algorithm. 
+This method works by generating a nearest-neighbor (kNN) graph of phenotpyic similarities followed by Louvain community dectection. 
+For speed, we run PhenoGraph using the [Rphenoannoy implementation](https://github.com/stuchly/Rphenoannoy).
+
+```{r phenograph-run}
+clust_method <- c("Pheno2")
+
+# Number of nearest-neighbors
+k <- 25
+
+purrr::walk(assay_sel, \(cur_assay) {
+  clust_name <- paste(clust_method, cur_assay, sep = "_")
+  writeLines(c("\n", clust_name))
+
+  # Run Phenograph
+  set.seed(seed)
+  cur_pheno_annoy <- Rphenoannoy::Rphenoannoy(t(assay(sce_imm, cur_assay)), k = k)
+
+  cur_pheno <- DataFrame(cur_pheno_annoy[[2]]$membership)
+  colnames(cur_pheno) <- clust_name
+  rownames(cur_pheno) <- colnames(assay(sce_imm, cur_assay))
+
+  # Add Phenograph clusters to the colData of the SCE object
+  colData(sce_imm)[, clust_name] <<- cur_pheno
+  remove(cur_pheno)
+})
+```
+
+```{r save_pheno}
+fn_spe <- file.path(paths$folder_script, paste0(paths$object_type, "_", paths$panel_type, "temp_Pheno.rds"))
+saveRDS(sce_imm, fn_spe)
+# sce_imm_test <- readRDS(fn_spe)
+```
+## **Clustering: SNN + Leiden**
+
+Here, we first construct a shared nearest-neighbor graph and identify clusters using the Leiden community detection algorithm.
+
+### Run clustering
+
+```{r SNN-leiden-run}
+clust_method <- c("Leiden2")
+do_leiden <- FALSE
+
+# Number of nearest-neighbors for SNN graph
+k <- 15
+
+# Resolutions for Leiden algorithm
+resolutions <- c(0.000005, 0.0000075, 0.00001, 0.000025,
+                  0.00005,  0.000075,  0.0001,  0.00025,
+                   0.0005,   0.00075)
+
+
+purrr::walk(assay_sel, \(cur_assay) {
+  clust_name <- paste(clust_method, cur_assay, sep = "_")
+  writeLines(c("\n", clust_name))
+  
+  # if (!clust_name %in% colnames(colData(sce_imm))) {
+  if (!clust_name %in% colnames(colData(sce_sub))) {
+    do_leiden <- TRUE
+    
+    # Build the SNN graph
+    set.seed(seed)
+     cur_graph <- scran::buildSNNGraph(sce_sub, type = "jaccard", k = k,
+    #cur_graph <- scran::buildSNNGraph(sce_imm, type = "jaccard", k = k,
+                                       assay.type = cur_assay, 
+                                       BPPARAM = MulticoreParam(workers = n_cores))
+    
+    # Leiden clustering.
+    set.seed(seed)
+    clusters <- furrr::future_map(resolutions, \(cur_resolution) {
+      cur_leiden <- igraph::cluster_leiden(
+        cur_graph,
+        objective_function = "CPM", # could change for additional scalability.
+        resolution_parameter = cur_resolution)
+
+      cur_leiden <- cur_leiden$membership
+    }, .options = options)
+
+    # Add clusters to colData
+    for (k in seq_along(resolutions)) {
+      res_name <- paste(clust_method, cur_assay, k, sep = "_")
+      colData(sce_sub)[, res_name] <<- clusters[[k]]
+      #colData(sce_imm)[, res_name] <<- clusters[[k]]
+    }
+    
+    # Plot cluster tree
+    p <- clustree::clustree(sce_sub, prefix = paste0(clust_method, "_", cur_assay, "_"))
+    # p <- clustree::clustree(sce_imm, prefix = paste0(clust_method, "_", cur_assay, "_"))
+
+    if (do_print) print(p)
+    
+    # Save
+    fn <- paste0(paste(today, clust_method, cur_assay, "ClusterTree", sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param))
+    remove(cur_graph, clusters)
+  }
+})
+```
+```{r save_leiden}
+fn_spe <- file.path(paths$folder_script, paste0(paths$object_type, "_", paths$panel_type, "temp_leiden.rds"))
+saveRDS(sce_imm, fn_spe)
+```
+
+### Optimal cluster resolution
+
+Based on the trees above, select the optimal cluster resolution. Columns corresponding to other resolutions are removed from `colData(sce_sub)`.
+
+```{r SNN-leiden-select}
+do_leiden <- TRUE
+
+if (do_leiden) {
+  #optimal_res <- c("fastMNN" = 7, "scaled" = 6)
+  optimal_res <- c("fastMNN_case_id" = 8, "scaled" = 8)
+
+  purrr::walk(assay_sel, \(cur_assay) {
+    clust_name <- paste(clust_method, cur_assay, sep = "_")
+
+    optimal_col <- paste(clust_method, cur_assay, optimal_res[cur_assay], sep = "_")
+    colData(sce_sub)[, clust_name] <<- colData(sce_sub)[, optimal_col]
+    colData(sce_not)[, clust_name] <<- 0
+
+    other_cols <- colnames(colData(sce_sub))[grep(paste0(clust_name, "_"), colnames(colData(sce_sub)))]
+    colData(sce_sub)[, other_cols] <<- NULL
+  })
+}
+gc()
+```
+
+```{r save_leiden2}
+fn_spe <- file.path(paths$folder_script, paste0(paths$object_type, "_", paths$panel_type, "sce_sub_temp.rds"))
+saveRDS(sce_sub, fn_spe)
+```
+
+## **Train classifier**
+
+Clustering is performed on a cell subset. A random forest classifier is used to attribute clusters to the other cells.
+
+### Random forest
+
+Train a random forest classifier to attribute clusters to cells that were not subsetted.
+
+```{r random-forest-train-predict}
+
+if (do_leiden) {
+  n_features <- length(channels_clust)
+
+  purrr::walk(assay_sel, \(cur_assay) {  
+    #purrr::walk(methods_sel, \(cur_method) {
+    cur_method <- "Leiden2"
+      # cur_assay <- assay_sel[1]; cur_method <- methods_sel[1]
+    clust_name <- paste(cur_method, cur_assay, sep = "_")
+    print(clust_name)
+
+    # Define training (`sce_sub`) and test data (`sce_not`)
+    training_data <- dplyr::bind_cols(t(assay(sce_sub, cur_assay)),
+                                        cluster_x = sce_sub[[clust_name]])
+    df_data <- t(assay(sce_not, cur_assay))
+
+    # Changed to dplyr for scalability.
+    test_data <- dplyr::bind_cols(df_data, cluster_x = sce_not[[clust_name]])
+
+    # Train
+    ranger_model <- ranger::ranger(
+      formula = cluster_x ~ .,
+      data = training_data,
+      importance = "impurity",
+      mtry = floor(n_features / 3),
+      num.trees = 10 * n_features,
+      classification = TRUE,
+      num.threads = n_cores,
+      seed = seed)
+
+    # Predict
+    rf_predict <- predict(ranger_model, test_data, seed = seed)
+    sce_not[[clust_name]] <<- rf_predict$predictions
+  })
+} 
+```
+
+### Original vs. predicted
+
+Compare predicted clusters and original clusters on train set (cells on which the clustering algorithms were applied).
+
+```{r random-forest-compare, fig.width=15, fig.height=10}
+dat_sub <- scuttle::makePerCellDF(sce_sub, use_dimred = TRUE) |>
+  dplyr::mutate(case_id = factor(case_id, levels = meta$cases),
+                donor_type = factor(donor_type, levels = meta$stages)) |>
+  dplyr::arrange(case_id, donor_type)
+
+dat_not <- scuttle::makePerCellDF(sce_not, use_dimred = TRUE) |>
+  dplyr::mutate(case_id = factor(case_id, levels = meta$cases),
+                donor_type = factor(donor_type, levels = meta$stages)) |>
+  dplyr::arrange(case_id, donor_type)
+dat_not <- dat_not[sample(rownames(dat_not), nrow(dat_sub)), ]
+
+purrr::walk(assay_sel, \(cur_assay) {
+  #purrr::walk(methods_sel, \(cur_method) {
+  cur_method <- "Leiden2"
+    dimred_name <- paste("UMAP", "immune", cur_assay, sep = "_")
+    clust_name <- paste(cur_method, cur_assay, sep = "_")
+
+    # Plot all clusters
+    p_sub <- plot_dim_red(dat_sub, dimred_name, clust_name,
+                          sample = TRUE, size = 0.1, alpha = 1) +
+      ggtitle(paste(clust_name, "Original", sep = " - "))
+
+    p_not <- plot_dim_red(dat_not, dimred_name, clust_name,
+                          sample = TRUE, size = 0.1, alpha = 1) +
+      ggtitle(paste(clust_name, "Predicted", sep = " - "))
+
+    p <- p_sub + p_not
+    # print(p)
+
+    fn <- paste0(paste(today, clust_name, "RFcomparison", sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param))
+})
+
+dat_sub <- makePerCellDF(sce_sub, use_dimred = TRUE) |>
+  mutate(case_id = factor(case_id, levels = meta$cases),
+         donor_type = factor(donor_type, levels = meta$stages)) |>
+  arrange(case_id, donor_type)
+
+dat_not <- makePerCellDF(sce_not, use_dimred = TRUE) |>
+  mutate(case_id = factor(case_id, levels = meta$cases),
+         donor_type = factor(donor_type, levels = meta$stages)) |>
+  arrange(case_id, donor_type)
+dat_not <- dat_not[sample(rownames(dat_not), nrow(dat_sub)), ]
+
+purrr::walk(assay_sel, \(cur_assay) {
+  # purrr::walk(methods_sel, \(cur_method) {
+  cur_method <- "Leiden2"
+    dimred_name <- paste("UMAP", "immune", cur_assay, sep = "_")
+    clust_name <- paste(cur_method, cur_assay, sep = "_")
+
+    # Plot all clusters
+    p_sub <- plot_dim_red(dat_sub, dimred_name, clust_name,
+                          sample = TRUE, size = 0.1, alpha = 1) +
+      ggtitle(paste(clust_name, "Original", sep = " - "))
+
+    p_not <- plot_dim_red(dat_not, dimred_name, clust_name,
+                          sample = TRUE, size = 0.1, alpha = 1) +
+      ggtitle(paste(clust_name, "Predicted", sep = " - "))
+
+    p <- p_sub + p_not
+    # print(p)
+
+    fn <- paste0(paste(today, clust_name, "RFcomparison", sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param))
+})
+```
+
+### Merge test and train datasets
+
+Merge datasets and add clusters to the SCE object containing immune cells (`sce_imm`).
+
+```{r random-forest-merge}
+# Cluster columns
+# cluster_cols <- c(outer(methods_sel, assay_sel, FUN = paste, sep = "_"))
+cluster_cols <- c("Leiden2_fastMNN_case_id", "Leiden2_scaled")
+# Merge datasets
+clusters <- rbind(colData(sce_sub)[, cluster_cols],
+                  colData(sce_not)[, cluster_cols])
+clusters <- clusters[order(match(rownames(clusters), colnames(sce_imm))), ]
+
+# Add to the SCE object
+colData(sce_imm)[, cluster_cols] <- clusters
+# remove(sce_sub, sce_not)
+```
+
+```{r save_rf2}
+metadata(sce_imm)$all_channels <- all_channels
+fn_spe <- file.path(paths$folder_script, paste0(paths$object_type, "_", paths$panel_type, "rf.rds"))
+saveRDS(sce_imm, fn_spe)
+# sce_imm <- readRDS(fn_spe)
+```
+# **Visualize clusters**
+
+## Load packages
+
+```{r packages4, results='hide'}
+suppressPackageStartupMessages(c(
+  library(heatmaply),
+  library(htmltools),
+  library(cytomapper),
+  library(ggalluvial)
+))
+```
+
+
+## Visualize clusters on reduced dimensions
+
+```{r dimred-clusters}
+cur_dat <- makePerCellDF(sce_imm, use_dimred = TRUE) |>
+  mutate(case_id = factor(case_id, levels = meta$cases),
+         donor_type = factor(donor_type, levels = meta$stages)) |>
+  arrange(case_id, donor_type)
+
+purrr::walk(assay_sel, \(cur_assay) {
+  purrr::walk(dimred_sel, \(cur_dimred) {
+    purrr::walk(methods_sel, \(cur_method) {
+      # cur_assay <- "scaled"; cur_method <- "Pheno2"; cur_dimred <- "UMAP"
+      dimred_name <- paste(cur_dimred, "immune", cur_assay, sep = "_")
+      clust_name <- paste(cur_method, cur_assay, sep = "_")
+      
+      # Plot all clusters
+      p <- plot_dim_red(cur_dat, dimred_name, clust_name,
+                        sample = TRUE, size = 0.1, alpha = 1)
+      if (do_print) print(p)
+      
+      fn <- paste0(paste(today, "Clusters", clust_name, cur_dimred,
+                         sep = "_"), ".png")
+      do.call(ggsave, c(list(fn, p), plotsave_param))
+    })
+  })
+})
+```
+
+
+## Distribution of marker expression by cluster
+
+```{r violin-clusters-markers, message=FALSE, warning=FALSE, fig.width=15, fig.height=10}
+purrr::walk(assay_sel, \(cur_assay) {
+  purrr::walk(methods_sel, \(cur_method) {
+    clust_name <- paste(cur_method, cur_assay, sep = "_")
+    sce_imm[[clust_name]] <- as.factor(sce_imm[[clust_name]])
+    cur_dat <- makePerCellDF(sce_imm, assay.type = cur_assay,
+                             features = channels_clust, use.dimred = FALSE)
+    
+    cur_dat <- melt.data.table(
+      as.data.table(cur_dat),
+      id.vars = c("image_number", "cell_number", clust_name),
+      measure.vars = channels_clust,
+      variable.name = "channel",
+      value.name = cur_assay
+    )
+    cur_dat[, MeanExprs := mean(get(cur_assay)),
+            by = c("channel", clust_name)]
+    
+    p <- plot_violin(cur_dat, x = "channel", y = cur_assay,
+                     fill_by = "MeanExprs", facet_by = clust_name,
+                     title = clust_name) +
+      theme(axis.text.x = element_text(size = 8, angle = 90))
+    if (do_print) suppressMessages(print(p))
+    fn <- paste0(paste(today, "Clusters", clust_name, "Violins",
+                       sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param_large))
+  })
+})
+```
+
+
+## Heatmap of marker expression by cluster
+
+```{r heatmap-clusters-markers}
+hmlist <- list()
+n <- 1
+purrr::walk(assay_sel, \(cur_assay) {
+  purrr::walk(methods_sel, \(cur_method) {
+    clust_name <- paste(cur_method, cur_assay, sep = "_")
+    
+    # Summarize the data
+    hm <- summarize_heatmap(sce_imm,
+                            expr_values = cur_assay,
+                            cluster_by = clust_name,
+                            channels = channels_clust)
+    
+    # Display the heatmap
+    fn <- paste0(paste(today, "Clusters", clust_name, "Heatmap",
+                       sep = "_"), ".html")
+    hmlist[[n]] <- heatmaply::heatmaply(
+      heatmaply::normalize(hm), main = clust_name,
+      file = file.path(paths$folder_script, fn))
+    n <- n + 1
+
+    # remove all clusters with less than 10 cells and plot again.
+    clust_freq <- table(colData(sce_imm)[[clust_name]])
+    keep_clusts <- names(clust_freq)[clust_freq >= 110]
+    sce_isl_sub <- sce_imm[, colData(sce_imm)[[clust_name]] %in% keep_clusts]
+
+    hm <- summarize_heatmap(sce_isl_sub,
+                            expr_values = cur_assay,
+                            cluster_by = clust_name,
+                            channels = channels_clust)
+    # Display the reduced heatmap -> this improves the visualization.
+    # Otherwise heatmap is scaled by expression of outliers.
+    fn <- paste0(paste(today, "Clusters", clust_name, "Heatmap_reduced",
+                       sep = "_"), ".html")
+    hmlist[[n]] <- heatmaply(
+       heatmaply::normalize(hm), main = clust_name, 
+       file = file.path(paths$folder_script, fn))
+    n <- n + 1
+  })
+})
+htmltools::tagList(setNames(hmlist, NULL))
+```
+
+## Barplot with cluster frequencies
+Visualize the number of cells per cluster.
+```{r viz-cluster-barplot}
+cur_dat <- scuttle::makePerCellDF(sce_imm, use_dimred = TRUE) |>
+  dplyr::mutate(case_id = factor(case_id, levels = meta$cases),
+                donor_type = factor(donor_type, levels = meta$stages)) |>
+  dplyr::arrange(case_id, donor_type) |> 
+  tibble::as_tibble()
+
+purrr::walk(methods_sel, \(cur_method) {
+  purrr::walk(assay_sel, \(cur_assay) {
+    clust_name <- paste(cur_method, cur_assay, sep = "_")
+    title <- paste0("Cluster Abundances: ", clust_name)
+    df <- cur_dat |> 
+      dplyr::select(all_of(clust_name))  |> 
+      dplyr::group_by(across(all_of(clust_name))) |> 
+      dplyr::summarise(n = n())
+
+    p <- df |> 
+      ggplot2::ggplot(ggplot2::aes(x = factor(get(clust_name)),
+                                   y = n, fill = factor(get(clust_name)))) +
+      mytheme$standard() +
+      ggplot2::theme(
+        axis.text.x = ggplot2::element_text(angle = 45, hjust = 1),
+        panel.background = ggplot2::element_rect(colour = "grey20")
+      ) + 
+      ggplot2::geom_bar(stat = "identity") +
+      ggtitle(title) + 
+      ggplot2::scale_fill_manual(values = palettes$colors[seq_along(unique(cur_dat[[clust_name]]))]) + 
+      xlab("Cluster") +
+      ylab("Number of cells")
+    print(p)
+    fn <- paste0(paste(today, "Clusters", clust_name, "Barplot",
+                       sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param_large))
+  })
+})
+```
+
+```{r check_enrichment}
+df <- as_tibble(colData(sce_imm)) |> select(case_id, donor_type, image_id, Pheno2_scaled)
+
+df |> 
+  dplyr::add_count(Pheno2_scaled) |> 
+  dplyr::count(case_id, Pheno2_scaled, n) |> 
+  mutate(fraction = nn / n) |> 
+  filter(n > 30) |> 
+  arrange(desc(fraction)) |> 
+  print(n = 30)
+
+df |> dplyr::count(image_id, Pheno2_scaled) |> filter(Pheno2_scaled == 10) |> arrange(desc(n))
+```
+## Visualize clusters with cytomapper
+
+### Select cluster(s) and assay to show
+
+```{r viz-clust-select}
+# Lymphocytes: viz_clust <- c(3, 9, 17, 24, 29) #c(3, 17, 21) NULL
+viz_clust <- NULL # c(25, 27, 1, 23, 2, 31, 30)
+viz_method <- "Pheno2"
+viz_assay <- "scaled"
+# all_channels <- metadata(sce_imm)$all_channels
+```
+
+### Load images and masks
+
+```{r viz-cluster-load}
+if (!is.null(viz_clust)) {
+  nb_images <- 14
+  image_extension <- ".tiff"
+  clust_name <- paste(viz_method, viz_assay, sep = "_")
+  
+  # Subset the SCE
+  sce_viz <- sce_imm[, colData(sce_imm)[[clust_name]] %in% viz_clust]
+
+  set.seed(seed)
+  image_sub <- sort(sample(
+    unique(sce_viz$image_fullname),
+    min(length(unique(sce_viz$image_fullname)), nb_images)))
+
+  # Folders
+  folder_images <- file.path(paths$folder_in, "img", paths$panel_type)
+  folder_masks <- file.path(paths$folder_in, "masks_cells",
+                            paths$panel_type, "whole-cell")
+  
+  # Load images and masks
+  #images <- yoloader(
+  #  x = sce_viz,
+  #  image_dir = folder_images,
+  #  image_names = image_sub,
+  #  type = "stacks"
+  #)
+  # 
+  # 27: "6347_Immune_ROI_021.tiff", "6422_Immune_ROI_039.tiff", "6424_Immune_ROI_064.tiff"
+  # 22: "6228_Immune_ROI_029.tiff", "8011_Immune_ROI_017.tiff", "6514_Immune_ROI_005.tiff"
+  # 29: "6225_Immune_ROI_053.tiff", "6225_Immune_ROI_043.tiff", "6225_Immune_ROI_057.tiff"
+  # 28: "6328_Immune_ROI_076.tiff", "6328_Immune_ROI_078.tiff", "6328_Immune_ROI_001.tiff"
+  # 23: "6533_Immune_ROI_051.tiff", "6209_Immune_ROI_057.tiff", "6506_Immune_ROI_060.tiff"
+  image_sub <- unique(c(image_sub, "6347_Immune_ROI_021.tiff", "6422_Immune_ROI_039.tiff", "6424_Immune_ROI_064.tiff", "6228_Immune_ROI_029.tiff", 
+                 "8011_Immune_ROI_017.tiff", "6514_Immune_ROI_005.tiff", "6225_Immune_ROI_053.tiff", "6225_Immune_ROI_043.tiff", "6225_Immune_ROI_057.tiff",
+                 "6328_Immune_ROI_076.tiff", "6328_Immune_ROI_078.tiff", "6328_Immune_ROI_001.tiff",
+                 "6533_Immune_ROI_051.tiff", "6209_Immune_ROI_057.tiff", "6506_Immune_ROI_060.tiff", 
+                 "6310_Immune_ROI_006.tiff", # "6043_Immune_ROI_014.tiff",  
+                 "6228_Immune_ROI_082.tiff", "6247_Immune_ROI_072.tiff"))                             
+                 # )
+
+  images <- cytomapper::loadImages(file.path(folder_images, image_sub))
+  channelNames(images) <- all_channels
+  images <- getChannels(images, channels_clust)
+  # Add image names to metadata
+  mcols(images)$ImageName <- names(images)
+  mcols(images)$ImageName <- paste0(mcols(images)$ImageName)
+
+  masks <- yoloader(
+    x = sce_viz,
+    image_dir = folder_masks,
+    image_names = image_sub,
+    as.is = TRUE,
+    type = "masks"
+  )
+  
+  sce_viz <- sce_viz[, sce_viz$image_fullname %in% image_sub]
+  sce_viz$ImageName <- gsub(image_extension, "", sce_viz$image_fullname)
+}
+```
+
+### Plot images
+
+Images are saved to disk but not shown.
+
+```{r viz-cluster-plot}
+if (!is.null(viz_clust)) {
+  fn <- list(filename = file.path(
+    plotsave_param$path,
+    paste0(paste(today, "Cytomapper", clust_name,
+                 paste(viz_clust, collapse = "-"), sep = "_"), ".png")))
+
+  plotPixels(images, object = sce_viz, masks,
+             cell_id = "cell_number", img_id = "ImageName",
+             colour_by = c("CD3e", "PD1", "MPO", "HLA_DR", "CD163", "CD206"),
+             outline_by = c(clust_name),
+             bcg = list(CD3e = c(0, 5, 1), PD1 = c(0, 5, 1), MPO = c(0, 5, 1),
+                        HLA_DR = c(0, 5, 1), CD163 = c(0, 5, 1), CD206 = c(0, 5, 1)),
+             image_title = NULL, scale = TRUE, save_plot = fn)
+}
+```
+
+### Cytoviewer app.
+```{r cytoviewer}
+if (!is.null(viz_clust)) {
+  library(cytoviewer)
+  sce_viz[[clust_name]] <- as.factor(sce_viz[[clust_name]])
+  app <- cytoviewer(image = images, 
+                    mask = masks, 
+                    object = sce_viz,
+                    img_id = "ImageName", 
+                    cell_id = "cell_number")
+
+  if (interactive()) {
+    shiny::runApp(app)
+  }
+}
+```
+
+### Remove generated files
+
+```{r viz-cluster-remove}
+if (!is.null(viz_clust)) {
+  remove(sce_viz, images, masks)
+}
+```
+
+
+## Plot specific cluster(s)
+
+When many clusters are present, they may not be easy fo visualize on reduced dimension maps. Here, a subset of clusters can be selected for plotting.
+
+### Select cluster(s) and assay to show
+
+```{r dimred-cluster-select}
+viz_clust <- NULL # c(1, 4, 10) # NULL
+viz_method <- "Leiden2"
+viz_assay <- "fastMNN_case_id"
+```
+
+```{r dimred-cluster-plot}
+if (!is.null(viz_clust)) {
+  # Prepare the data
+  cur_dat <- makePerCellDF(
+    sce_imm[, colnames(sce_imm) %in% meta[["subset"]]],
+    use.dimred = TRUE) |>
+    mutate(case_id = factor(case_id, levels = meta$cases),
+           donor_type = factor(donor_type, levels = meta$stages)) |>
+    arrange(case_id, donor_type)
+  
+  # Clusters and palette
+  clust_name <- paste(viz_method, viz_assay, sep = "_")
+  clust_nb <-  length(unique(cur_dat[[clust_name]]))
+  viz_pal <- palettes$colors[1:clust_nb]
+  names(viz_pal) <- 1:clust_nb
+  viz_pal[!names(viz_pal) %in% viz_clust] <- "lightgrey"
+  
+  # Plot
+  purrr::walk(dimred_sel, \(cur_dimred) {
+    dimred_name <- paste(cur_dimred, "immune", viz_assay, sep = "_")
+    
+    p <- plot_dim_red(cur_dat, dimred_name, clust_name, palette = viz_pal,
+                      sample = TRUE, size = 0.1, alpha = 1)
+    
+    fn <- paste0(paste(today, paste0("Cluster", paste(viz_clust, collapse = "-")),
+           clust_name, cur_dimred, sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param))
+  })
+}
+```
+
+
+
+# **Attribute cell types**
+
+**Note: this section requires manual intervention**  
+
+Here, clusters obtained at the previous steps are manually merged into meaningful cell types. Cluster numbers are attributed to the different cell types based on the plots and heatmaps above. Consequently, this attribution has to be adapted to the clustering results.  
+
+## Cell type attribution
+
+Cell type attribution has to be performed once per clustering method and per selected assay.
+
+### Phenograph x scaled counts
+
+```{r celltypes-pheno-scaled}
+clust_method <- "Pheno2"
+clust_assay <- "scaled"
+
+if (!clust_assay %in% assay_sel)
+  stop("The selected assay is not in the assays selected for clustering")
+
+clust_name <- paste(clust_method, clust_assay, sep = "_")
+print(clust_name)
+
+# Define which clusters correspond to which cell types
+#clust_lympho  <- c(1, 5, 7, 17, 18)
+#clust_myelo <- c(2, 3, 4, 8, 11, 12, 13, 14, 15, 16)
+#clust_neutr <- c(6, 9, 10)
+#clust_other <- c()
+clust_lympho <- c(6, 13, 14, 20, 23, 29)
+clust_neutr <- c(5, 22, 24)
+clust_myelo <- c(1, 3, 4, 7, 8, 9, 10, 11, 12, 15, 16, 17, 18, 19, 21, 25, 26, 27, 30, 31)
+clust_other <- c(2, 28, 32, 33)
+
+all_clust <- sort(c(clust_lympho, clust_myelo, clust_neutr, clust_other))
+
+if ((!length(unique(all_clust)) ==
+     length(unique(colData(sce_imm)[, clust_name]))) ||
+    any(duplicated(all_clust))) {
+  stop("Recheck cluster attribution")
+}
+
+# Add cell types to the SCE object
+colData(sce_imm)[colData(sce_imm)[, clust_name] %in% clust_lympho,
+                 paste("CellType", clust_name, sep = "_")] <- "Lymphocyte"
+colData(sce_imm)[colData(sce_imm)[, clust_name] %in% clust_myelo,
+                 paste("CellType", clust_name, sep = "_")] <- "Myeloid"
+colData(sce_imm)[colData(sce_imm)[, clust_name] %in% clust_neutr,
+                 paste("CellType", clust_name, sep = "_")] <- "Neutrophil"
+colData(sce_imm)[colData(sce_imm)[, clust_name] %in% clust_other,
+                 paste("CellType", clust_name, sep = "_")] <- "Other"
+```
+
+### Phenograph x fastMNN counts
+
+```{r celltypes-pheno-fastMNN}
+clust_method <- "Pheno2"
+clust_assay <- "fastMNN_case_id"
+
+if (!clust_assay %in% assay_sel)
+  stop("The selected assay is not in the assays selected for clustering")
+
+clust_name <- paste(clust_method, clust_assay, sep = "_")
+print(clust_name)
+
+# Define which clusters correspond to which cell types
+#clust_lympho  <- c(1, 7, 10, 14)
+#clust_myelo <- c(2, 3, 4, 5, 6, 9, 13, 15)
+#clust_other <- c()
+##clust_neutr <- c(8, 11, 12)
+
+clust_lympho <- c(6, 9, 15, 21, 22, 23, 24)
+clust_neutr <- c(5, 11, 20)
+clust_myelo <- c(1:4, 7, 8, 10, 12:14, 16:19, 26)
+clust_other <- c(25, 27)
+all_clust <- sort(c(clust_lympho, clust_myelo, clust_neutr, clust_other))
+
+if ((!length(unique(all_clust)) ==
+     length(unique(colData(sce_imm)[, clust_name]))) ||
+    any(duplicated(all_clust))) {
+  stop("Recheck cluster attribution")
+}
+
+# Add cell types to the SCE object
+colData(sce_imm)[colData(sce_imm)[, clust_name] %in% clust_lympho,
+                 paste("CellType", clust_name, sep = "_")] <- "Lymphocyte"
+colData(sce_imm)[colData(sce_imm)[, clust_name] %in% clust_myelo,
+                 paste("CellType", clust_name, sep = "_")] <- "Myeloid"
+colData(sce_imm)[colData(sce_imm)[, clust_name] %in% clust_neutr,
+                 paste("CellType", clust_name, sep = "_")] <- "Neutrophil"
+colData(sce_imm)[colData(sce_imm)[, clust_name] %in% clust_other,
+                 paste("CellType", clust_name, sep = "_")] <- "Other"
+```
+
+### Leiden x scaled counts
+
+```{r celltypes-leiden-scaled}
+clust_method <- "Leiden2"
+clust_assay <- "scaled"
+
+if (!clust_assay %in% assay_sel)
+  stop("The selected assay is not in the assays selected for clustering")
+
+clust_name <- paste(clust_method, clust_assay, sep = "_")
+print(clust_name)
+
+# Define which clusters correspond to which cell types
+# clust_lympho  <- c(1, 7, 10)
+#clust_myelo <- c(3, 4, 6, 8, 9)
+#clust_neutr <- c(5, 11)
+#clust_other <- c(2, 12)
+
+clust_lympho <- c(3, 9, 17, 24, 29)
+clust_myelo <- c(1, 4:8, 11:14, 18:23, 26:28,
+                 30, 31, 32, 33, 35:37)
+clust_neutr <- c(2, 25, 34)
+clust_other <- c(10, 15, 16)
+
+
+all_clust <- sort(c(clust_lympho, clust_myelo, clust_neutr, clust_other))
+
+if ((!length(unique(all_clust)) ==
+     length(unique(colData(sce_imm)[, clust_name]))) ||
+    any(duplicated(all_clust))) {
+  stop("Recheck cluster attribution")
+}
+
+# Add cell types to the SCE object
+colData(sce_imm)[colData(sce_imm)[, clust_name] %in% clust_lympho,
+                 paste("CellType", clust_name, sep = "_")] <- "Lymphocyte"
+colData(sce_imm)[colData(sce_imm)[, clust_name] %in% clust_myelo,
+                 paste("CellType", clust_name, sep = "_")] <- "Myeloid"
+colData(sce_imm)[colData(sce_imm)[, clust_name] %in% clust_neutr,
+                 paste("CellType", clust_name, sep = "_")] <- "Neutrophil"
+colData(sce_imm)[colData(sce_imm)[, clust_name] %in% clust_other,
+                 paste("CellType", clust_name, sep = "_")] <- "Other"
+```
+
+### Leiden x fastMNN counts
+
+```{r celltypes-leiden-fastMNN}
+clust_method <- "Leiden2"
+clust_assay <- "fastMNN_case_id"
+
+if (!clust_assay %in% assay_sel)
+  stop("The selected assay is not in the assays selected for clustering")
+
+clust_name <- paste(clust_method, clust_assay, sep = "_")
+print(clust_name)
+
+# Define which clusters correspond to which cell types
+#clust_lympho  <- c(1, 2, 8)
+#clust_myelo <- c(3, 4, 5, 6)
+#clust_neutr <- c(7)
+#clust_other <- c(9)
+clust_neutr <- c(5, 16, 21)
+clust_lympho <- c(8, 9, 15, 20, 22, 27)
+clust_other <- c()
+clust_myelo <- c(1, 2, 3, 4, 6, 7, 10, 11, 12, 13, 14, 17, 18, 19, 23, 24, 25, 26, 28:41)
+
+
+all_clust <- sort(c(clust_lympho, clust_myelo, clust_neutr, clust_other))
+
+if ((!length(unique(all_clust)) ==
+     length(unique(colData(sce_imm)[, clust_name]))) ||
+    any(duplicated(all_clust))) {
+  stop("Recheck cluster attribution")
+}
+
+# Add cell types to the SCE object
+colData(sce_imm)[colData(sce_imm)[, clust_name] %in% clust_lympho,
+                 paste("CellType", clust_name, sep = "_")] <- "Lymphocyte"
+colData(sce_imm)[colData(sce_imm)[, clust_name] %in% clust_myelo,
+                 paste("CellType", clust_name, sep = "_")] <- "Myeloid"
+colData(sce_imm)[colData(sce_imm)[, clust_name] %in% clust_neutr,
+                 paste("CellType", clust_name, sep = "_")] <- "Neutrophil"
+colData(sce_imm)[colData(sce_imm)[, clust_name] %in% clust_other,
+                 paste("CellType", clust_name, sep = "_")] <- "Other"
+```
+
+
+## Visualize attributed cell types
+
+### Plot cell types on reduced dimensions
+
+```{r palette$celltypes}
+palettes$celltype <- (c(
+  Myeloid = palettes$colors[1], Lymphocyte = palettes$colors[2],
+  Neutrophil = palettes$colors[3], Other = palettes$colors[8]))
+```
+
+
+```{r celltypes-dimred}
+# Prepare the data
+cur_dat <- makePerCellDF(
+  sce_imm[, colnames(sce_imm) %in% meta[["subset_immune"]]],
+  use_dimred = TRUE) |>
+  mutate(case_id = factor(case_id, levels = meta$cases),
+         donor_type = factor(donor_type, levels = meta$stages)) |>
+  arrange(case_id, donor_type)
+
+# Plot
+purrr::walk(assay_sel, \(cur_assay) {
+  purrr::walk(dimred_sel, \(cur_dimred) {
+    purrr::walk(methods_sel, \(cur_method) {
+      # cur_assay <- assay_sel[2];  cur_method <- methods_sel[2]; cur_dimred <- dimred_sel[1]
+      dimred_name <- paste(cur_dimred, "immune", cur_assay, sep = "_")
+      clust_name <- paste("CellType", cur_method, cur_assay,
+                          sep = "_")
+      
+      p <- plot_dim_red(cur_dat, dimred_name, clust_name,
+                        palette = palettes$celltype,
+                        sample = TRUE, size = 0.1, alpha = 1)
+      if (do_print) print(p)
+      
+      fn <- paste0(paste(today, clust_name, cur_dimred,
+                         sep = "_"), ".png")
+      do.call(ggsave, c(list(fn, p), plotsave_param))
+    })
+  })
+})
+```
+
+### Cell types heatmap
+
+```{r celltypes-heatmap}
+hmlist <- list()
+n <- 1
+purrr::walk2(assay_sel, names(assay_sel), \(cur_assay, name_cur_assay) {
+  purrr::walk(methods_sel, \(cur_method) {
+    clust_name <- paste("CellType", cur_method, cur_assay,
+                        sep = "_")
+  
+    # Summarize the data
+    hm <- summarize_heatmap(sce_imm,
+                            expr_values = name_cur_assay,
+                            cluster_by = clust_name,
+                            channels = channels_clust)
+    
+    # Display the heatmap
+    fn <- paste0(paste(today, clust_name, "Heatmap",
+                       sep = "_"), ".html")
+    
+    hmlist[[n]] <- heatmaply(
+      heatmaply::normalize(hm), main = clust_name,
+      file = file.path(paths$folder_script, fn))
+    n <- n + 1
+  })
+})
+htmltools::tagList(setNames(hmlist, NULL))
+```
+
+### Visualize celltypes with cytomapper
+
+Load the masks
+
+```{r viz-celltype-load}
+nb_images <- 14
+image_extension <- ".tiff"
+
+set.seed(seed)
+image_sub <- sort(sample(
+  unique(sce_imm$image_fullname),
+  min(length(unique(sce_imm$image_fullname)), nb_images)))
+
+# Subset the SCE to subsampled images
+sce_sub <- sce_imm[, sce_imm$image_fullname %in% image_sub]
+sce_sub$ImageName <- gsub(image_extension, "", sce_sub$image_fullname)
+
+# Folders
+folder_images <- file.path(paths$folder_in, "img", paths$panel_type)
+folder_masks <- file.path(paths$folder_in, "masks_cells",
+                          paths$panel_type, "whole-cell")
+
+# Load masks
+masks <- yoloader(
+  x = sce_sub,
+  image_dir = folder_masks,
+  image_names = image_sub,
+  as.is = TRUE,
+  type = "masks"
+)
+```
+
+Plot the images
+
+```{r viz-celltype-plot}
+purrr::walk(assay_sel, \(cur_assay) {
+  purrr::walk(methods_sel, \(cur_method) {
+    celltype_viz <- paste("CellType", cur_method, cur_assay,
+                          sep = "_")
+    
+    colour_key <- list(celltype_viz = palettes$celltype)
+
+    fn <- list(filename = file.path(
+      plotsave_param$path,
+      paste0(paste(today, "Cytomapper", celltype_viz, sep = "_"), ".png")))
+
+    plotCells(masks, object = sce_sub,
+              cell_id = "cell_number", img_id = "ImageName",
+              colour_by = celltype_viz, colour = colour_key, save_plot = fn)
+  })
+})
+```
+
+# **Consensus cell types**
+
+Attribute consensus cell types for immune cells based on the clustering 
+performed above.
+
+
+## Cell type concordance
+
+Compare concordance of cell types attributed using different methods.
+
+```{r celltypes-concordance}
+celltype_cols <- colnames(colData(sce_imm))[grepl(paste0(
+  "CellType_", methods_sel, collapse = "|"), colnames(colData(sce_imm)))]
+
+celltypes <- as.data.table(colData(sce_imm)[
+  , c("cell_id", "case_id", "image_number", "cell_number", celltype_cols)])
+
+ct_combination <- t(combn(unique(celltype_cols), 2))
+
+for (i in 1:nrow(ct_combination)) {
+  cat("\n", ct_combination[i, 1], " vs ", ct_combination[i, 2], "\n")
+  
+  ct_concord <- nrow(
+    celltypes[get(ct_combination[i, 1]) == get(ct_combination[i, 2]), ]
+  )
+  ct_discord <- nrow(
+    celltypes[get(ct_combination[i, 1]) != get(ct_combination[i, 2]), ]
+  )
+  cat("Number of cells with concordant cell types: ", ct_concord,
+      "\nNumber of cells with discordant cell types: ", ct_discord,
+      "\nPercentage of cells with concordant cell types:",
+      100 * ct_concord / (ct_discord + ct_concord), "%", "\n")
+}
+```
+Pheno2-scaled - Leiden2-fastMNN: 96.0 %
+Pheno2-scaled - Pheno2-fastMNN: 95.6 %
+Pheno2-scaled - Leiden2-scaled: 97.4 %
+Leiden2-fastMNN - Pheno2-fastMNN: 97.4 %
+Leiden2-fastMNN - Leiden2-scaled: 96.7 %
+Pheno2-fastMNN - Leiden2-scaled: 95.7 %
+
+
+
+## Attribute consensus cell types
+
+### Majority vote
+
+Cells for which 3 out of 4 methods agree on the cell type are attributed this cell type, other cells as considered as "Ambiguous".
+
+```{r consensus-celltype}
+#column_to_remove <- grep("Pheno1_fastMNN", names(celltypes))
+
+# Remove the column by setting it to NULL
+#celltypes[, (column_to_remove) := NULL]
+
+# Majority vote
+Mode <- function(x) {
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+celltypes[, cell_type := apply(celltypes, 1, Mode)]
+celltypes[, Paste := do.call(paste0, .SD),
+          .SDcols = grep("CellType_", colnames(celltypes))]
+celltypes[, count := stringr::str_count(Paste, cell_type)]
+celltypes[count < 3, cell_type := "Ambiguous"]
+celltypes[, `:=`(Paste = NULL, count = NULL)]
+
+cat("Percentage of cells with an ambiguous cell type: ",
+    100 * nrow(celltypes[cell_type == "Ambiguous"]) / nrow(celltypes),
+    "%")
+```
+
+### Compare cell type attributions
+
+```{r celltypes-alluvial, warning=FALSE}
+celltype_cols <- c("cell_type", colnames(colData(sce_imm))[grepl(paste0(
+  "CellType_", methods_sel, collapse = "|"), colnames(colData(sce_imm)))])
+
+p <- celltypes[, .(number = .N), by = celltype_cols] |>
+  ggplot(aes(axis1 = get(celltype_cols[1]),
+             axis2 = get(celltype_cols[2]),
+             axis3 = get(celltype_cols[3]),
+             axis4 = get(celltype_cols[4]),
+             axis5 = get(celltype_cols[5]),
+             y = number)) +
+  geom_stratum() +
+  geom_text(stat = "stratum", infer.label = TRUE) +
+  geom_alluvium(aes(fill = get(celltype_cols[1]))) +
+  scale_x_discrete(limits = gsub("cell_type_", "", celltype_cols)) +
+  scale_fill_manual(values = palettes$colors[c(TRUE, FALSE)],
+                    name = "Cell Type") +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+if (do_print) print(p)
+
+fn <- paste0(paste(today, "CellTypes", "alluvial", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+### Number of cells by cell type
+
+```{r cells-per-celltype}
+as_tibble(celltypes) |>
+  select(cell_type) |>
+  group_by(cell_type) |>
+  add_count(name = "Number of cells") |>
+  distinct()
+```
+170k Lymphocytes!
+
+## Add cell types to the immune SCE object
+
+```{r add-immune-celltypes-sce}
+celltypes <- celltypes[order(match(celltypes$cell_id, colnames(sce_imm))), ]
+colData(sce_imm)$cell_type <- celltypes$cell_type
+```
+
+
+
+# **Plot cell types**
+
+## Reduced dimensions
+
+Plot consensus cell types on reduced dimensions
+
+```{r consensus-dimred}
+ct <- c(names(palettes$celltype), "Ambiguous")
+palette_ct <- c(palettes$celltype[1:(length(ct) - 2)], "grey40", "grey")
+names(palette_ct) <- names(ct) <- ct
+
+cur_dat <- makePerCellDF(
+  sce_imm[, colnames(sce_imm) %in% metadata(sce_imm)$subset],
+  use_dimred = TRUE) |>
+  mutate(case_id = factor(case_id, levels = metadata(sce_imm)$cases),
+         donor_type = factor(donor_type, levels = metadata(sce_imm)$stages),
+         cell_type = factor(cell_type, levels = names(ct))) |>
+  arrange(cell_type, case_id, donor_type)
+
+purrr::walk(assay_sel, \(cur_assay) {
+  purrr::walk(dimred_sel, \(cur_dimred) {
+    dimred_name <- paste(cur_dimred, "immune", cur_assay, sep = "_")
+    
+    p <- plot_dim_red(cur_dat, dimred_name, "cell_type",
+                      sample = TRUE, size = 0.1, alpha = 1,
+                      palette = palette_ct)
+    if (do_print) print(p)
+    
+    fn <- paste0(paste(today, "CellType", "Consensus", dimred_name,
+                       sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param))
+  })
+})
+```
+
+## Heatmap
+
+```{r consensus-heatmap}
+hmlist <- list()
+purrr::walk2(assay_sel, names(assay_sel), \(cur_assay, name_cur_assay) {
+  clust_name <- paste("CellType", cur_assay, sep = "_")
+  
+  # Summarize the data
+  hm <- summarize_heatmap(sce_imm,
+                          expr_values = name_cur_assay,
+                          cluster_by = "cell_type",
+                          channels = channels_clust)
+  
+  # Display the heatmap
+  fn <- paste0(paste(today, "CellType", "Consensus", cur_assay,
+                     "Heatmap", sep = "_"), ".html")
+  
+  hmlist[[i]] <- heatmaply(
+    heatmaply::normalize(hm), main = clust_name,
+    file = file.path(paths$folder_script, fn))
+})
+htmltools::tagList(setNames(hmlist, NULL))
+```
+
+
+## Correlation between channels
+
+```{r celltype-correlation}
+# Define the correlation method
+cor_method <- "pearson"
+
+# Function to calculate p values
+cor_test_p <- function(x) {
+  FUN <- function(x, y) cor.test(x, y, method = cor_method)[["p.value"]]
+  z <- outer(
+    colnames(x), 
+    colnames(x), 
+    Vectorize(function(i, j) FUN(x[, i], x[, j]))
+  )
+  dimnames(z) <- list(colnames(x), colnames(x))
+  z
+}
+
+hmlist <- list()
+purrr::walk(assay_sel, \(cur_assay) {
+  
+  # Summarize the data
+  hm <- summarize_heatmap(sce_imm,
+                          expr_values = cur_assay,
+                          cluster_by = "cell_type",
+                          channels = channels_clust)
+  
+  # Run the correlation test
+  r <- cor(hm, method = cor_method)
+  p <- cor_test_p(hm)
+  diag(p) <- NA
+  
+  # Plot and save the heatmap
+  fn <- paste0(paste(today, "CellTypes", "Consensus", "Correlation",
+                     cur_assay, sep = "_"), ".html")
+  
+  hmlist[[i]] <- heatmaply_cor(
+    r, node_type = "scatter",
+    point_size_mat = -log10(p), point_size_name = "-log10(p-value)",
+    label_names = c("x", "y", "Correlation"),
+    main = paste("Cell type -", cur_assay),
+    file = file.path(paths$folder_script, fn))
+})
+htmltools::tagList(setNames(hmlist, NULL))
+```
+
+
+
+# **Finalize and save **
+
+## Merge objects
+
+Add immune cell types to the main SPE
+
+```{r add-immune-celltypes}
+# Add a new "cell_type" column to the SPE object
+spe$cell_type <- "0"
+
+# Make sure row order is preserved
+row_order <- rownames(colData(spe)[spe$cell_category == "immune", ])
+sce_imm <- sce_imm[, order(match(colnames(sce_imm), row_order))]
+
+# Add cell types
+colData(spe)[row_order, ]$cell_type <- sce_imm$cell_type
+```
+
+
+## Save the updated SCE object
+
+Contains all attributed cell types and cell categories
+
+```{r save-spe}
+print(spe)
+fn_spe <- file.path(paths$folder_script, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+saveRDS(spe, fn_spe)
+```

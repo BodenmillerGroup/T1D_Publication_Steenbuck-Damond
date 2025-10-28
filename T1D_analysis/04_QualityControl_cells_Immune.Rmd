@@ -1,0 +1,1279 @@
+---
+title: "04_QualityControl_cells_Immune"
+author: "Nathan Steenbuck, Nicolas Damond"
+date: "Created: 23 May, 2022; Compiled: `r format(Sys.time(), '%d %b, %Y')`"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+if (rstudioapi::isAvailable()) {
+  script_name <- basename(rstudioapi::getSourceEditorContext()$path)
+} else {
+  script_name <- knitr::current_input()
+}
+
+script_name <- "04_QualityControl_cells_Immune.Rmd"
+cur_user <- Sys.info()[["user"]]
+
+## cur_user == "ubuntu" indicates working on the VM.
+## Else; working on the Cluster.
+if (cur_user == "ubuntu") {
+  source(file.path("/", "mnt", "central_nas", "projects", 
+    "type1_diabetes", "nathan", "T1D_Vol", "T1D_analysis", 
+    "analysis", "helpers.R"))
+  n_cores <- 4
+  future::plan(future::multisession(workers = n_cores))
+  paths <- getPaths(script_name)
+  knitr::opts_knit$set(root_dir = paths$home_data)
+} else {
+  source(file.path("/", "home", "nsteen", "scripts", "T1D_analysis", "analysis", "helpers.R"))
+  future::plan(future::multicore)
+  paths <- getPaths(script_name)
+  paths$folder_script <- paths$cluster_folder_script
+  paths$folder_in <- paths$cluster_folder_in
+  paths$folder_out <- paths$cluster_home 
+  knitr::opts_knit$set(root_dir = paths$cluster_home)
+}
+
+# Misc. Settings.
+seed <- 123456
+set.seed(seed)
+options <- furrr::furrr_options(seed = seed)
+options(future.globals.maxSize = 50 * 1024 * 1024 * 1024)
+knitr::opts_chunk$set(echo = TRUE)
+paths$prev <- paste("03_TransformCorrect", paths$object_type, paths$panel_type, sep = "_")
+```
+
+## **Goals**  
+  
+Perform quality controls on cell-level data.   
+  
+**Diagnostic plots**  
+- Number of cells and images per condition  
+- Density plots  
+- 90th percentile per channel  
+- Heatmaps  
+- Low-level representations: PCA, MDS, MNF  
+- Shannon entropy / ion counts  
+
+**Dimensionality reduction**  
+- UMAP  
+- Plot key variables (stage, cases, batch) on reduced dimensions.  
+- Plot marker abundances on reduced dimensions.  
+
+**Image visualization**  
+- Display images with `cytomapper` for visual quality check.  
+- Display images before/after spillover-compensation.  
+
+
+
+# **Settings**  
+
+## Load packages
+
+```{r packages, results='hide'}
+suppressPackageStartupMessages(c(
+  library(data.table),
+  library(dplyr),
+  library(SpatialExperiment),
+  library(parallel),
+  library(furrr),
+  library(tictoc)
+))
+```
+
+## Paths and settings
+
+```{r settings}
+# Paths
+if (!dir.exists(paths$folder_script)) dir.create(paths$folder_script)
+plotsave_param$path <- paths$folder_script
+plotsave_param_large$path <- paths$folder_script
+
+# Misc settings
+today <- gsub("-", "", Sys.Date())
+```
+
+##  Read in the data
+
+Load the SpatialExperiment (SPE) object saved at the previous step.
+
+```{r load-data}
+fn_spe <- file.path(paths$folder_out, paths$prev, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+spe <- readRDS(fn_spe)
+print(spe)
+```
+
+
+
+# **Diagnostic plots**
+
+```{r packages2, results='hide', include=FALSE}
+suppressPackageStartupMessages(c(
+  library(vroom),
+  library(RColorBrewer),
+  library(ggplot2),
+  library(ggridges),
+  library(scuttle),
+  library(scater),
+  library(dittoSeq),
+  library(heatmaply),
+  library(htmltools),
+  library(BiocParallel),
+  library(ggrepel),
+  library(EBImage)
+  #library(foreach),
+  #library(doParallel)
+))
+```
+
+## Order rows
+
+Load a file that indicates in which order the data should be plotted.
+The content of this file is then saved in the metadata slot of the SPE object.
+
+```{r row-order}
+# Load the file
+fn_order <- file.path(paths$folder_in, "order.csv")
+if (!file.exists(fn_order)) stop("Ordering file not found")
+row_order <- vroom(fn_order, show_col_types = FALSE)
+
+# Row order for cases and stages
+stages <- row_order[!is.na(row_order$stages), ]$stages
+stages <- stages[stages %in% spe$donor_type]
+cases  <- row_order[!is.na(row_order$cases), ]$cases
+cases <- cases[cases %in% spe$case_id]
+
+# Save to metadata
+metadata(spe)[["stages"]] <- stages
+metadata(spe)[["cases"]] <- cases
+```
+
+## Select assays and channels
+
+Modify the `assay_sel` variable to select which assay (for instance scaled counts (`scaled`) or asinh-transformed counts (`exprs`)) should be used for quality control plots. 
+Multiple assays can be entered but this leads to increased processing times.
+
+```{r select-assays}
+# Select the assay(s) of interest
+assay_sel <- c("counts", "scaled", "exprs", "fastMNN_case_id")
+writeLines(c("Assays:", assay_sel[assay_sel %in% assayNames(spe)]))
+
+# Select the channels to display
+channels <- rownames(spe)[!(grepl("DNA|H3", rownames(spe)))]
+writeLines(c("\nNumber of channels:", length(channels)))
+
+# Variables to plot
+plot_variables <- c("stages", "cases")
+plot_variables2 <- c("stages", "casestages")
+names(plot_variables2) <- names(plot_variables) <- c("donor_type", "case_id")
+writeLines("\nVariables to plot:")
+print(plot_variables)
+```
+
+Change the case_id column to a factor.
+```{r factor_column}
+colData(spe)[, "case_id"] <- factor(colData(spe)[, "case_id"])
+```
+
+## Subset the SPE object
+
+The SPE object is subset to `nb_cells` per case for faster plotting. Hence, for example `2000 cells` per donor.
+
+```{r subset-spe}
+if (!("subset" %in% names(metadata(spe)))) {
+  # Cells per case
+  nb_cells <- 2000
+  
+  # Subset the SPE object (nb_cells per case)
+  cell_subset <- tibble(rn = rownames(colData(spe)),
+                        case_id = colData(spe)$case_id) |> 
+    group_by(case_id) |>
+    sample_n(nb_cells) |> 
+    pull(rn)
+  
+  # Keep the subset cell ids in SPE metadata
+  metadata(spe)[["subset"]] <- sort(as.vector(cell_subset))
+}
+
+# Keep only the selected cells and channels
+spe_sub <- spe[channels, metadata(spe)[["subset"]]]
+```
+
+
+## Number of images and cells per case and stage
+
+Plot the number of images per case and stage.
+
+```{r images-per-condition}
+# Calculate number of images per case and stage
+cur_dat <- as_tibble(colData(spe)) |>
+  dplyr::distinct(case_id, donor_type, image_id) |>
+  dplyr::count(case_id, donor_type) |>
+  dplyr::mutate(case_id = factor(case_id, levels = metadata(spe)$cases),
+                donor_type = factor(donor_type, levels = metadata(spe)$stages)) |>
+  dplyr::arrange(case_id, donor_type)
+
+# Plot number of images per case
+p <- cur_dat |>
+  ggplot(aes(y = n,
+             x = as.factor(donor_type),
+             color = as.factor(donor_type))) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter() +
+  expand_limits(y = 0) +
+  scale_color_manual(values = palettes$stages) +
+  labs(color = "T1D stage", x = NULL, y = "Number of images per case") +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(p)
+
+fn <- paste0(paste(today, "Number", "ImagesPerCase", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# Plot total number of images per disease stage
+p <- cur_dat |>
+  ggplot(aes(y = n,
+             x = as.factor(donor_type),
+             fill = as.factor(donor_type))) +
+  geom_bar(stat = "identity") +
+  expand_limits(y = 0) +
+  scale_fill_manual(values = palettes$stages) +
+  labs(fill = "T1D stage", x = NULL, y = "Total number of images per stage") +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(p)
+
+fn <- paste0(paste(today, "Number", "ImagesPerStage", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+Plot the number of measured cells per case and per stage.
+
+```{r cells-per-condition}
+# Calculate number of cells per case and stage
+cur_dat <- as_tibble(colData(spe)) |>
+  group_by(case_id, donor_type) |>
+  summarise(n = n(), .groups = "keep") |>
+  mutate(case_id = factor(case_id, levels = metadata(spe)$cases),
+         donor_type = factor(donor_type, levels = metadata(spe)$stages)) |>
+  arrange(case_id, donor_type)
+
+# Plot number of cells per case
+p <- cur_dat |>
+  ggplot(aes(y = n,
+             x = as.factor(donor_type),
+             color = as.factor(donor_type))) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter() +
+  expand_limits(y = 0) +
+  scale_color_manual(values = palettes$stages) +
+  labs(color = "T1D stage", x = NULL, y = "Number of cells per case") +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+p
+
+fn <- paste0(paste(today, "Number", "CellsPerCase", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# Plot number of cells per disease stage
+p <- cur_dat |>
+  ggplot(aes(y = n,
+             x = as.factor(donor_type),
+             fill = as.factor(donor_type))) +
+  geom_bar(stat = "identity") +
+  expand_limits(y = 0) +
+  scale_fill_manual(values = palettes$stages) +
+  labs(fill = "T1D stage", x = NULL, y = "Total number of cells per stage") +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+p
+
+fn <- paste0(paste(today, "Number", "CellsPerStage", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+Plot the number of cells per image.
+
+```{r cells-per-image}
+# Calculate number of cells per case and stage
+cur_dat <- as_tibble(colData(spe)) |>
+  group_by(case_id, donor_type, image_id) |>
+  summarise(n = n(), .groups = "keep") |>
+  mutate(case_id = factor(case_id, levels = metadata(spe)$cases),
+         donor_type = factor(donor_type, levels = metadata(spe)$stages)) |>
+  arrange(case_id, donor_type)
+
+# Plot number of cells per image and per case
+p <- cur_dat |>
+  ggplot(aes(y = n,
+             x = as.factor(case_id),
+             color = as.factor(donor_type))) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(size = 0.5) +
+  expand_limits(y = 0) +
+  scale_color_manual(values = palettes$stages) +
+  labs(color = "Case", x = NULL, y = "Number of cells per image") +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+p
+
+fn <- paste0(paste(today, "Number", "CellsPerImage", "byCase",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+
+# Plot number of cells per image and per stage
+cur_dat <- cur_dat |>
+  group_by(case_id, donor_type) |>
+  summarise(avg = mean(n), .groups = "keep")
+  
+p <- cur_dat |>
+  ggplot(aes(y = avg,
+             x = as.factor(donor_type),
+             color = as.factor(donor_type))) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter() +
+  expand_limits(y = 0) +
+  scale_color_manual(values = palettes$stages) +
+  labs(color = "T1D stage", x = NULL, y = "Average number of cells per image") +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+p
+
+fn <- paste0(paste(today, "Number", "CellsPerImage", "byStage",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+
+## Density plots
+
+For the different transformations, check the distribution of each marker intensity to identify potential global shifts and drop outs.
+
+```{r density-plots, message=FALSE, fig.height=10, fig.width=15}
+furrr::future_walk(assay_sel, \(cur_assay) {
+  # Create tibble with image number, cell number, case and intensity values.
+  cur_dat <- dplyr::bind_cols(
+    image_numer = colData(spe_sub)$image_number,
+    cell_number = colData(spe_sub)$cell_number,
+    case_id = colData(spe_sub)$case_id,
+    t(assay(spe_sub, cur_assay)))
+  
+  # Pivot longer into channel and intensity columns
+  cur_dat <- cur_dat |>
+    tidyr::pivot_longer(cols = -c(image_numer, cell_number, case_id), 
+                        names_to = "channel", values_to = cur_assay)  |> 
+    dplyr::filter(channel %in% channels)  |> 
+    dplyr::arrange(case_id)
+  
+  # Plot Intensity distribution for all channels and donors.
+  p <- cur_dat |> 
+    ggplot(aes(x = get(cur_assay), y = as.factor(case_id))) +
+    geom_density_ridges(aes(fill = as.factor(case_id), color = "black"),
+                        size = 0.2, alpha = 0.5) +
+    facet_wrap(~channel) +
+    scale_fill_manual(values = palettes$casestages) +
+    scale_color_manual(values = palettes$stages) +
+    ggtitle(paste("ChannelsperDonor", "-", cur_assay)) +
+    guides(fill = FALSE) +
+    labs(x = cur_assay, y = "Case", color = "T1D stage") +
+    mytheme$standard() +
+    theme(axis.text.y = element_text(size = 3))
+  
+  # Save.
+  fn <- paste0(paste(today, "DensityPlots", "ChannelsperDonor",
+                     cur_assay, sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param_large))
+}, .options = options)
+```
+
+
+## 90th percentile
+
+Calculate the 90th percentile intensity in each channel for all donors.
+
+```{r 90-percentile, fig.height=10, fig.width=15}
+furrr::future_walk(.x = assay_sel, .f = \(cur_assay) {
+  # we only need the case id from colData
+  # get entire counts data frame. 
+  cur_dat <- dplyr::bind_cols(
+    case_id = colData(spe_sub)$case_id,
+    t(assay(spe_sub, cur_assay))
+  )
+
+  # Calculate 90th percentile of each channel (column-wise) and each case
+  cur_dat <- cur_dat |> 
+    group_by(case_id) |>
+    summarise(across(all_of(channels), \(x) quantile(x, probs = 0.9)))
+
+  cur_dat <- cur_dat |> 
+    tidyr::pivot_longer(cols = -case_id, names_to = "channel", values_to = "perc")
+  
+  # Plot percentiles
+  p <- cur_dat |>
+    ggplot(aes(x = as.factor(case_id), y = perc, fill = as.factor(case_id))) +
+    geom_bar(stat = "identity") +
+    scale_fill_manual(values = palettes$casestages) +
+    facet_wrap(~channel, scales = "free") +
+    labs(x = "Cases", y = "Counts 90th percentile", fill = "Cases") +
+    mytheme$standard() +
+    theme(
+      legend.position = "none",
+      axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 3)
+    )
+
+  fn <- paste0(paste(today, "90thPercentiles", cur_assay, sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param_large))
+}, .options = options)
+```
+
+
+## Heatmaps
+
+### Interactive heatmaps
+
+Interactive heatmaps of feature expression are generated using the [heatmaply package](https://github.com/talgalili/heatmaply).
+
+```{r heatmap-case-stage}
+hmlist <- list()
+hmlist <- replicate(n = length(plot_variables2), expr = list())
+names(hmlist) <- plot_variables2
+
+purrr::walk2(assay_sel, seq_along(assay_sel), \(cur_assay, idx_assay) {
+  purrr::walk2(plot_variables2, seq_along(plot_variables2), \(plot_x, idx_plots) {
+    # Prepare the data. summarize_heatmap defined in helpers.R
+    hm <- summarize_heatmap(spe_sub, cur_assay,
+                            names(plot_variables2)[idx_plots], channels, "mean")
+    # Row-side colors
+    cur_var <- metadata(spe)[[plot_x]]
+    rowsidecol <- cur_var[order(match(cur_var, rownames(hm)))]
+    rowsidepal <- palettes[[plot_x]]
+    rowsidepal <- rowsidepal[names(rowsidepal) %in% rownames(hm)]
+    rowsidepal <- rowsidepal[order(match(names(rowsidepal), rownames(hm)))]
+    # Define file name
+    fn <- paste0(paste(today, "Heatmap", plot_x, cur_assay, sep = "_"), ".html")
+
+    # Plot heatmap
+    hmlist[[idx_plots]][[idx_assay]] <- heatmaply(
+      heatmaply::normalize(hm),
+      RowSideColors = rowsidepal, row_side_palette = rowsidepal,
+      seriate = "OLO",
+      main = paste(plot_x, cur_assay, sep = " - "),
+      file = file.path(paths$folder_script, fn))
+  })
+})
+htmltools::tagList(setNames(hmlist, NULL))
+```
+
+### Visualize mean expression levels
+
+Heatmaps are generated with the [dittoSeq package](http://www.bioconductor.org/packages/release/bioc/html/dittoSeq.html).  
+
+Prepare the data:  
+* Calculate mean marker intensity per case.
+* Transform counts.
+
+```{r calculate-mean-expr}
+# Workaround for *** hardcoded `sample_id` in `SpatialExperiment`
+sce <- as(spe, "SingleCellExperiment")
+sce$sample_id <- sce$image_id
+
+# Calculate mean intensities
+sce_mean <- scuttle::aggregateAcrossCells(sce,
+                                          ids = sce$case_id,
+                                          statistics = "mean",
+                                          use.dimred = FALSE)
+colnames(sce_mean) <- sce_mean$case_id
+remove(sce)
+
+# Asinh-transformed counts
+assay(sce_mean, "exprs") <- asinh(assay(sce_mean, "counts"))
+
+# Quantile-normalized counts
+censor_val <- 0.999
+quant <- apply(assay(sce_mean, "counts"), 1, quantile, probs = censor_val)
+assay(sce_mean, "scaled") <- apply(assay(sce_mean, "counts"), 2,
+                                   function(x) x / quant)
+assay(sce_mean)[assay(sce_mean, "scaled") > 1] <- 1
+assay(sce_mean, "scaled")[assay(sce_mean, "scaled") < 0] <- 0
+
+# Select assays for ploting mean marker intensities
+assay_sel_mean <- c("counts", "exprs", "scaled")
+```
+
+Heatmaps of marker intensities without scaling
+
+```{r dittoheatmap-not-scaled}
+purrr::walk(assay_sel_mean, \(cur_assay) {
+  h <- dittoHeatmap(sce_mean, assay = cur_assay,
+                    annot.by = c("case_id", "donor_type"),
+                    order.by = match(cases, sce_mean$case_id),
+                    scale = "none", heatmap.colors = viridis(100),
+                    cluster_cols = FALSE,
+                    main = paste("Heatmap", "NotScaled", cur_assay,
+                                 sep = " - "),
+                    annotation_colors = list(case_id = palettes$cases,
+                                             donor_type = palettes$stages),
+                    genes = channels)
+  fn <- paste0(paste(today, "HeatmapDitto", "NotScaled",
+                     cur_assay, sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, h), plotsave_param))
+})
+```
+
+Centered and scaled mean marker intensities
+
+```{r dittoheatmap-centered-scaled}
+purrr::walk(assay_sel_mean, \(cur_assay) {
+  h <- dittoHeatmap(sce_mean, assay = cur_assay,
+                    annot.by = c("case_id", "donor_type"),
+                    order.by = match(cases, sce_mean$case_id),
+                    heatmap.colors = colorRampPalette(
+                    c("dark blue", "white", "dark red"))(100),
+                    cluster_cols = FALSE,
+                    main = paste("Heatmap", "Cent + Scaled", cur_assay,
+                                 sep = " - "),
+                    annotation_colors = list(case_id = palettes$cases,
+                                             donor_type = palettes$stages),
+                    breaks = seq(-3, 3, length.out = 101),
+                    genes = channels)
+  fn <- paste0(paste(today, "HeatmapDitto", "CenteredScaled",
+                     cur_assay, sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, h), plotsave_param))
+})
+```
+
+# **Dimensionality reduction**
+
+Dimensionality reduction algorithms are applied on different count transformations (`assays`) and stored in the `reducedDims` of the SPE object. 
+In addition, selected variables and marker expression are plotted on the obtained reduced dimensions.  
+
+Dimensionality reduction algorithms currently used:  
+- **UMAP** [uwot package](https://github.com/jlmelville/uwot)
+
+## Packages
+
+Change the path to the FIt-SNE source file below if needed.  
+
+```{r packages3, results='hide'}
+suppressPackageStartupMessages(c(
+  library(uwot),
+  library(viridis)
+))
+#source(file.path("/", "home", "ubuntu", "FIt-SNE", "fast_tsne.R"), chdir = TRUE)
+```
+
+## Select parameters
+
+- Dimensionality reduction algorithm
+- Assays (count transformations)
+- Channels
+- Variables to plot
+
+```{r select-assay2}
+# Select the dimensionality reduction algorithms to use
+dimred_sel <- c("UMAP") #, "tSNE")
+writeLines(c("Dimensionality reduction:", dimred_sel))
+
+# Select the assay(s) of interest
+assay_sel <- c("scaled", "exprs", "fastMNN_case_id")
+writeLines(c("\nAssays:", assay_sel[assay_sel %in% assayNames(spe)]), 
+           assay_sel[assay_sel %in% reducedDimNames(spe)])
+
+# Select the channels
+channels_dimred <- rowData(spe)[rowData(spe)$dimred == 1, ]$short_name
+cat(c("Channels:", channels_dimred[channels_dimred %in% rownames(spe)]))
+cat(c("\nNumber of channels:", length(channels_dimred)))
+
+# Variables to plot
+plot_variables <- c("stages", "cases", "batch")
+names(plot_variables) <- c("donor_type", "case_id", "batch")
+writeLines("\nVariables to plot:")
+print(plot_variables)
+
+# Subset the SPE object
+spe_sub <- spe[channels_dimred, metadata(spe)[["subset"]]]
+cells_not_subset <- colnames(spe)[! colnames(spe) %in% metadata(spe)$subset]
+```
+
+
+## Run dimensionality reduction
+
+### Run UMAP
+
+UMAP for every selected assay, only if there is no object with the same name in `reducedDimNames(spe)`.  
+UMAP is performed on subsampled cells only (`spe_sub`) and the results are "extrapolated" to the other cells (`spe_test`).
+
+```{r run-UMAP}
+# Generate a "test" set
+spe_test <- spe[channels_dimred, cells_not_subset]
+
+# Save as variable and write assays to NULL. Reduces memory overhead for parallelization. 
+colnames_spe <- colnames(spe)
+
+# Add UMAPs to SPE object
+results <- purrr::map(assay_sel, \(cur_assay) {
+  dimred_name <- paste("UMAP", cur_assay, sep = "_")
+  print(dimred_name)
+
+  # Run UMAP on a cell subset
+  if ((!dimred_name %in% reducedDimNames(spe_sub)) && ("UMAP" %in% dimred_sel)) {
+    # Extract Counts. 
+    if (cur_assay %in% assayNames(spe_sub)) {
+      counts <- t(assay(spe_sub, cur_assay))
+      counts_test <- t(assay(spe_test, cur_assay))
+    } else {
+      counts <- reducedDim(spe_sub, cur_assay)
+      counts_test <- reducedDim(spe_test, cur_assay)
+    }
+
+    # Run UMAP.
+    umap_model <- uwot::umap(counts, ret_model = TRUE)
+    # Extract Embedding.
+    cur_umap <- umap_model$embedding
+    colnames(cur_umap) <- c("UMAP1", "UMAP2")
+    rownames(cur_umap) <- rownames(counts)
+    
+    # Embed the "test" cells into the existing embedding
+    umap_test <- uwot::umap_transform(counts_test, umap_model)
+    colnames(umap_test) <- c("UMAP1", "UMAP2")
+    rownames(umap_test) <- rownames(counts_test)
+
+    # Merge and order the two UMAP embeddings and add to the SPE object
+    cur_umap <- rbind(cur_umap, umap_test)
+    cur_umap <- cur_umap[order(match(rownames(cur_umap), colnames_spe)), ]
+    
+    remove(umap_model, umap_test, counts_test, counts)
+    cur_umap
+  }
+})
+remove(spe_test)
+
+dimred_name1 <- paste("UMAP", assay_sel[1], sep = "_")
+dimred_name2 <- paste("UMAP", assay_sel[2], sep = "_")
+dimred_name3 <- paste("UMAP", assay_sel[3], sep = "_")
+dimred_name4 <- paste("UMAP", assay_sel[4], sep = "_")
+
+reducedDim(spe, dimred_name1) <- results[[1]]
+reducedDim(spe, dimred_name2) <- results[[2]]
+reducedDim(spe, dimred_name3) <- results[[3]]
+reducedDim(spe, dimred_name4) <- results[[4]]
+```
+
+## Save the updated SPE object
+
+Contains the new reduced dimensions
+
+```{r save-spe1}
+fn_spe <- file.path(paths$folder_script, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+print(reducedDimNames(spe))
+print(assayNames(spe))
+saveRDS(spe, fn_spe)
+```
+
+
+## Plot reduced dimensions
+
+### Plot variables
+
+Plot selected variables on reduced dimensions.
+
+```{r plot-dimred, fig.width=15, fig.height=10}
+# assay_sel <- c("scaled", "exprs", "fastMNN_case_id")
+# Prepare the data
+cur_dat <- makePerCellDF(spe[, colnames(spe) %in% metadata(spe)$subset]) |>
+  dplyr::mutate(case_id = factor(case_id, levels = cases),
+                donor_type = factor(donor_type, levels = stages)) |>
+  dplyr::arrange(case_id, donor_type)
+
+# Plot variables
+purrr::walk(assay_sel, \(cur_assay) {
+  purrr::walk(dimred_sel, \(cur_dimred) {
+    purrr::walk2(plot_variables, names(plot_variables), \(cur_var, name_cur_var) {
+      dimred_name <- paste(cur_dimred, cur_assay, sep = "_")
+      message(dimred_name)
+      message(name_cur_var)
+      p <- plot_dim_red(dat = cur_dat, dimred = dimred_name, color_by = name_cur_var,
+                        size = 0.1, palette = palettes[[cur_var]])
+      
+      fn <- paste0(paste(today, dimred_name, cur_var, sep = "_"), ".png")
+      do.call(ggsave, c(list(fn, p), plotsave_param))
+    })
+  })
+}, .progress = TRUE)
+```
+
+### Plot distance to islet edge
+
+```{r plot-dimred-distance}
+# Calculate log of distance
+cur_dat$logDist <- log(abs(cur_dat$distance_to_islet) + 1) * sign(cur_dat$distance_to_islet)
+
+# Plot log of distance
+purrr::walk(assay_sel, \(cur_assay) {
+  purrr::walk(dimred_sel, \(cur_dimred) {
+    dimred_name <- paste(cur_dimred, cur_assay, sep = "_")
+    print(dimred_name)
+    p <- plot_dim_red(cur_dat, dimred_name, "logDist",
+                      size = 0.1, palette_continuous = TRUE) +
+      scale_colour_gradient2(
+        low = "#2166AC", mid = "white", high = "#B2182B", midpoint = 0,
+        limits = c(range(cur_dat$logDist)[1], range(cur_dat$logDist)[2])
+      )
+    
+    fn <- paste0(paste(today, dimred_name, "DistanceIslet", sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param))
+  })
+}, .progress = TRUE)
+```
+
+### Plot ion counts
+
+Shannon entropy can be used to visualize potential biases in ion counts distribution across cells.    
+
+```{r plot-dimred-shannon}
+# Calculate ion count
+# spe_sub <- spe[channels, metadata(spe)[["subset"]]]
+# cur_dat <- makePerCellDF(spe_sub, use_dimred = TRUE)
+
+# Summed Log-counts of all cells
+ion_counts <- log(colSums(counts(spe_sub)))
+ion_counts <- ion_counts[order(match(names(ion_counts), rownames(cur_dat)))]
+cur_dat$ion_counts <- ion_counts
+
+# Calculate Shannon entropy
+prop <- t(t(counts(spe_sub)) / colSums(counts(spe_sub)))
+prod <- prop * log2(prop)
+prod[is.na(prod)] <- 0
+entropy <- -colSums(prod)
+entropy <- entropy[order(match(names(entropy), rownames(cur_dat)))]
+cur_dat$entropy <- entropy
+
+# Plot ion count
+purrr::walk(assay_sel, \(cur_assay) {
+  purrr::walk(dimred_sel, \(cur_dimred) {
+    dimred_name <- paste(cur_dimred, cur_assay, sep = "_")
+
+    p <- plot_dim_red(cur_dat, dimred_name, "ion_counts",
+                      size = 0.1, palette_continuous = TRUE) +
+      scale_color_viridis(option = "magma")
+    
+    fn <- paste0(paste(today, dimred_name, "IonCount", "Total",
+                       sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param))
+  })
+}, .progress = TRUE)
+
+# Plot Shannon entropy
+purrr::walk(assay_sel, \(cur_assay) {
+  purrr::walk(dimred_sel, \(cur_dimred) {
+    dimred_name <- paste(cur_dimred, cur_assay, sep = "_")
+    
+    p <- plot_dim_red(cur_dat, dimred_name, "entropy",
+                      size = 0.1, palette_continuous = TRUE) +
+      scale_color_viridis(option = "magma")
+    
+    fn <- paste0(paste(today, dimred_name, "IonCount", "Shannon",
+                       sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param))
+  })
+}, .progress = TRUE)
+```
+
+### Plot marker expression
+
+```{r plot-dimred-channels, fig.height=10, fig.width=15}
+# Subset the SPE object
+spe_sub <- spe[channels, metadata(spe)[["subset"]]]
+
+# Plot marker expression
+tic("Plot marker expression")
+purrr::walk(assay_sel, \(cur_assay) {
+  purrr::walk(dimred_sel, \(cur_dimred) {
+    dimred_name <- paste(cur_dimred, cur_assay, sep = "_")
+
+    # Prepare the data
+    if (cur_assay %in% assayNames(spe_sub)) {
+      cur_dat <- scuttle::makePerCellDF(spe_sub, features = channels,
+                                        exprs_values = cur_assay) |>
+                  dplyr::select(c(all_of(channels), paste0(dimred_name, ".1"), 
+                                                    paste0(dimred_name, ".2")))
+    } else {
+      cur_dat <- scuttle::makePerCellDF(spe_sub, features = channels,
+                                        exprs_values = "exprs") |>
+        dplyr::select(c(all_of(channels), paste0(dimred_name, ".1"), 
+                                          paste0(dimred_name, ".2")))
+    }
+    
+    cur_dat <- cur_dat |>
+      tidyr::pivot_longer(cols = all_of(channels),
+                          names_to = "channel",
+                          values_to = cur_assay)
+    
+    # Plot marker expression
+    p <- plot_dim_red_channels(cur_dat, dimred_name, cur_assay,
+                               channels, force_points = TRUE)
+
+    fn <- paste0(paste(today, dimred_name, "Channels", sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param_large))
+  })
+}, .progress = TRUE)
+toc()
+```
+
+## PCA for sample-level variance
+
+1) Perform Principal component analysis.
+2) Analyze which co-variates are correlated with the first 2 PCs.
+3) Visualize
+
+```{r pca-sample, warning=FALSE}
+channels_dimred <- rowData(spe_sub)[rowData(spe_sub)$dimred == 1, ]$short_name
+
+## Assays.
+pcas <- furrr::future_map(assay_sel_mean, \(cur_assay) {
+  dimred_name <- paste("PCA", cur_assay, sep = "_")
+  # Exclude DNA and H3 channels
+  cur_dimred <- scater::calculatePCA(sce_mean,
+                                     exprs_values = cur_assay,
+                                     ncomponents = 10,
+                                     subset_row = channels_dimred, # !(grepl("DNA|H3", rownames(spe))),
+                                     BPPARAM = BiocParallel::MulticoreParam(),
+                                     scale = TRUE)
+  cur_dimred
+}, .options = options)
+pcas <- setNames(pcas, assay_sel_mean)
+```
+
+### Test for correlated co-variates
+Identify which co-variates are correlated with the first 2 PCs.
+We expect: biological and technical effects.
+
+Note: this is computed on the SCE containing the mean marker intensities.
+
+```{r calculate-pca-association}
+corr_pca <- purrr::map(pcas, \(cur_pc) {
+  # Add covariates to the reduced dimensions
+  cur_pc <- as_tibble(cur_pc, rownames = "case_id") |> 
+    dplyr::left_join(as_tibble(colData(sce_mean)), by = "case_id")  |> 
+    dplyr::select(!starts_with(c("image", "cell", "islet")))  |> 
+    dplyr::select(!ends_with(c("px", "islet")))  |> 
+    dplyr::select(-c(panel, sample_id, case_number))
+
+  df <- as.data.frame(cur_pc)
+  mlm_res <- lm(cbind(PC1, PC2) ~ batch + donor_type + gender + age + race + BMI, data = df)
+  broom::tidy(mlm_res) |> 
+    dplyr::mutate(adj_p.value = p.adjust(p.value, method = "fdr")) |> 
+    dplyr::arrange(response, adj_p.value)
+})
+purrr::walk(corr_pca, \(x) print(x, n = "all"))
+```
+
+Results: Significant contributions are observed by the batch and the donor type (stage).
+Age also shows a significant effect to PC1 (as expected).
+BMI, Sex, Race did not show an significant effect.
+
+### Visualize PCA
+
+Visualize the effect of the age, batch and stage on the first 2 PCs.
+
+```{r visualize-pca, warning=FALSE}
+var_to_plot <- c("donor_type", "batch", "age")
+
+plot_list <- purrr::map2(pcas, names(pcas), \(cur_pc, cur_assay) {
+  purrr::walk(var_to_plot, \(cur_var) {
+    # Scatter plot 
+    ifelse(cur_var == "age", discrete <- FALSE, discrete <- TRUE)
+    p <- as_tibble(cur_pc, rownames = "case_id") |> 
+      dplyr::left_join(as_tibble(colData(sce_mean)), by = "case_id") |> 
+      ggplot2::ggplot(aes(x = PC1, y = PC2)) +
+      geom_point(aes(color = get(cur_var)), size = 5) +
+      # geom_text(aes(label = case_id), hjust = -0.1, vjust = -0.1, show.legend = FALSE) +
+      ggtitle(paste("PCA", cur_assay, sep = " - ")) +
+      labs(x = paste0("PCA 1 [", round(attributes(cur_pc)$varExplained[1], 1), " %]"),
+           y = paste0("PCA 2 [", round(attributes(cur_pc)$varExplained[2], 1), " %]")) +
+      mytheme$standard() + 
+      viridis::scale_color_viridis(discrete = discrete)
+    
+    fn <- paste0(paste(today, "LowLevel", "PCA", cur_assay, cur_var,
+                       sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param))
+  })
+})
+```
+
+Alternatively, we can also visualize sample-level variance by MDS and NMF plots.
+We deleted these.
+
+# **Image Visualization**
+
+The [cytomapper](https://github.com/BodenmillerGroup/cytomapper/) package can be used to visualize IMC data. 
+For this, the names and locations of the image files must be retrieved and added to the spe object.
+
+```{r packages4, results='hide'}
+suppressPackageStartupMessages(c(
+  library(cytomapper)
+))
+```
+
+
+## Parameters
+
+The following files are required: 
+- Image stacks (multichannel `.tiff` stacks)  
+- Cell masks (`tiff` images)  
+
+A few random images (number defined in `nb_images`) are loaded and displayed.   
+
+**Folder names and file name patterns must be changed manually**  
+
+```{r image-settings}
+# Number of images to load and display
+nb_images <- 14
+image_extension <- ".tiff"
+segmentation_type <- "whole-cell"
+
+# Folders
+folder_images <- file.path(paths$folder_in, "img", paths$panel_type)
+if (!dir.exists(folder_images)) stop("Image folder not found")
+folder_masks <- file.path(paths$folder_in, "masks_cells",
+                          paths$panel_type, segmentation_type)
+if (!dir.exists(folder_masks)) stop("Mask folder not found")
+
+# Select random images and the associated masks
+set.seed(seed)
+image_list <- list.files(folder_images)
+image_list <- mask_list <- sort(sample(unique(image_list), nb_images))
+writeLines(c("Selected images:", image_list))
+```
+
+
+## Load images
+
+Load full image stacks and cell masks as `CytoImageList` objects.
+
+```{r load-images}
+# Load multichannel images
+images <- yoloader(
+  x = spe,
+  image_dir = folder_images,
+  image_names = image_list,
+  type = "stacks"
+  # on_disk = TRUE,
+  # h5FilesPath = HDF5Array::getHDF5DumpDir()
+)
+
+# Load cell masks
+masks <- yoloader(
+  x = spe,
+  image_dir = folder_masks,
+  image_names = mask_list,
+  as.is = TRUE,
+  # bit.depth = ,
+  type = "masks"
+)
+
+if (length(setdiff(mcols(images)$ImageName,
+                   mcols(masks)$ImageName)) != 0) {
+  print("mcols(images)$ImageName and mcols(masks)$ImageName
+        should have the same values")
+}
+
+# Subset the SPE object
+spe_sub <- spe[, spe$image_fullname %in% image_list]
+spe_sub$ImageName <- gsub(image_extension, "", spe_sub$image_fullname)
+```
+
+
+## Plot images
+
+Display selected variables on the randomly selected images. Note that the 
+images are saved but not displayed.
+
+### Plot cell-level data
+
+Plot cell-level data on cell masks.
+
+```{r cytomapper-plot-cells}
+# Cell area
+fn <- list(filename = file.path(
+  plotsave_param$path,
+  paste0(paste(today, "Cytomapper", "Cell", "Area", sep = "_"), ".png")))
+
+cytomapper::plotCells(masks, object = spe_sub,
+                      cell_id = "cell_number", img_id = "ImageName",
+                      colour_by = "cell_area", save_plot = fn)
+
+# Distance to islet
+fn <- list(filename = file.path(
+  plotsave_param$path,
+  paste0(paste(today, "Cytomapper", "Islet", "Distance", sep = "_"), ".png")))
+
+cytomapper::plotCells(masks, object = spe_sub,
+                      cell_id = "cell_number", img_id = "ImageName",
+                      colour_by = "distance_to_islet", save_plot = fn)
+
+# Parent islet
+fn <- list(filename = file.path(
+  plotsave_param$path,
+  paste0(paste(today, "Cytomapper", "Islet", "Parent", sep = "_"), ".png")))
+
+cytomapper::plotCells(masks, object = spe_sub,
+                      cell_id = "cell_number", img_id = "ImageName",
+                      colour_by = "islet_parent", save_plot = fn)
+
+# Closest islet
+fn <- list(filename = file.path(
+  plotsave_param$path,
+  paste0(paste(today, "Cytomapper", "Islet", "Closest", sep = "_"), ".png")))
+
+cytomapper::plotCells(masks, object = spe_sub,
+                      cell_id = "cell_number", img_id = "ImageName",
+                      colour_by =  "islet_closest", save_plot = fn)
+```
+
+### Plot counts
+
+Plot counts and counts transformation on cell masks for a single channel.
+Here, we choose `SYP`, the islet marker.
+
+```{r cytomapper-plot-counts1}
+counts_to_plot <- assayNames(spe)
+channel_to_plot <- c("SYP")
+
+purrr::walk(counts_to_plot, \(cur_counts) {
+  fn <- list(filename = file.path(
+    plotsave_param$path,
+    paste0(paste(today, "Cytomapper", "Counts", channel_to_plot,
+                 cur_counts, sep = "_"), ".png"))
+  )
+  
+  cytomapper::plotCells(masks, object = spe_sub,
+                        cell_id = "cell_number", img_id = "ImageName",
+                        exprs_values = cur_counts, colour_by = channel_to_plot,
+                        save_plot = fn)
+})
+```
+
+Repeat for GCG.
+```{r cytomapper-plot-counts2}
+counts_to_plot <- assayNames(spe)
+channel_to_plot <- c("GCG")
+
+purrr::walk(counts_to_plot, \(cur_counts) {
+  fn <- list(filename = file.path(
+    plotsave_param$path,
+    paste0(paste(today, "Cytomapper", "Counts", channel_to_plot,
+                 cur_counts, sep = "_"), ".png"))
+  )
+  
+  cytomapper::plotCells(masks, object = spe_sub,
+                        cell_id = "cell_number", img_id = "ImageName",
+                        exprs_values = cur_counts, colour_by = channel_to_plot,
+                        save_plot = fn)
+})
+```
+
+### Plot pixel-level data
+
+Plot channel from the original images. Here, we choose the main Islet markers
+(`INS`, `GCG`, `SST`) and afterwards the immune markers (`CD3e`, `CD8a`, `CD163`).
+
+```{r cytomapper-plot-pixels}
+# Plot SYP also on the pixel level.
+fn <- list(filename = file.path(
+  plotsave_param$path,
+  paste0(paste(today, "Cytomapper", "Pixels0", sep = "_"), ".png")))
+
+cytomapper::plotPixels(images, object = spe_sub, cell_id = "cell_number",
+                       img_id = "ImageName",
+                       colour_by = c("SYP"),
+                       image_title = NULL, scale = TRUE, save_plot = fn)
+
+# First set of channels
+fn <- list(filename = file.path(
+  plotsave_param$path,
+  paste0(paste(today, "Cytomapper", "Pixels1", sep = "_"), ".png")))
+
+cytomapper::plotPixels(images, object = spe_sub,
+                       masks, cell_id = "cell_number", img_id = "ImageName",
+                       colour_by = c("INS", "GCG", "SST"),
+                       outline_by = c("donor_type"),
+                       bcg = list(INS = c(0, 5, 1), GCG = c(0, 5, 1),
+                                  SST = c(0, 5, 1)),
+                       image_title = NULL, scale = TRUE, save_plot = fn)
+
+# Second set of channels
+fn <- list(filename = file.path(
+  plotsave_param$path,
+  paste0(paste(today, "Cytomapper", "Pixels2", sep = "_"), ".png")))
+
+cytomapper::plotPixels(images, object = spe_sub,
+                       masks, cell_id = "cell_number", img_id = "ImageName",
+                       colour_by = c("CD3e", "CD8a", "CD163"),
+                       outline_by = "cell_area",
+                       bcg = list(CD3e = c(0, 5, 1), CD8a = c(0, 5, 1),
+                                  CD163 = c(0, 5, 1)),
+                       image_title = NULL, scale = TRUE, save_plot = fn)
+```
+
+
+## Save images
+
+Images and masks can be saved as `CytoImageList` objects but this is not 
+recommended at this stage (may cause long processing time and generate very 
+large files).
+
+```{r save-images}
+# saveRDS(images, file.path(paths$folder_out, "cytomapper", paste0(
+#   "images_", paths$panel_type, ".rds")))
+# saveRDS(masks, file.path(paths$folder_out, "cytomapper", paste0(
+#   "masks_", paths$object_type, "_", paths$panel_type, ".rds")))
+```
+
+
+## Spillover compensation
+
+The [cytomapper](https://github.com/BodenmillerGroup/cytomapper) allows channel
+spillover compensation directly on multi-channel images.  
+
+The `compImage` function takes a `CytoImageList` object and the estimated 
+spillover matrix as input. The `channelNames` need to be set according to 
+their metal isotope in the form (mt)(mass)Di and therefore match 
+`colnames(sm)`.
+
+### Spillover matrix
+
+```{r spillover-matrix}
+do_img_compensation <- TRUE
+
+if (isTRUE(do_img_compensation)) {
+  # Load the spillover matrix (saved in `SpilloverCompensation` script)
+  folder_spillcomp <- file.path(paths$folder_in, "spillcomp")
+  fn_spillmat <- paste0(paste("spillmat", paths$panel_type, "Batch1",
+                              sep = "_"), ".csv")
+  spillmat <- read.csv(file.path(folder_spillcomp, fn_spillmat))
+  
+  # Correct the channel names in `CytoImageList` images
+  if (!identical(rownames(spe), cytomapper::channelNames(images))) {
+    stop("Channel names in images and SPE object are different")
+  }
+  original_channel_names <- cytomapper::channelNames(images)
+  cytomapper::channelNames(images) <- paste0(rowData(spe)$metal, "Di")
+  cytomapper::setChannels(images, "Ir191Di") <- NULL
+  cytomapper::setChannels(images, "Ir193Di") <- NULL
+  original_channel_names <- original_channel_names[
+    !(original_channel_names %in% c("Ir191", "Ir193"))]
+  
+  # Adapt the spillover matrix
+  spillmat <- spillmat[, colnames(spillmat) %in% cytomapper::channelNames(images)]
+  spillmat$X <- NULL
+  spillmat <- data.matrix(spillmat, rownames.force = NA)
+}
+```
+
+### Spillover compensation on images
+
+```{r spillover-compensation}
+if (isTRUE(do_img_compensation)) {
+  images_comp <- cytomapper::compImage(images, spillmat)
+}
+```
+
+### Plot compensated images
+
+Compare images before and after compensation.
+
+```{r spillover-plot}
+if (isTRUE(do_img_compensation)) {
+  # In115
+  fn <- list(filename = file.path(plotsave_param$path, paste0(
+    paste(today, "Cytomapper", "SpillComp", "In115-before", sep = "_"), ".png")))
+  
+  plotPixels(images, colour_by = "In115Di", 
+             bcg = list(In115Di = c(0, 4, 1)), legend = NULL, save_plot = fn)
+  plotPixels(images[10], colour_by = "In115Di",
+             image_title = list(text = "In115 - before", position = "topleft"),
+             bcg = list(In115Di = c(0, 4, 1)), legend = NULL)
+  
+  fn <- list(filename = file.path(plotsave_param$path, paste0(
+    paste(today, "Cytomapper", "SpillComp", "In115-after", sep = "_"), ".png")))
+  
+  plotPixels(images_comp, colour_by = "In115Di",
+             bcg = list(In115Di = c(0, 4, 1)), legend = NULL, save_plot = fn)
+  plotPixels(images_comp[10], colour_by = "In115Di",
+             image_title = list(text = "In115 - after", position = "topleft"),
+             bcg = list(In115Di = c(0, 4, 1)), legend = NULL)
+  
+  # Nd142
+  fn <- list(filename = file.path(plotsave_param$path, paste0(
+    paste(today, "Cytomapper", "SpillComp", "Nd142-before", sep = "_"), ".png")))
+  
+  plotPixels(images, colour_by = "Nd142Di",
+             bcg = list(Nd142Di = c(0, 4, 1)), legend = NULL, save_plot = fn)
+  plotPixels(images[10], colour_by = "Nd142Di",
+             image_title = list(text = "Nd142 - before", position = "topleft"),
+             bcg = list(Nd142Di = c(0, 4, 1)), legend = NULL)
+  
+  fn <- list(filename = file.path(plotsave_param$path, paste0(
+    paste(today, "Cytomapper", "SpillComp", "Nd142-after", sep = "_"), ".png")))
+  
+  plotPixels(images_comp, colour_by = "Nd142Di",
+             bcg = list(Nd142Di = c(0, 4, 1)), legend = NULL, save_plot = fn)
+  plotPixels(images_comp[10], colour_by = "Nd142Di",
+             image_title = list(text = "Nd142 - after", position = "topleft"),
+             bcg = list(Nd142Di = c(0, 4, 1)), legend = NULL)
+  
+  # SYP: Nd146
+  fn <- list(filename = file.path(plotsave_param$path, paste0(
+    paste(today, "Cytomapper", "SpillComp", "Nd146-before", sep = "_"), ".png")))
+  
+  plotPixels(images, colour_by = "Nd146Di",
+             bcg = list(Nd146Di = c(0, 4, 1)), legend = NULL, save_plot = fn)
+  plotPixels(images[10], colour_by = "Nd146Di",
+             image_title = list(text = "Nd146 - before", position = "topleft"),
+             bcg = list(Nd146Di = c(0, 4, 1)), legend = NULL)
+  
+  fn <- list(filename = file.path(plotsave_param$path, paste0(
+    paste(today, "Cytomapper", "SpillComp", "Nd146-after", sep = "_"), ".png")))
+  
+  plotPixels(images_comp, colour_by = "Nd146Di",
+             bcg = list(Nd146Di = c(0, 4, 1)), legend = NULL, save_plot = fn)
+  plotPixels(images_comp[10], colour_by = "Nd146Di",
+             image_title = list(text = "Nd146 - after", position = "topleft"),
+             bcg = list(Nd146Di = c(0, 4, 1)), legend = NULL)
+}
+```
+
+### Save compensated images
+
+Spillover-compensated images can be saved as `CytoImageList` objects. Note that
+this may cause long processing time and generate very large files.
+
+```{r spillover-save-images}
+library(tiff)
+if (isTRUE(do_img_compensation)) {
+  # Restore the original channel names
+  channelNames(images_comp) <- original_channel_names
+
+  # Save the compensated images
+  fn <- file.path(paths$folder_in, "cytomapper", paths$panel_type)
+  if (!dir.exists(fn)) { dir.create(fn, recursive = TRUE)}
+  
+  # Save the images as tiff files
+  furrr::future_walk(names(images_comp), 
+    function(x){
+      writeImage(as.array(images_comp[[x]])/(2^16 - 1), 
+                 file.path(fn, paste0(x, ".tiff")),
+                 bits.per.sample = 16)
+  }, .options = options)
+
+  #saveRDS(images_comp, file.path(paths$folder_out, "cytomapper", paste0(
+  #   "images_", paths$panel_type, ".rds")))
+  #saveRDS(masks, file.path(paths$folder_out, "cytomapper", paste0(
+  #   "masks_", paths$object_type, "_", paths$panel_type, ".rds")))
+}
+```

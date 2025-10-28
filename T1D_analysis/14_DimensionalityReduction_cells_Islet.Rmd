@@ -1,0 +1,337 @@
+---
+title: "14_DimensionalityReduction_cells_Islet"
+author: "Nicolas Damond, Nathan Steenbuck"
+date: "Created: 24 May, 2022; Compiled: `r format(Sys.time(), '%d %b, %Y')`"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+cur_user <- Sys.info()[["user"]]
+script_name <- "14_DimensionalityReduction_cells_Islet.Rmd"
+
+if (cur_user == "ubuntu") {
+  source(file.path("/", "mnt", "T1D_Vol", "T1D_analysis", "analysis", "helpers.R"))
+  #n_cores <- future::availableCores() - 1
+  n_cores <- 2
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  knitr::opts_knit$set(root_dir = paths$home_data)
+  do_print <- FALSE
+} else {
+  source(file.path("/", "home", "nsteen", "scripts", "T1D_analysis", "analysis", "helpers.R"))
+  n_cores <- 8
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  paths$folder_script <- paths$cluster_folder_script
+  paths$folder_in <- paths$cluster_folder_in
+  paths$folder_out <- paths$cluster_home 
+  knitr::opts_knit$set(root_dir = paths$cluster_home)
+  do_print <- TRUE
+}
+
+seed <- 123456
+set.seed(seed)
+options <- furrr::furrr_options(seed = seed)
+# FIXME: maybe perform also Infiltration score?
+paths$prev <- paste("12_CellTypeSCEs", paths$object_type, paths$panel_type, sep = "_")
+knitr::opts_chunk$set(echo = TRUE)
+options(future.globals.maxSize = 60 * 1024 * 1024 * 1024)
+```
+
+
+# **Goal**
+
+Run dimensionality reduction and plot reduced dimensions for individual cell types.  
+
+
+# **Settings**  
+
+## Load packages
+
+```{r packages, results='hide'}
+suppressPackageStartupMessages(c(
+  library(data.table),
+  library(dplyr),
+  library(SpatialExperiment),
+  library(parallel)
+))
+```
+
+## Paths and settings
+
+```{r settings}
+# Paths
+# Paths
+if (!dir.exists(paths$folder_script)) dir.create(paths$folder_script)
+plotsave_param$path <- paths$folder_script
+plotsave_param_large$path <- paths$folder_script
+
+# Misc settings
+today <- gsub("-", "", Sys.Date())
+```
+
+##  Read in the data
+
+Load the SpatialExperiment (SPE) object saved at the previous step.
+
+```{r load-data}
+fn_spe <- file.path(paths$folder_out, paths$prev, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+spe <- readRDS(fn_spe)
+print(spe)
+```
+
+##  Read in the data
+
+Load the list containing one SCE object per cell type.  
+
+```{r load-data-celltypes}
+folder_spes <- file.path(paths$folder_out, paste0("12_CellTypeSCEs_", paths$object_type, "_", paths$panel_type))
+fn_spes <- file.path(folder_spes, "celltypes_Islet.rds")
+
+spes <- readRDS(fn_spes)
+print(spes)
+```
+
+
+# **Reduce dimensions** 
+
+Dimensionality reduction is performed on each SCE object in the `spes` list.
+
+Dimensionality reduction algorithms currently used:  
+- **PCA**
+- **UMAP**
+- **tSNE**
+- **Diffusion map**
+
+## Packages
+
+```{r packages2, results='hide'}
+suppressPackageStartupMessages(c(
+  library(uwot),
+  library(destiny),
+  library(viridis),
+  library(scater),
+  library(foreach),
+  library(doParallel),
+  library(SingleCellExperiment),
+  library(SummarizedExperiment),
+  library(RSpectra)
+))
+```
+
+## Select parameters
+
+Select the dimensionality reductions algorithms, assays and channels to use and the variables to plot on reduced dimensions.
+
+```{r select-assay2}
+# Select the dimensionality reduction algorithms to use
+dimred_sel <- c("UMAP", "DiffMap")
+writeLines(c("Dimensionality reduction:", dimred_sel))
+
+# Select the assay(s) of interest
+assay_sel <- c("exprs") # , "scaled") # c("scaled", "exprs") # , "fastMNN_case_id")
+writeLines(c("\nAssays:", assay_sel[assay_sel %in% SummarizedExperiment::assayNames(spes[[1]])]))
+
+# Variables to plot
+plot_variables <- c("stages", "cases")
+names(plot_variables) <- c("donor_type", "case_id")
+writeLines("\nVariables to plot:")
+print(plot_variables)
+
+# Cell state channels (not used for dimensionality reduction)
+channels_state <- c("Ki67")
+```
+
+## Run PCA
+
+```{r run-PCA}
+# Function to calculate PCA
+calc_PCA <- function(x, exprs_values, channels = NULL) {
+  if (is.null(channels))
+    cur_channels <- rownames(x)[!rownames(x) %in% channels_state]
+  else
+    cur_channels <- channels
+  
+  purrr::map(exprs_values, \(cur_exprs) {
+    dimred_name <- paste("PCA", cur_exprs, sep = "_")
+    
+    if (!dimred_name %in% SingleCellExperiment::reducedDimNames(x)) {
+      x <- scater::runPCA(
+        x, exprs_values = cur_exprs, 
+        subset_row = cur_channels, ncomponents = 5, 
+        ntop = length(cur_channels) / 2, name = dimred_name
+      )
+    }
+    return(x)
+  })
+}
+
+# Run PCA
+spes <- lapply(spes, FUN = calc_PCA, exprs_values = assay_sel)
+spes <- unlist(spes)
+# spes <<- unlist(purrr::map(spes, \(spes_x) {
+#   calc_PCA(spes_x, exprs_values = assay_sel)}))
+```
+
+
+## Run UMAP
+
+```{r run-UMAP}
+# Function to calculate UMAP
+calc_UMAP <- function(x, exprs_values, channels = NULL) {
+  if (is.null(channels))
+    cur_channels <- rownames(x)[!rownames(x) %in% channels_state]
+  else
+    cur_channels <- channels
+
+  for (i in seq_along(exprs_values)) {
+    dimred_name <- paste("UMAP", exprs_values[i], sep = "_")
+    
+    if (!dimred_name %in% SingleCellExperiment::reducedDimNames(x)) {
+      cur.umap <- umap(t(SummarizedExperiment::assay(x, exprs_values[i])[cur_channels,]))
+      colnames(cur.umap) <- c("UMAP1", "UMAP2")
+      rownames(cur.umap) <- colnames(SummarizedExperiment::assay(x, exprs_values[i]))
+      SingleCellExperiment::reducedDim(x, dimred_name) <- cur.umap
+      remove(cur.umap)
+    }
+  }
+  return(x)
+}
+
+# Run UMAP
+spes <- parallel::mclapply(spes, FUN = calc_UMAP, exprs_values = assay_sel, mc.cores = n_cores)
+#spes <- lapply(spes, FUN = calc_UMAP, exprs_values = assay_sel)
+# FIXME: unlist?
+
+#spes <<- unlist(purrr::map(spes, \(spe_x) {
+#    calc_UMAP(spe_x, exprs_values = assay_sel) 
+#  }))
+```
+
+## Run Diffusion Map
+
+DiffMap is run on the principal components of each assay, rather than on the counts.
+
+```{r run-diffmap}
+# Function to calculate Diffusion Map
+calc_diff_map <- function(x, exprs_values, channels = NULL) {
+  if (is.null(channels))
+    cur_channels <- rownames(x)[!rownames(x) %in% channels_state]
+  else
+    cur_channels <- channels
+    
+  for (i in seq_along(exprs_values)) {
+    dimred_name <- paste("DiffMap", exprs_values[i], sep = "_")
+    
+    if (!dimred_name %in% SingleCellExperiment::reducedDimNames(x)) {
+      pca_name <- paste("PCA", exprs_values[i], sep = "_")
+      cur_pca <- SingleCellExperiment::reducedDim(x, pca_name)
+
+      cur_diffmap <- destiny::DiffusionMap(cur_pca)
+      SingleCellExperiment::reducedDim(x, dimred_name) <- cur_diffmap@eigenvectors[, c("DC1", "DC2"), drop = FALSE]
+      colnames(SingleCellExperiment::reducedDim(x, dimred_name)) <- c("DiffMap1", "DiffMap2")
+    }
+  }
+  return(x)
+}
+
+# Run Diffusion Map
+spes <- mclapply(spes, FUN = calc_diff_map, exprs_values = assay_sel,
+                 mc.cores = n_cores)
+```
+
+## Save the updated SCE
+
+Contains the new reduced dimensions.
+
+```{r save-spes}
+print(spes)
+saveRDS(spes, fn_spes)
+```
+
+
+# **Plot reduced dimensions**
+
+Because many plots are generated, the functions are run in parallel to save time. 
+The plots are saved but not displayed in the notebook.
+
+## Plot variables
+
+```{r plot-dimred-variables}
+# Function for parallel plotting of variables
+lplot_dim_red <- function(x, exprs_values, dimred, variables) {
+  cur_dat <- makePerCellDF(x, use_dimred = TRUE) |>
+    mutate(case_id = factor(case_id, levels = metadata(spe)$cases),
+           donor_type = factor(donor_type, levels = metadata(spe)$stages)) |>
+    arrange(case_id, donor_type)
+  
+  purrr::map(exprs_values, \(cur_exprs) {
+    purrr::map(dimred_sel, \(cur_dimred) {
+      purrr::map2(plot_variables, names(plot_variables), \(cur_var, name_cur_var) {
+        dimred_name <- paste(cur_dimred, cur_exprs, sep = "_")
+
+        if (dimred_name %in% SingleCellExperiment::reducedDimNames(x)) {
+          p <- plot_dim_red(cur_dat, dimred_name, name_cur_var,
+                            size = 0.1, palette = palettes[[cur_var]])
+          fn <- paste0(paste(today, mainExpName(x), dimred_name,
+                             cur_var, sep = "_"), ".png")
+          do.call(ggsave, c(list(fn, p), plotsave_param))
+        }
+      })
+    })
+  })
+  remove(cur_dat)
+}
+
+# Plot
+purrr::map(spes, \(spe_x) {
+  lplot_dim_red(spe_x, exprs_values = assay_sel, dimred = dimred_sel,
+                variables = plot_variables)
+})
+```
+
+
+## Plot marker expression
+
+```{r plot-dimred-channels}
+# Function for plotting marker expression on reduced dimensions
+lplot_dim_red_channels <- function(x, exprs_values, dimred, channels = NULL) {
+  if (is.null(channels))
+    cur_channels <- rownames(x)[!rownames(x) %in% channels_state]
+  else
+    cur_channels <- channels
+  
+  purrr::map(exprs_values, \(cur_exprs) {
+    cur_dat <- as.data.table(
+      makePerCellDF(x,
+                    features = cur_channels,
+                    exprs_values = cur_exprs))
+    
+    for (j in seq_along(dimred)) {
+      dimred_name <- paste(dimred[j], cur_exprs, sep = "_")
+      
+      if (dimred_name %in% SingleCellExperiment::reducedDimNames(x)) {
+        cur_dat_long <- melt.data.table(
+          cur_dat,  measure.vars = cur_channels, variable.name = "channel",
+          id.vars = c(paste0(dimred_name, ".1"), paste0(dimred_name, ".2")),
+          value.name = cur_exprs)
+        
+        # Plot marker expression
+        p <- plot_dim_red_channels(cur_dat_long, dimred_name, cur_exprs,
+                                   cur_channels)
+        fn <- paste0(paste(today, mainExpName(x), dimred_name, "Channels",
+                           sep = "_"), ".png")
+        do.call(ggsave, c(list(fn, p), plotsave_param_large))
+      }
+    }
+  })
+  remove(cur_dat, cur_dat_long)
+}
+
+# Plot
+purrr::map(spes, \(spe_x) {
+  lplot_dim_red_channels(spe_x, exprs_values = assay_sel, dimred = dimred_sel)
+})
+```

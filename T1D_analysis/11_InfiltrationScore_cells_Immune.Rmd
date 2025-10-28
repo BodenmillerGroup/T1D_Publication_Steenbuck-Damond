@@ -1,0 +1,1260 @@
+---
+title: "11_InfiltrationScore_cells_Immune"
+author: "Nicolas Damond, Nathan Steenbuck"
+date: "Created: 02 Sep, 2022; Compiled: `r format(Sys.time(), '%d %b, %Y')`"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+if (rstudioapi::isAvailable()) {
+  script_name <- basename(rstudioapi::getSourceEditorContext()$path)
+} else {
+  script_name <- knitr::current_input()
+}
+
+cur_user <- Sys.info()[["user"]]
+script_name <- "11_InfiltrationScore_cells_Immune.Rmd"
+
+if (cur_user == "ubuntu") {
+  source(file.path("/", "mnt", "central_nas", "projects", 
+    "type1_diabetes", "nathan", "T1D_Vol", "T1D_analysis", 
+    "analysis", "helpers.R"))  #n_cores <- future::availableCores() - 1
+  
+    #n_cores <- future::availableCores() - 1
+  n_cores <- 4
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  knitr::opts_knit$set(root_dir = paths$home_data)
+} else {
+  source(file.path("/", "home", "nsteen", "scripts", "T1D_analysis", "analysis", "helpers.R"))
+  n_cores <- 8
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  paths$folder_script <- paths$cluster_folder_script
+  paths$folder_in <- paths$cluster_folder_in
+  paths$folder_out <- paths$cluster_home 
+  knitr::opts_knit$set(root_dir = paths$cluster_home)
+}
+
+seed <- 123456
+set.seed(seed)
+options <- furrr::furrr_options(seed = seed)
+paths$prev <- paste("08_CellTypesIslet", paths$object_type, paths$panel_type, sep = "_")
+knitr::opts_chunk$set(echo = TRUE)
+do_print <- TRUE
+```
+
+Rscript -e "rmarkdown::render('T1D_analysis/analysis/11_InfiltrationScore_cells_Immune.Rmd')"
+
+# **A0: Goal**
+
+Calculate and plot infiltration scores. Infiltration scores are defined as a combination of immune cell numbers and distance of these cells to the islets.
+
+For individual immune cells, the score is `1` if the cell is located within an islet and `1 / log(d)` if the cell is located outside islets, with `d` the pixel distance from the cell to the islet edge.  
+At the islet level, infiltration scores are defined as the sum of the scores of all immune cells that infiltrate this islet. Separate scores are defined for each cell type / cluster.  
+
+- Optimize infiltration score (1/d^x) by performing a grid search.
+  - Distance score: `1 / log(d)` or `1 / d` or `1 / sqrt(d)` or `1 / d^2` and others.
+  - Density score: `1` for all cells (x=0)
+  - Other: Normalization by islet diameter + beta-cell fraction.
+
+- The best score is selected by evaluating against T-CD8 islet infiltration (a main hallmark of disease). 
+- The score is then applied to all immune cell types and clusters.
+
+# **A1: Settings**
+
+## A1.1: Load packages
+
+```{r packages, results='hide'}
+suppressPackageStartupMessages(c(
+  library(dplyr),
+  library(tidyr),
+  library(data.table),
+  library(SpatialExperiment),
+  library(purrr),
+  library(ggpubr),
+  library(rstatix)
+))
+```
+
+## A1.2: Paths
+
+```{r settings}
+if (!dir.exists(paths$folder_script)) dir.create(paths$folder_script)
+plotsave_param$path <- paths$folder_script
+plotsave_param_large$path <- paths$folder_script
+
+# Misc settings
+today <- gsub("-", "", Sys.Date())
+```
+
+## A1.3: Read in the data
+
+Load the SpatialExperiment (SPE) object saved at the previous step.
+
+```{r load-data}
+fn_spe <- file.path(paths$folder_out, paths$prev, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+spe <- readRDS(fn_spe)
+print(spe)
+```
+
+## A1.4: Subset immune cells
+
+```{r subset-immune}
+spe_imm <- spe[, spe$cell_category == "immune" & 
+                      spe$cell_type != "Ambiguous"]
+print(spe_imm)
+```
+
+## A1.5: Define the analysis parameters
+
+```{r parameters}
+# List of cell types
+celltypes <- c("T_CD4", "T_CD8", "B", "NK", "Neutrophil", "Myeloid",
+               "Lympho_Other", "T_DN", "CD303_VIM")
+names(celltypes) <- celltypes
+cat("Immune cell types\n", celltypes)
+
+# Color palette for plotting
+palette_ct <- c(palettes$colors[seq_len(length(celltypes))])
+names(palette_ct) <- celltypes
+
+# List of clusters and associated color palettes
+cluster_cols <- c("cell_cluster_scaled") #, "cell_cluster_fastMNN_case_id")
+names(cluster_cols) <- c("scaled") # , "fastMNN_case_id")
+
+clusters <- palettes_clust <- vector(mode = "list")
+for (i in seq_along(cluster_cols)) {
+  clusters[[i]] <- sort(unique(spe_imm[[cluster_cols[i]]]))
+  palettes_clust[[i]] <- c(palettes$colors[seq_len(length(clusters[[i]]))])
+}
+names(clusters) <- names(palettes_clust) <- cluster_cols
+print(c("Immune cell clusters", clusters))
+
+# Variables to plot
+plot_variables <- c("donor_type", "case_id")
+names(plot_variables) <- c("Stage", "Donor")
+
+# Scores to calculate
+score_sel <- c("AbsScore", "NormScore", "NormScoreTot")
+```
+
+## A1.6 Remove pancreatitis cases
+
+*OPTIONAL* Should pancreatitis cases be removed before plotting?
+
+```{r remove-pancreatitis}
+remove_pancreatitis <- TRUE
+
+if (remove_pancreatitis) {
+  spe_imm <- spe_imm[, spe_imm$donor_type != "Pancreatitis"]
+  
+  metadata(spe)$stages <- metadata(spe)$stages[
+    metadata(spe)$stages != "Pancreatitis"]
+  palettes$stages <- palettes$stages[names(palettes$stages) != "Pancreatitis"]
+  metadata(spe)$cases <- metadata(spe)$cases[!metadata(spe)$cases %in% c("6036", "6043", "6061", "6150", "6225", "6506", "6522", "8005", "8008")]
+  palettes$cases <- palettes$cases[!names(palettes$cases) %in% c("6036", "6043", "6061", "6150", "6225", "6506", "6522", "8005", "8008")]
+}
+```
+
+
+
+# **A.2: Calculate infiltration scores**
+
+## A2.1: Calculate distance score
+
+The distance score is defined for each immune cell. Its value is `1` if the 
+cell is located within an islet and `1 / d` if the cell is 
+located outside islets, with `d` the pixel distance (µm) from the cell to the islet 
+edge.
+The distance threshold is set to 1 µm to avoid artifical increase by distances between 0 and 1.
+We tested distinct 1/d^x functions for different values of x (0, 1, 2, 1/2, log).
+
+```{r calculate-distance-score}
+# Calculate distance score (x = 1)
+spe_imm$DistScore <- ifelse(spe_imm$distance_to_islet >= -1, 1,
+                            1 / abs(spe_imm$distance_to_islet))
+
+# log: 1/log(d)
+spe_imm$DistScoreLog <- ifelse(spe_imm$distance_to_islet >= -exp(1), 1,
+                               1 / log(abs(spe_imm$distance_to_islet)))
+
+# 1/sqrt(d)
+spe_imm$DistScoreSqrt <- ifelse(spe_imm$distance_to_islet >= -1, 1,
+                                1 / sqrt(abs(spe_imm$distance_to_islet)))
+
+# 1/d^2
+spe_imm$DistScoreSquare <- ifelse(spe_imm$distance_to_islet >= -1, 1,
+                                  1 / abs(spe_imm$distance_to_islet)^2)
+
+# (Peri)-Islet Scores
+spe_imm$DistScoreIslet <- ifelse(spe_imm$distance_to_islet >= -1, 1, 0)
+spe_imm$DistScorePeriIslet <- ifelse(spe_imm$distance_to_islet >= -1, 1, 
+  ifelse(spe_imm$distance_to_islet >= -20, 1/abs(spe_imm$distance_to_islet), 0))
+
+# Density score (x = 0)
+spe_imm$Density <- 1
+```
+
+
+## A2.2: Calculate scores per image
+
+### A2.2.1: Calculate islet cell numbers
+
+Normalization was done by the number of immune cells, trying to do it by
+the total number of cells.
+
+```{r calculate-islet-cell-number}
+image_ids <- unique(spe_imm$image_id)
+
+## Total immune cell numbers per ROI:
+immune_total <- colData(spe_imm) %>%
+  as_tibble() %>%
+  filter(image_id %in% image_ids) %>%
+  dplyr::count(image_id, donor_type, case_id, name = "ImmuneCellNb")
+
+## Total cell numbers per ROI:
+total_cells <- colData(spe) %>%
+  as_tibble() %>%
+  filter(image_id %in% image_ids) %>%
+  dplyr::count(image_id, donor_type, case_id, name = "TotalCellNb")
+
+## Beta-cell fraction + Islet-area per ROI:
+beta_fraction <- colData(spe) %>%
+  as_tibble() %>%
+  filter(image_id %in% image_ids) |> 
+  group_by(image_id) |> 
+  summarise(islet_tot = sum(cell_category == "islet"),
+            beta_tot = sum(cell_type == "Beta"),
+            beta_fraction = ifelse(islet_tot != "0", beta_tot / islet_tot, 0), 
+            islet_area = sum(islet_area, na.rm = TRUE), 
+            diameter = 2*sqrt(islet_area/pi), .groups = "drop")
+
+icis <- beta_fraction  |> filter(beta_fraction > 0) |> pull(image_id)
+
+##
+case_stages <- colData(spe)[, c("age", "case_id", "donor_type")] |> 
+  as_tibble() |> 
+  distinct() |> 
+  filter(donor_type %in% metadata(spe)$stages[1:4]) |> 
+  mutate(age_group = ifelse(age < 13, "t1d1", "t1d2"))
+
+# Average islet_sizes across all images
+diameters_df <- beta_fraction |> 
+  filter(image_id %in% icis) |> 
+  mutate(case_id = stringr::str_remove(image_id, "_Immune_[0-9]+$")) |>
+  inner_join(case_stages, by = "case_id") |>
+  group_by(donor_type, case_id) |>
+  summarise(islet_area = mean(islet_area, na.rm = TRUE),
+            diameter = mean(diameter, na.rm = TRUE), .groups = "drop") |>
+  group_by(donor_type) |> 
+  summarise(islet_area_int = mean(islet_area, na.rm = TRUE),
+            diameter_int = mean(diameter, na.rm = TRUE))
+
+# Add fraction intercept.
+frac_int <- beta_fraction |> 
+  filter(image_id %in% icis) |> 
+  mutate(case_id = stringr::str_remove(image_id, "_Immune_[0-9]+$")) |>
+  inner_join(case_stages, by = "case_id") |> 
+  group_by(donor_type) |>
+  summarise(fraction_int = mean(beta_fraction, na.rm = TRUE), .groups = "drop")
+```
+
+# A3: Testing different scores
+
+This facilitates testing different scores 
+
+## A3.1: Function to test scores on cell types.
+```{r stats}
+generate_scores <- function(score_l, a = 1, y = 0, diameters = NULL, g=1) {
+  # score_l <- "DistScore"; a <- 1; y <- 1; g <- 1
+  score_ct <- colData(spe_imm) %>%
+    as_tibble() %>%
+    filter(image_id %in% icis) %>%
+    select(image_id, cell_type, Score = any_of(score_l))
+
+  # Summarize scores by image and cell type
+  score_ct <- score_ct %>%
+    group_by(image_id, cell_type) %>%
+    summarise(AbsScore = sum(Score), .groups = "drop") %>%
+    complete(image_id, cell_type,
+            fill = list(AbsScore = 0)) %>%
+    dplyr::rename(CellType = cell_type)
+
+  # Import immune cell nb
+  score_ct <- score_ct %>%
+    inner_join(immune_total, by = "image_id")
+
+  # Normalize score by immune cell nb
+  score_ct <- score_ct %>%
+    mutate(NormScore = AbsScore / ImmuneCellNb) %>%
+    mutate(CellType = factor(CellType, levels = celltypes),
+          image_id = factor(image_id, levels = image_ids)) %>%
+    arrange(image_id, CellType)
+
+  # Import total cell nb
+  score_ct <- score_ct %>%
+    inner_join(total_cells, by = c("image_id", "donor_type", "case_id"))
+
+  # Normalize score by total cell nb
+  score_ct <- score_ct %>%
+    mutate(NormScoreTot = AbsScore / (g*TotalCellNb)) %>%
+    mutate(CellType = factor(CellType, levels = celltypes),
+          image_id = factor(image_id, levels = image_ids)) %>%
+    arrange(image_id, CellType)
+  
+  # Now update the score by beta-fraction and islet area
+  score_ct <- score_ct |> 
+    inner_join(beta_fraction, by = "image_id") %>%
+    inner_join(diameters_df, by = "donor_type") |>
+    inner_join(frac_int, by = "donor_type") |>
+    mutate(NormScoreArea = AbsScore * (diameter_int/diameter)^a) |> 
+    mutate(NormScoreArea2 = AbsScore * (1 + (diameter_int/diameter)^a)) |> 
+    mutate(NormScoreAreaFrac = AbsScore * (1 + (beta_fraction/fraction_int)^y) * (1 + (diameter_int/diameter)^a))
+
+  # Decast the dataset
+  score_ct <- score_ct %>%
+    pivot_wider(id_cols = c(image_id, donor_type, case_id),
+                values_from = c(AbsScore, NormScore, NormScoreTot, 
+                                NormScoreAreaFrac, NormScoreArea, NormScoreArea2),
+                names_from = c(CellType))
+
+  # Extract cell type compo from metadata of the SPE object
+  compo_ct <- metadata(spe)$celltype_compo[
+    , !colnames(metadata(spe)$celltype_compo) %in%
+      colnames(score_ct)[colnames(score_ct) != "image_id"]] %>%
+    as_tibble() |> 
+    filter(image_id %in% icis)
+
+  # Merge the dataset with cell type composition
+  score_ct <- score_ct %>%
+    merge(compo_ct, by = "image_id") %>%
+    mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages),
+          case_id = factor(case_id, levels = metadata(spe)$cases)) %>%
+    arrange(case_id, donor_type) %>%
+    DataFrame()
+
+  ## 
+  # Normalized to immune cell number scores
+  scoreNorm_ct <- score_ct %>%
+    as_tibble() %>%
+    select(c("image_id", all_of(plot_variables),
+            grep("NormScore_", colnames(score_ct)))) |> 
+    rename_with(~ gsub("NormScore_", "", .x))
+
+  # Absolute scores
+  scoreAbs_ct <- score_ct %>%
+    as_tibble() %>%
+    select(c("image_id", all_of(plot_variables), 
+            grep("AbsScore_", colnames(score_ct)))) |> 
+    rename_with(~ gsub("AbsScore_", "", .x))
+
+  # Normalized to total cell number scores
+  scoreNormTot_ct <- score_ct %>%
+    as_tibble() %>%
+    select(c("image_id", all_of(plot_variables),
+            grep("NormScoreTot_", colnames(score_ct)))) |> 
+    rename_with(~ gsub("NormScoreTot_", "", .x))
+
+  # Normalized to area and beta-fraction scores
+  scoreNormAreaFrac_ct <- score_ct %>%
+    as_tibble() %>%
+    select(c("image_id", all_of(plot_variables),
+            grep("NormScoreAreaFrac_", colnames(score_ct)))) |>
+    rename_with(~ gsub("NormScoreAreaFrac_", "", .x))
+
+  # Normalized to area scores
+  scoreNormArea_ct <- score_ct %>%
+    as_tibble() %>%
+    select(c("image_id", all_of(plot_variables),
+            grep("NormScoreArea_", colnames(score_ct)))) |>
+    rename_with(~ gsub("NormScoreArea_", "", .x))
+  
+  # Normalization to area2. 
+  scoreNormArea2_ct <- score_ct %>%
+    as_tibble() %>%
+    select(c("image_id", all_of(plot_variables),
+            grep("NormScoreArea2_", colnames(score_ct)))) |>
+    rename_with(~ gsub("NormScoreArea2_", "", .x))
+
+    return(list(scoreNorm_ct, scoreAbs_ct, scoreNormTot_ct, scoreNormAreaFrac_ct, scoreNormArea_ct, scoreNormArea2_ct))
+}
+```
+
+## A3.1.2: Add data.
+
+```{r}
+save_spe <- FALSE
+if (save_spe){
+  fn_cases_full <- file.path(paths$folder_in, "cases_full.xlsx")
+
+  cases_full <- readxl::read_excel(fn_cases_full) |> 
+    mutate(case_id = as.character(case_id)) |> 
+    select(case_id, RR_id, hemodiluted_status, cause_of_death, 
+          case_recovery_type, ICU_time_days, transit_time_minutes,
+          meds_hospital, clinical_history, admission_course, age_years) |> 
+    mutate(ICU_time_days = abs(as.numeric(stringr::str_remove(ICU_time_days, " days")))) |> 
+    mutate(age_group = ifelse(age_years < 13, "< 13", ">= 13"))
+
+  tt <- colData(spe) |> 
+    as_tibble(rownames = "id") |> 
+    left_join(cases_full, by = "case_id") |> 
+    DataFrame()
+
+  rownames(tt) <- tt$id
+  tt$id <- NULL
+
+  colData(spe) <- tt
+  fn_spe <- file.path(paths$folder_out, paths$prev, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+  saveRDS(spe, fn_spe)
+}
+```
+
+## A3.2: Test different scores using LMs/LMMs.
+
+```{r evaluate_models}
+# Filter to only NoDiabetes & RecentOnset:.funs
+score_list <- list("Density", "DistScore", "DistScoreLog", "DistScoreSqrt", "DistScoreSquare")
+test_score <- TRUE
+
+if (test_score) {
+  results <- purrr::map(score_list, \(score_l) {
+    ## Do a simple grid-search over y, a first.
+    a <- c(0, 1/2, 1/exp(1), 1, 2, exp(1), 10)
+    y <- c(0, 1/2, 1/exp(1), 1, 2, exp(1), 10)
+    g <- 1
+    
+    ## all combinations
+    score_combinations <- expand.grid(score_l = score_l, y = y, a = a, g = g)
+
+    res <- pmap(score_combinations, \(score_l, yy, aa, gg) {
+      # score_l <- "DistScore"; yy <- 0; aa <- 2; gg <- 1
+      print(paste("Testing score:", score_l, "with y =", yy, "and a =", aa, "and g =", gg))
+      ll <- generate_scores(score_l, y = yy, a = aa, g = gg)
+      names(ll) <- c("NormScore", "AbsScore", "NormScoreTot", "NormScoreAreaFrac", "NormScoreArea", "NormScoreArea2")
+      # score_df <- ll[[4]] 
+      # name_score_df <- names(ll)[4]
+
+      purrr::map2(ll, names(ll), \(score_df, name_score_df) {
+      
+        set.seed(123)
+        input_df <- score_df %>%
+          select(-ends_with("NA")) |>
+          filter(Stage %in% metadata(spe)$stages[1:4]) |>
+          mutate(Stage = factor(Stage, levels = metadata(spe)$stages[1:4])) |> 
+          filter(Donor %in% metadata(spe)$cases) |>
+          mutate(donor_num = as.integer(Stage)) |> 
+          inner_join(case_stages, by = c("Donor" = "case_id"))
+
+        ## Donor-level information.      
+        input_df_case <- input_df %>%
+          select(-image_id) %>%
+          group_by(Donor, Stage, age_group) %>%
+          summarise(across(where(is.numeric), \(x) mean(x, na.rm = TRUE)), .groups = "drop") %>%
+          mutate(donor_num = as.integer(Stage)) |> 
+          mutate(across(where(is.numeric), ~ as.vector(scale(.x, center = TRUE, scale = TRUE))))
+
+        message("lm: ", round(summary(lm(T_CD8 ~ Stage + age_group, data = input_df_case))$r.squared, 2))
+        lm_r2 <- summary(lm(T_CD8 ~ Stage + age_group, data = input_df_case))$r.squared
+        model_lmer <- lmerTest::lmer(T_CD8 ~ Stage + age_group + (1 | Donor), data = input_df)
+        r2_cond <- performance::model_performance(model_lmer)$R2_cond
+        r2_marginal <- performance::model_performance(model_lmer)$R2_marginal
+        
+        ## Evaluate the model.
+        oobg <- tibble(.estimate = lm_r2, 
+                        r2_cond = r2_cond, r2_marginal = r2_marginal,
+                        Normalization = !!name_score_df, 
+                        a = aa, y = yy, Score = !!score_l, 
+                        g = gg)
+        oobg
+      }) |> bind_rows()
+    }) |> bind_rows()
+  }) |> bind_rows()
+}
+```
+
+## A3.3: Plot and evaluate results
+
+Note: when evaluating the results:
+- Absscore + NormScore + NormScoreTot are not dependent on diameter or beta-cell fraction.
+- NormScoreArea/NormScoreArea2 are dependent on diameter, not fraction
+- NormScoreAreaFrac is dependent on diameter and fraction.
+
+IFS_score <- AbsScore * (1 + (diameter_int/diameter)^a); with a = 1.
+
+```{r plot_results}
+if (test_score) {
+  p <- results |> 
+      filter(Normalization %in% c("AbsScore", "NormScore", "NormScoreTot")) |> 
+      distinct(Normalization, Score, r2_cond, r2_marginal, .estimate) |>
+      mutate(r2_cond = ifelse(is.na(r2_cond), 0, r2_cond)) |>
+      mutate(r2_marginal = ifelse(is.na(r2_marginal), 0, r2_marginal)) |> 
+      pivot_longer(cols = c(.estimate, r2_cond, r2_marginal),
+                   names_to = "fits", values_to = ".estimate") |>
+      mutate(fits = factor(fits, levels = c("r2_cond", "r2_marginal", ".estimate"))) |>
+      ggplot(aes(x = Score, y = .estimate, fill = Normalization)) +
+      geom_bar(stat = "identity", position = "dodge") +
+      labs(title = "R-squared", x = "Score", y = "R-squared") +  
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom"
+      ) +
+      facet_wrap(~fits, scales = "free")
+  print(p)
+  fn <- file.path(paste0(today, "r2_scores_", today, ".png"))
+  do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+  p <- results |> 
+      filter(Normalization %in% c("NormScoreArea", "NormScoreFracArea", "NormScoreArea2")) |> 
+      distinct(Normalization, Score, r2_cond, r2_marginal, .estimate, a) |> 
+      arrange(desc(r2_marginal)) |> 
+      mutate(r2_cond = ifelse(is.na(r2_cond), 0, r2_cond)) |>
+      mutate(r2_marginal = ifelse(is.na(r2_marginal), 0, r2_marginal)) |> 
+      pivot_longer(cols = c(.estimate, r2_cond, r2_marginal),
+                   names_to = "fits", values_to = ".estimate") |> 
+      mutate(fits = factor(fits, levels = c("r2_cond", "r2_marginal", ".estimate"))) |>
+      mutate(joint = paste(Score, Normalization, sep = "_")) |> 
+      ggplot(aes(x = joint, y = .estimate, fill = joint)) +
+      geom_bar(stat = "identity", position = "dodge") +
+      labs(title = "R-squared", x = "Score", y = "R-squared") +  
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom"
+      ) +
+      facet_wrap(fits~a, scales = "free")
+  fn <- file.path(paste0(today, "r2_scores_area_", today, ".png"))
+  plotsave_param_large2 <- plotsave_param_large
+  plotsave_param_large2$height <- 600
+  do.call(ggsave, c(list(fn, p), plotsave_param_large2))
+}
+
+## Select robust method. 
+set.seed(123)
+results |> 
+  filter(Normalization %in% c("AbsScore", "NormScore", "NormScoreTot", "NormScoreArea", "NormScoreArea2", "NormScoreAreaFrac")) |>
+  mutate(r2_cond = ifelse(is.na(r2_cond), 0, r2_cond)) |>
+  mutate(r2_marginal = ifelse(is.na(r2_marginal), 0, r2_marginal)) |> 
+  mutate(.estimate_sum = rank(.estimate, ties.method = "random")) |> 
+  mutate(r2_cond_sum = rank(r2_cond, ties.method = "random"),
+        r2_marginal_sum = rank(r2_marginal, ties.method = "random")) |>
+  mutate(sum_r2 = .estimate_sum + r2_cond_sum + r2_marginal_sum) |>
+  arrange(desc(sum_r2)) |> 
+  filter(Normalization == "NormScoreAreaFrac")
+```
+
+Best formula:
+if d < -1, then 1/sqrt(d); else 1
+- (1 + (diameter_int/diameter)^a) + (1 + (beta_fraction/fraction_int)^y)
+with a = 1 and y = 0. 
+
+- (1 + (diameter_int/diameter)^1) + (1 + (beta_fraction/fraction_int)^0)
+
+-> Remove beta-cell fraction term. 
+(1 + (diameter_stage/diameter_islet))
+
+# A4: Calculate optimized score.
+## A4.1: Calculate scores for cell types
+
+The absolute score (`AbsScore`) for an islet is the sum of the distance scores of all cells located close to that islet.  
+The normalized score (`NormScore`) is the absolute score divided by the number of cells in the islet.  
+The second normalized score (`NormScoreTot`) is the absolute score divided by the total number of cells in the image.
+
+```{r calculate-infiltration-score-celltypes}
+# Score per cell
+score_ct <- colData(spe_imm) |> 
+  as_tibble() |> 
+  filter(image_id %in% icis) |> 
+  select(c("image_id", "cell_type", "DistScoreSqrt"))
+
+# Summarize scores by image and cell type
+score_ct <- score_ct |> 
+  group_by(image_id, cell_type) |> 
+  summarise(AbsScore = sum(DistScoreSqrt), .groups = "drop") |> 
+  complete(image_id, cell_type,
+           fill = list(AbsScore = 0)) |> 
+  dplyr::rename(CellType = cell_type)
+
+# Import immune cell nb
+score_ct <- score_ct |> 
+  inner_join(immune_total, by = "image_id")
+
+# Normalize score by immune cell nb
+score_ct <- score_ct %>%
+  mutate(NormScore = AbsScore / ImmuneCellNb) %>%
+  mutate(CellType = factor(CellType, levels = celltypes),
+         image_id = factor(image_id, levels = image_ids)) |> 
+  arrange(image_id, CellType)
+
+# Import total cell nb
+score_ct <- score_ct %>%
+  inner_join(total_cells, by = c("image_id", "donor_type", "case_id")) |> 
+  inner_join(beta_fraction, by = "image_id")  |> 
+  inner_join(diameters_df, by = "donor_type") 
+
+# Normalize score by total cell nb
+score_ct <- score_ct %>%
+  mutate(NormScoreTot = AbsScore / TotalCellNb) %>%
+  mutate(NormScoreArea = AbsScore * (1 + diameter_int/diameter)) |>
+  mutate(CellType = factor(CellType, levels = celltypes),
+         image_id = factor(image_id, levels = image_ids)) %>%
+  arrange(image_id, CellType)
+
+# Decast the dataset
+score_ct <- score_ct %>%
+  pivot_wider(id_cols = c(image_id, donor_type, case_id),
+              values_from = c(AbsScore, NormScore, NormScoreTot, NormScoreArea),
+              names_from = c(CellType))
+
+# Extract cell type compo from metadata of the SPE object
+compo_ct <- metadata(spe)$celltype_compo[
+  , !colnames(metadata(spe)$celltype_compo) %in%
+    colnames(score_ct)[colnames(score_ct) != "image_id"]] %>%
+  as_tibble() |> 
+  filter(image_id %in% icis)
+
+# Merge the dataset with cell type composition
+score_ct <- score_ct %>%
+  merge(compo_ct, by = "image_id") %>%
+  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages),
+         case_id = factor(case_id, levels = metadata(spe)$cases)) %>%
+  arrange(case_id, donor_type) %>%
+  DataFrame()
+
+score_ct
+```
+
+## A4.2: Calculate scores for cell clusters
+
+```{r calculate-infiltration-score-clusters}
+score_clust <- vector(mode = "list")
+
+for (i in seq_along(cluster_cols)) {
+  # Score per cell
+  score_clust[[i]] <- colData(spe_imm) %>%
+    as_tibble() %>%
+    select(c("image_id", cluster_cols[[i]], "DistScore"))
+  
+  # Summarize scores by image and cell type
+  score_clust[[i]] <- score_clust[[i]]|> 
+    group_by(image_id, immune_cluster = get(cluster_cols[[i]]))|> 
+    summarise(AbsScore = sum(DistScore), .groups = "drop")|> 
+    complete(image_id, immune_cluster,
+             fill = list(AbsScore = 0)) %>%
+    dplyr::rename(Cluster = immune_cluster)
+
+  # Import immune cell nb
+  score_clust[[i]] <- score_clust[[i]] |> 
+    inner_join(immune_total, by = "image_id")
+
+# Normalize score by immune cell nb
+score_clust[[i]] <- score_clust[[i]]  |> 
+  mutate(NormScore = AbsScore / ImmuneCellNb) %>%
+  mutate(Cluster = factor(Cluster, levels = clusters[[i]]),
+         image_id = factor(image_id, levels = image_ids)) |> 
+  arrange(image_id, Cluster)
+
+  # Import total cell nb
+  score_clust[[i]] <- score_clust[[i]]  |> 
+    inner_join(total_cells, by = c("image_id", "donor_type", "case_id")) |> 
+    inner_join(beta_fraction, by = "image_id")  |> 
+    inner_join(diameters_df, by = "donor_type") 
+
+# Normalize score by total cell nb
+score_clust[[i]] <- score_clust[[i]] %>%
+  mutate(NormScoreTot = AbsScore / TotalCellNb) %>%
+  mutate(NormScoreArea = AbsScore * (1 + diameter_int/diameter)) |>
+  mutate(Cluster = factor(Cluster, levels = clusters[[i]]),
+         image_id = factor(image_id, levels = image_ids)) %>%
+  arrange(image_id, Cluster)
+  
+  # Decast the dataset
+  score_clust[[i]] <- score_clust[[i]] %>%
+    pivot_wider(id_cols = c(image_id, donor_type, case_id),
+                values_from = c(AbsScore, NormScore, NormScoreTot, NormScoreArea),
+                names_from = c(Cluster))
+  
+  # Extract cell type compo from metadata of the SPE object
+  compo_clust <- metadata(spe)$cluster_compo[[i]][
+    , !colnames(metadata(spe)$cluster_compo[[i]]) %in%
+      colnames(score_clust[[i]])[colnames(score_clust[[i]]) != "image_id"]] %>%
+    as_tibble()
+  
+  # Merge the dataset with cell type composition
+  score_clust[[i]] <- score_clust[[i]] %>%
+    merge(compo_clust, by = "image_id") %>%
+    mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages),
+           case_id = factor(case_id, levels = metadata(spe)$cases)) %>%
+    arrange(case_id, donor_type) %>%
+    DataFrame()
+}
+names(score_clust) <- cluster_cols
+```
+
+## A5: Add infiltration scores to SPE and save
+
+The cell type and cluster scores are added to the metadata of the SPE
+
+```{r add-compo-spe}
+save_spe <- FALSE
+
+if (! length(grep("score_", colnames(metadata(spe)$celltype_compo))) > 0) {
+  metadata(spe)$celltype_compo_score <- score_ct
+  save_spe <- TRUE
+}
+
+if (! length(grep("score_", colnames(metadata(spe)$cluster_compo))) > 0) {
+  metadata(spe)$cluster_compo_score <- score_clust
+  save_spe <- TRUE
+}
+
+fn_spe <- file.path(paths$folder_out, paths$prev, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+
+if (isTRUE(save_spe)) {
+  saveRDS(spe, fn_spe)
+  print(spe)
+}
+```
+
+# A5.1: Joint data frames with scores.
+## A5.1.1: Cell Types.
+
+```{r melt-data-frames-celltypes}
+# Normalized to immune cell number scores
+scoreNorm_ct <- score_ct %>%
+  as_tibble() %>%
+  select(c("image_id", all_of(plot_variables),
+           grep("NormScore_", colnames(score_ct)))) %>%
+  pivot_longer(cols = grep("NormScore_", colnames(.)),
+               names_prefix = "NormScore_",
+               names_to = "CellType",
+               values_to = "NormScore")
+
+# Absolute scores
+scoreAbs_ct <- score_ct %>%
+  as_tibble() %>%
+  select(c("image_id", all_of(plot_variables),
+           grep("AbsScore_", colnames(score_ct)))) %>%
+  pivot_longer(cols = grep("AbsScore_", colnames(.)),
+               names_prefix = "AbsScore_",
+               names_to = "CellType",
+               values_to = "AbsScore")
+
+# Normalized to total cell number scores
+scoreNormTot_ct <- score_ct %>%
+  as_tibble() %>%
+  select(c("image_id", all_of(plot_variables),
+           grep("NormScoreTot_", colnames(score_ct)))) %>%
+  pivot_longer(cols = grep("NormScoreTot_", colnames(.)),
+               names_prefix = "NormScoreTot_",
+               names_to = "CellType",
+               values_to = "NormScoreTot")
+
+# Normalized to area scores
+scoreNormArea_ct <- score_ct %>%
+  as_tibble() %>%
+  select(c("image_id", all_of(plot_variables),  
+           grep("NormScoreArea_", colnames(score_ct)))) %>%
+  pivot_longer(cols = grep("NormScoreArea_", colnames(.)),
+               names_prefix = "NormScoreArea_",
+               names_to = "CellType",
+               values_to = "NormScoreArea")
+
+# Merge
+score_ct <- scoreAbs_ct %>%
+  merge(scoreNorm_ct,
+        by = intersect(colnames(scoreNorm_ct), colnames(.))) %>%
+  merge(scoreNormTot_ct,
+        by = intersect(colnames(scoreNormTot_ct), colnames(.))) %>%
+  merge(scoreNormArea_ct,
+        by = intersect(colnames(scoreNormArea_ct), colnames(.))) %>%
+  filter(CellType %in% celltypes) %>%
+  mutate(image_id = factor(image_id, levels = image_ids),
+         CellType = factor(CellType, levels = celltypes)) %>%
+  arrange(image_id, CellType) %>%
+  setnames(names(plot_variables), plot_variables) |>
+  drop_na()
+```
+
+
+## A5.1.2: Clusters.
+
+```{r melt-data-frames-clusters}
+for (i in seq_along(cluster_cols)) {
+  # Normalized scores
+  score_norm_clust <- score_clust[[i]] %>%
+    as_tibble() %>%
+    select(c("image_id", all_of(plot_variables),
+             grep("NormScore_", colnames(score_clust[[i]])))) %>%
+    pivot_longer(cols = grep("NormScore_", colnames(.)),
+                 names_prefix = "NormScore_",
+                 names_to = "Cluster",
+                 values_to = "NormScore")
+  
+  # Absolute scores
+  score_abs_clust <- score_clust[[i]] %>%
+    as_tibble() %>%
+    select(c("image_id", all_of(plot_variables),
+             grep("AbsScore_", colnames(score_clust[[i]])))) %>%
+    pivot_longer(cols = grep("AbsScore_", colnames(.)),
+                 names_prefix = "AbsScore_",
+                 names_to = "Cluster",
+                 values_to = "AbsScore")
+  
+  # Normalized to total cell number scores
+  score_norm_tot_clust <- score_clust[[i]] %>%
+    as_tibble() %>%
+    select(c("image_id", all_of(plot_variables),
+             grep("NormScoreTot_", colnames(score_clust[[i]])))) %>%
+    pivot_longer(cols = grep("NormScoreTot_", colnames(.)),
+                 names_prefix = "NormScoreTot_",
+                 names_to = "Cluster",
+                 values_to = "NormScoreTot")
+  # Normalized to area scores
+  score_norm_area_clust <- score_clust[[i]] %>%
+    as_tibble() %>%
+    select(c("image_id", all_of(plot_variables),
+             grep("NormScoreArea_", colnames(score_clust[[i]])))) %>%
+    pivot_longer(cols = grep("NormScoreArea_", colnames(.)),
+                 names_prefix = "NormScoreArea_",
+                 names_to = "Cluster",
+                 values_to = "NormScoreArea")
+  
+  # Merge
+  score_clust[[i]] <- score_abs_clust %>%
+    merge(score_norm_clust,
+          by = intersect(colnames(score_norm_clust), colnames(.))) %>%
+    merge(score_norm_tot_clust,
+          by = intersect(colnames(score_norm_tot_clust), colnames(.))) %>%
+    merge(score_norm_area_clust,
+          by = intersect(colnames(score_norm_area_clust), colnames(.))) %>%
+    # if Cluster == "T.EMRA" or "T.naive" make "T-naive" and "T-EMRA"
+    mutate(Cluster = ifelse(Cluster %in% c("T.EMRA", "T.naive"),
+                           gsub("\\.", "-", Cluster), Cluster)) %>%
+    mutate(image_id = factor(image_id, levels = image_ids),
+           Cluster = factor(Cluster, levels = clusters[[1]])) %>%
+    arrange(image_id, Cluster) %>%
+    setnames(names(plot_variables), plot_variables) |> 
+    mutate(CellType = stringr::str_remove(Cluster, "_[0-9]+$")) |> as_tibble()
+}
+```
+
+# A6: **Plot infiltration scores**
+
+```{r packages2, results='hide'}
+suppressPackageStartupMessages(c(
+  library(ggplot2),
+  library(ggpubr),
+  library(cowplot)
+  # library(GGally)
+))
+```
+
+## A6.1: Scores by image
+
+### A6.1.1:Cell types
+
+Iterate through the different scores and plot them by image.
+Color by stage.
+
+```{r images-celltype-score-stages, fig.width= 15, fig.height= 10}
+ps <- vector("list", length = length(celltypes))
+scores <- c("AbsScore", "NormScore", "NormScoreTot", "NormScoreArea")
+purrr::walk(scores, \(score_l){
+
+  for (i in seq_along(celltypes)) {
+    ps[[i]] <- score_ct  %>%
+      filter(CellType == celltypes[i]) %>%
+      dplyr::rename(Score = !!score_l) %>%
+      ggplot(aes(x = reorder(image_id, Score), y = Score)) +
+      geom_bar(stat = "identity", aes(fill = donor_type), width = 1) +
+      scale_fill_manual("Cell Type", values = palettes$stages) +
+      labs(title = celltypes[i],
+          x = "Individual image sections",
+          y = "Infiltration score") +
+      mytheme$standard() +
+      theme(
+        axis.title.x = element_text(margin = margin(t = -6)),
+        axis.text.x = element_blank(),
+        axis.line.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        legend.position = "none"
+      )
+  }
+  legend <- get_legend(
+    ps[[1]] + theme(legend.position = "right")
+  )
+  p <- plot_grid(plotlist = ps, legend)
+  fn <- paste0(paste(today, "Images", "CellType", score_l, "Stage",
+                    sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param_large))
+  if (do_print) print(p)
+})
+```
+
+### A6.1.2: Cell types
+
+```{r images-celltype-score-cases, fig.width= 15, fig.height= 10}
+ps <- vector("list", length = length(celltypes))
+
+scores <- c("AbsScore", "NormScore", "NormScoreTot", "NormScoreArea")
+purrr::walk(scores, \(score_l){
+    
+  for (i in seq_along(celltypes)) {
+    ps[[i]] <- score_ct  %>%
+      filter(CellType == celltypes[i]) %>%
+      dplyr::rename(Score = !!score_l) %>%
+      ggplot(aes(x = reorder(image_id, Score), y = Score)) +
+      geom_bar(stat = "identity", aes(fill = case_id), width = 1) +
+      scale_fill_manual("Cell Type", values = palettes$cases) +
+      labs(title = celltypes[i],
+          x = "Individual image sections",
+          y = "Infiltration score") +
+      mytheme$standard() +
+      theme(
+        axis.title.x = element_text(margin = margin(t = -6)),
+        axis.text.x = element_blank(),
+        axis.line.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        legend.position = "none"
+      )
+  }
+  legend <- get_legend(
+    ps[[1]] + theme(legend.position = "right")
+  )
+  p <- plot_grid(plotlist = ps, legend)
+  fn <- paste0(paste(today, "Images", "CellType", score_l, "Case",
+                    sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param_large))
+  if (do_print) print(p)
+})
+```
+
+-> Clusters not done; plots get too busy.
+
+## A6.2: Scores by DONOR
+
+### A6.2.1: Scores by case
+Iterate through the different scores and color them by case.
+
+```{r mean-absscore-case}
+scores <- c("AbsScore", "NormScore", "NormScoreTot", "NormScoreArea")
+purrr::walk(scores, \(score_l){
+    
+  # Bar plot
+  p <- score_ct %>%
+    dplyr::rename(Score = !!score_l) %>%
+    group_by(case_id, donor_type) %>%
+    summarize_at("Score", .funs = mean) %>%
+    
+    ggplot(aes(x = case_id, y = Score, fill = donor_type)) +
+    geom_bar(stat = "identity") +
+    scale_fill_manual("Stage",
+                      labels = metadata(spe)$stages,
+                      values = palettes$stages) +
+    labs(title = paste("Mean per case", score_l),
+        x = "Case", y = paste("Mean", score_l)) +
+    mytheme$standard() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5))
+
+  fn <- paste0(paste(today, "Mean", score_l, "Case", "Barplot",
+                    sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param))
+  if (do_print) print(p)
+
+  # Boxplot
+  p <- score_ct %>%
+    dplyr::rename(Score = !!score_l) %>%
+    group_by(case_id, donor_type) %>%
+    summarize_at("Score", .funs = mean) %>%
+    
+    ggplot(aes(x = donor_type, y = Score, fill = donor_type)) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_jitter(width = 0.1) +
+    scale_fill_manual("Stage",
+                      labels = metadata(spe)$stages,
+                      values = palettes$stages) +
+    labs(title = paste("Mean per case", score_l),
+        x = "Stage",
+        y = paste("Mean", score_l)) +
+    mytheme$large() +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45))
+
+  fn <- paste0(paste(today, "Mean", score_l, "Case", "Boxplot",
+                    sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param))
+  if (do_print) print(p)
+})
+```
+
+### A6.2.2: Scores by case
+Iterate through the different scores and color them by case + cell-type.
+
+```{r mean-absscore-case-celltype}
+scores <- c("AbsScore", "NormScore", "NormScoreTot", "NormScoreArea")
+purrr::walk(scores, \(score_l){
+  # Barplot
+  p <- score_ct %>%
+    dplyr::rename(Score = !!score_l) %>%
+    group_by(CellType, case_id, donor_type) %>%
+    summarize_at("Score", .funs = mean) %>%
+    
+    ggplot(aes(x = case_id, y = Score, fill = donor_type)) +
+    geom_bar(stat = "identity") +
+    facet_wrap(~CellType, scales = "free_y") +
+    scale_fill_manual("Stage",
+                      labels = metadata(spe)$stages,
+                      values = palettes$stages) +
+    labs(title = paste("Mean per cell type and case", score_l),
+        x = "Case", 
+        y = paste("Mean", score_l)) +
+    mytheme$standard() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+
+  fn <- paste0(paste(today, "Mean", score_l, "Case", "Celltype", "Barplot",
+                    sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param_large))
+  if (do_print) print(p)
+
+  # Boxplot
+  p <- score_ct %>%
+    dplyr::rename(Score = !!score_l) %>%
+    group_by(CellType, case_id, donor_type) %>%
+    summarize_at("Score", .funs = mean) %>%
+    
+    ggplot(aes(x = donor_type, y = Score, fill = donor_type)) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_jitter(width = 0.1) +
+    # each facet with its own y-axis
+    facet_wrap(~CellType, scales = "free_y") +
+    scale_fill_manual("Stage",
+                      labels = metadata(spe)$stages,
+                      values = palettes$stages) +
+    labs(title = paste("Mean absolute score", score_l),
+        x = "Stage",
+        y = paste("Mean score", score_l)) +
+    mytheme$large() +
+    theme(axis.text.x = element_text(hjust = 0.5, vjust = 1, angle = 90))
+
+  fn <- paste0(paste(today, "Mean", score_l, "Case", "Celltype", "Boxplot",
+                    sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param_large))
+  if (do_print) print(p)
+})
+```
+
+
+## A6.3: Boxplots
+
+### A6.3.1: Scores - By cell type
+
+By stage
+
+```{r boxplot-absscore-celltype-stage, warning=FALSE}
+purrr::walk(c("AbsScore", "NormScore", "NormScoreTot", "NormScoreArea"), \(score_l){
+  
+  p <- score_ct %>%
+    dplyr::rename(Score = !!score_l) %>%
+    ggplot(aes(x = CellType, y = log(Score), fill = CellType, color = donor_type)) +
+    geom_boxplot(outlier.size = 0.1) +
+    scale_fill_manual("Cell Type",
+                      labels = names(celltypes),
+                      values = palette_ct) +
+    scale_color_manual("Stage",
+                       labels = metadata(spe)$stages,
+                       values = palettes$stages) +
+    labs(x = "Cell type", y = "log (infiltration score)") +
+    mytheme$standard() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+  fn <- paste0(paste(today, "Boxplot", score_l, "CellType", "Stage",
+                     sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param))
+  if (do_print) print(p)
+})
+```
+
+### A6.3.2: Scores - By case
+
+```{r boxplot-absscore-celltype-case, warning=FALSE}
+purrr::walk(c("AbsScore", "NormScore", "NormScoreTot", "NormScoreArea"), \(score_l){
+  
+  # Boxplot
+  p <- score_ct %>%
+    dplyr::rename(Score = !!score_l) %>%
+    ggplot(aes(x = CellType, y = log(Score), fill = CellType, color = case_id)) +
+    geom_boxplot(outlier.size = 0.1) +
+    scale_fill_manual("Cell Type",
+                      labels = names(celltypes),
+                    values = palette_ct) +
+  scale_color_manual("Stage",
+                    labels = metadata(spe)$cases,
+                    values = palettes$cases) +
+  labs(x = "Cell type", y = "log (infiltration score)") +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+  fn <- paste0(paste(today, "Boxplot", score_l, "CellType", "Case",
+                    sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param))
+  if (do_print) print(p)
+})
+```
+
+## A6.4: Plot selected main immune cell types for figure.
+
+Plot boxplots of main immune cell types of their infiltration score.
+
+```{r plot-fig-suppl}
+mfig_celltypes <- c("T_CD4", "T_CD8","Myeloid", "Neutrophil")
+msuppl_celltypes <- c("B", "NK", "CD303_VIM", "T_DN")
+
+score_ct2 <- score_ct |> 
+  left_join(cases_full |> select(case_id, ICU_time_days), by = "case_id") |> 
+  as_tibble() |> 
+  mutate(ICU_time_days = ifelse(is.na(ICU_time_days), mean(ICU_time_days, na.rm = TRUE), ICU_time_days))
+
+### 
+p <- plot_clusters_if_score(
+  df = score_ct2, 
+  cur_clusters = mfig_celltypes, 
+  ct_type = "cell_type", ncol = 2) + 
+  labs(y = "log1p: Infiltration Score",
+       x = "Stage")
+
+fn <- paste0(paste(today, "Mean", "NormScoreArea", "Case", "Boxplot", "Major",
+                  sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+fig3e <- p
+saveRDS(fig3e, file.path(paths$home_git, "figures", "fig3e.rds"))
+
+### 
+p <- plot_clusters_if_score(
+  df = score_ct2, 
+  cur_clusters = msuppl_celltypes, 
+  ct_type = "cell_type", ncol = 2) + 
+  labs(y = "log1p: Infiltration Score",
+       x = "Stage")
+
+fn <- paste0(paste(today, "Mean", "NormScoreArea", "Case", "Boxplot", "Minor",
+                  sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+extfig5d <- p
+saveRDS(extfig5d, file.path(paths$home_git, "figures", "extfig5d.rds"))
+```
+
+## A6.5: Immune-clusters
+
+By stage
+
+### A6.5.1: Myeloid clusters
+```{r total-normscore-total-cluster-stage3}
+### All Myeloid Clusters.
+score_cluster <- score_clust[[1]] |> filter(image_id %in% icis)
+cur_cluster <- c("Myeloid_1", "Myeloid_2", "Myeloid_3", "Myeloid_4",
+                 "Myeloid_5", "Myeloid_6", "Myeloid_7", "Myeloid_8")
+
+score_cluster2 <- score_cluster |> 
+  left_join(cases_full |> select(case_id, ICU_time_days), by = "case_id") |> 
+  as_tibble() |> 
+  mutate(ICU_time_days = ifelse(is.na(ICU_time_days), mean(ICU_time_days, na.rm = TRUE), ICU_time_days))
+
+p <- plot_clusters_if_score(
+  df = score_cluster2, 
+  cur_clusters = cur_cluster, 
+  ct_type = "cluster", nrow = 2)
+
+fn <- paste0(paste(today, "Mean", "NormScoreArea", "Case", "Boxplot", 
+                   "Myeloid", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+### Plot only Myeloid_3 and Myeloid_4 clusters (main interest).
+cur_cluster <- c("Myeloid_3", "Myeloid_4")
+p <- plot_clusters_if_score(
+  df = score_cluster2, 
+  cur_clusters = cur_cluster, 
+  ct_type = "cluster", nrow = 2)
+
+p <- p + facet_wrap(~ immune_cluster, labeller = 
+  as_labeller(c("Myeloid_3" = "Act. M1/M2-like", "Myeloid_4" = "cDC")), 
+  scales = "free_y", nrow = 2) 
+
+fn <- paste0(paste(today, "Mean", "NormScoreArea", "Case", "Boxplot", 
+                   "Myeloid_3_4", sep = "_"), ".png")
+
+plotsave_param2 <- plotsave_param
+plotsave_param2$height <- 400
+do.call(ggsave, c(list(fn, p), plotsave_param2))
+
+extfig8c <- p
+saveRDS(extfig8c, file.path(paths$home_git, "figures", "extfig8c.rds"))
+```
+
+### A6.5.2: T-CD8 and T-CD4 clusters
+```{r total-normscore-total-cluster-case}
+### T-CD8 clusters
+cur_clusters <- c("T_CD8_1", "T_CD8_2", "T_CD8_3", "T_CD8_4", 
+                  "T-naive", "T_CD8_6", "T-EMRA", "T_CD8_7")
+p <- plot_clusters_if_score(
+  df = score_cluster2, 
+  cur_clusters = cur_clusters, 
+  ct_type = "cluster", ncol = 4) + 
+  labs(y = "log1p: Infiltration Score",
+       x = "Stage")
+
+fn <- paste0(paste(today, "Mean", "NormScoreArea", "Case", "Boxplot", 
+                   "T_CD8_Clusters", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+### T-CD4 clusters
+cur_clusters <- c("T_CD4_1", "T_CD4_2", "T_CD4_3", "T_CD4_4", 
+                  "T_CD4_5", "T_CD4_6", "T_CD4_7", "T_CD4_8", "T_CD4_9")
+p <- plot_clusters_if_score(
+  df = score_cluster2, 
+  cur_clusters = cur_clusters, 
+  ct_type = "cluster", ncol = 4) + 
+  labs(y = "log1p: Infiltration Score",
+       x = "Stage")
+
+fn <- paste0(paste(today, "Mean", "NormScoreArea", "Case", "Boxplot", 
+                   "T_CD4_Clusters", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+## Main clusters of interest.
+cur_cluster <- c("T_CD4_5", "T_CD8_7")
+
+p <- plot_clusters_if_score(
+  df = score_cluster2, 
+  cur_clusters = cur_cluster, 
+  ct_type = "cluster", ncol = 4) + 
+  labs(y = "log1p: Infiltration Score",
+       x = "Stage")
+
+p <- p + facet_wrap(~ immune_cluster, labeller = as_labeller(
+    c("T_CD4_5" = "CD4+ Act. PD1+",
+      "T_CD8_7" = "T_CD8_7")), scales = "free_y")
+
+fn <- paste0(paste(today, "Mean", "NormScoreArea", "Case", "Boxplot", 
+                   "T_CD4_5", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+extfig6c <- p
+saveRDS(extfig6c, file.path(paths$home_git, "figures", "extfig6c.rds"))
+```
+
+### A6.5.3: NK-clusters
+```{r total-normscore-total-cluster-case-nk}
+cur_clusters <- c("NK_1", "NK_2", "NK_3")
+p <- plot_clusters_if_score(
+  df = score_cluster2, 
+  cur_clusters = cur_clusters, 
+  ct_type = "cluster", ncol = 3) + 
+  labs(y = "log1p: Infiltration Score",
+       x = "Stage")
+
+fn <- paste0(paste(today, "Mean", "NormScoreArea", "Case", "Boxplot", 
+                   "NK_Clusters", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+-> The relevant one is NK_2.

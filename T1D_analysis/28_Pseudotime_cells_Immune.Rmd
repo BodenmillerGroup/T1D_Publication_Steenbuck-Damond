@@ -1,0 +1,1876 @@
+---
+title: "28_Pseudotime_cells_Immune"
+author: "Nathan Steenbuck"
+date: "Created: 05 Mar, 2021; Compiled: `r format(Sys.time(), '%d %b, %Y')`"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+cur_user <- Sys.info()[["user"]]
+script_name <- "28_Pseudotime_cells_Immune.Rmd"
+
+if (cur_user == "ubuntu") {
+  source(file.path("/", "mnt", "central_nas", "projects", 
+    "type1_diabetes", "nathan", "T1D_Vol", "T1D_analysis", 
+    "analysis", "helpers.R")) 
+  #n_cores <- future::availableCores() - 1
+  n_cores <- 2
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  knitr::opts_knit$set(root_dir = paths$home_data)
+  do_print <- FALSE
+} else {
+  source(file.path("/", "home", "nsteen", "scripts", "T1D_analysis", "analysis", "helpers.R"))
+  n_cores <- 8
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  paths$folder_script <- paths$cluster_folder_script
+  paths$folder_in <- paths$cluster_folder_in
+  paths$folder_out <- paths$cluster_home 
+  knitr::opts_knit$set(root_dir = paths$cluster_home)
+  do_print <- TRUE
+}
+
+seed <- 123456
+set.seed(seed)
+options <- furrr::furrr_options(seed = seed)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## **Goal**
+
+Correlate Immune cell infiltration scores / densities to inferred Pseudotime.
+
+ALSO: perform joint analysis of immune cell + islet expression levels.
+
+
+# A0: **Settings**
+
+## A0.1: Load packages
+
+```{r packages, results='hide'}
+suppressPackageStartupMessages(c(
+  library(data.table),
+  library(dplyr),
+  library(SingleCellExperiment),
+  library(scater),
+  library(uwot),
+  library(ggplot2),
+  library(parallel),
+  library(slingshot),
+  library(scuttle),
+  library(ggplot2),
+  library(purrr),
+  library(tidyr),
+  library(patchwork),
+  library(ggpubr),
+  library(rstatix)
+))
+```
+
+## A0.2: Paths and settings
+
+```{r settings}
+# Paths
+if (!dir.exists(paths$folder_script)) dir.create(paths$folder_script)
+plotsave_param$path <- paths$folder_script
+plotsave_param_large$path <- paths$folder_script
+
+# Misc settings
+today <- gsub("-", "", Sys.Date())
+```
+
+##  A0.3: Read in the SCE data (BETA-cells)
+
+```{r load-data}
+fn_sces <- file.path(paths$folder_out, "12_CellTypeSCEs_cells_Islet", "celltypes_Islet.rds")
+sces <- readRDS(fn_sces)
+sces
+```
+
+## A0.4: Select assays and channels
+
+```{r variables}
+# Select a single assay
+assay_sel <- c("exprs")
+cat(c("Assay:", assay_sel))
+
+# Select the dimensionality reduction to use
+dimred_sel <- c("UMAP")
+dimred_name <- paste(dimred_sel, assay_sel, sep = "_")
+cat(c("\nReduced dimensions:", assay_sel))
+
+# Variables to plot
+plot_variables <- c("donor_type", "case_id")
+names(plot_variables) <- c("stages", "cases")
+```
+
+Add ran pseudotime (see 35_Pseudotime_Islet) to Beta-SPE.
+
+```{r pseudotime-beta}
+dimred_name <- "DiffMap_exprs"
+beta <- sces$Beta
+# islet <- spes$Islet
+
+## computed pseudotime.
+sds <- readRDS(file.path(paths$folder_out, "99_TEMPbetacells_cells_Islet", paste0("cells", "_", "beta", "_", "Slingshot", ".rds")))
+beta$slingshot <- sds$slingPseudotime_1
+```
+
+Get beta-cell data.
+```{r get-data}
+cur_dat <- scuttle::makePerCellDF(beta, use_dimred = TRUE) %>%
+  as_tibble() |> 
+  mutate(case_id = factor(case_id, levels = metadata(beta)$cases),
+         donor_type = factor(donor_type, levels = metadata(beta)$stages)) %>%
+  arrange(case_id, donor_type) |> 
+  filter(!donor_type %in% c("LongDuration", "Pancreatitis"))
+```
+
+
+# A1: Immune cell analysis.
+## A1.1: Load IMMUNE cells data.
+
+Correlate the Immune Cell Scores to the Beta/Islet-cell pseudotime.
+
+```{r load-immune-data}
+gc()
+fn_immune <- file.path(paths$folder_out, "08_CellTypesIslet_cells_Immune", "cells_Immune.rds")
+spe <- readRDS(fn_immune)
+```
+
+Subset to SPE_IMM.
+```{r immune-parameters}
+spe_imm <- spe[, spe$cell_category == "immune" & 
+                 spe$cell_type != "Ambiguous" &
+                 spe$cell_cluster_scaled != "Ambiguous"]
+# saveRDS(spe_imm, fn)
+```
+
+## A1.2: Prepare Data and set parameters.
+```{r}
+case_stages <- 
+  colData(spe)[, c("case_id", "age", "donor_type")] |> 
+    as_tibble() |> 
+    distinct() |> 
+    mutate(age_group = ifelse(age < 13, "< 13", ">= 13"))
+```
+
+Immune Cell Parameters.
+```{r immune-parameters}
+# List of cell types
+celltypes <- c("T_CD4", "T_CD8", "B", "NK", "Neutrophil", "Myeloid")
+names(celltypes) <- celltypes
+cat("Immune cell types\n", celltypes)
+
+# Color palette for plotting
+palette_ct <- c(palettes$colors[1:(length(celltypes))])
+names(palette_ct) <- celltypes
+```
+
+Remove Pancreatitis & LD.
+```{r remove-pancreatitis-LD2}
+spe_imm <- spe_imm[, !spe_imm$donor_type %in% c("LongDuration", "Pancreatitis")]
+
+metadata(spe)$stages <- metadata(spe)$stages[
+  !metadata(spe)$stages %in% c("LongDuration", "Pancreatitis")]
+palettes$stages <- palettes$stages[!names(palettes$stages) %in% c("LongDuration", "Pancreatitis")]
+```
+
+List of immune cell types and clusters.
+```{r immune-clusters-celltypes}
+# List of immune cell types and clusters
+clusters <- sort(unique(spe_imm$cell_cluster_scaled))
+clusters <- clusters[clusters != "Ambiguous"]
+clusters <- clusters[clusters != "T_CD8_5"]
+names(clusters) <- clusters
+cat("\nImmune cell clusters\n", clusters)
+
+# Color palettes for plotting
+palette_clust <- c(palettes$colors[1:(length(clusters))])
+#palette_clust <- c(palette_ct[3], rep(palette_ct[1], 3), rep(palette_ct[2], 6),
+#                   rep(palette_ct[6], 6), rep(palette_ct[5], 4), palette_ct[3],
+#                   "grey")
+names(palette_clust) <- clusters
+
+# Variables to plot
+plot_variables <- c("donor_type", "case_id")
+names(plot_variables) <- c("Stage", "Donor")
+cat("\nVariables to plot:", plot_variables)
+```
+
+UPDATED DistScoreSqrt for Immune Cells.
+```{r dist-score-immune}
+dist_score <- metadata(spe)$celltype_compo_score |> as_tibble() |> 
+  select(image_id, case_id, donor_type, starts_with("NormScoreArea_"), starts_with("Density"), starts_with("AbsScore")) |> 
+  pivot_longer(cols = starts_with("NormScoreArea_"), 
+               names_to = "cell_type", values_to = "NormScoreArea") |>
+  mutate(cell_type = stringr::str_remove(cell_type, "NormScoreArea_")) |>
+  pivot_longer(cols = starts_with("AbsScore"), 
+               names_to = "cell_type2", values_to = "DistScore") |> 
+  mutate(cell_type2 = stringr::str_remove(cell_type2, "AbsScore_")) |> 
+  pivot_longer(cols = starts_with("Density"), 
+               names_to = "cell_type3", values_to = "Density") |> 
+  mutate(cell_type3 = stringr::str_remove(cell_type3, "density_")) |> 
+  filter(cell_type == cell_type2) |> 
+  filter(cell_type == cell_type3)
+```
+
+## A1.3 Generate Combined (Beta + Immune + Pseudotime)
+
+First, aggregate Pseudotime + Beta-cell Expression by image.
+```{r aggregate-pseudotime-by-image}
+# aggregate by Image.
+channels_oi <- rownames(beta)
+
+## Beta-cell expression + 
+cur_dat <- as_tibble(
+  makePerCellDF(beta,
+                features = channels_oi,
+                exprs_values = "exprs")) |> 
+  group_by(case_id, donor_type, image_id) |> 
+  summarize(across(all_of(c(channels_oi, "slingshot")), \(x) mean(x, na.rm = TRUE)), .groups = "drop") |> 
+  filter(!donor_type %in% c("LongDuration", "Pancreatitis")) |> 
+  mutate(image_id = gsub("Islet", "Immune", image_id)) |> 
+  mutate(slingshot = scales::rescale(slingshot, to = c(0, 1)))
+
+all <- dplyr::inner_join(cur_dat, dist_score, by = c("case_id", "image_id", "donor_type")) %>%
+  as_tibble()
+```
+
+# A2: Pseudotime vs Immune INfiltration Scores
+Joint Beta-cell Pseudotime + Expression with Immune Cell Scores.
+
+## A2.1: Pseudotime vs Infiltration Scores per CT.
+Plot SLINGSHOT Pseudotime vs Immune Cell Scores per Image.
+Plot for each Immune CellType.
+```{r slingshot-vs-DistScore}
+plot_cols <- c("NormScoreArea")
+
+for (i in seq_along(plot_cols)) {
+  for(h in seq_along(celltypes)) {
+
+    p <- all %>%
+      filter(cell_type %in% celltypes[h]) %>%
+      ggplot(aes(x=slingshot, y=get(plot_cols[i]), color=donor_type))+
+      geom_point(size=0.1)+
+      scale_color_manual(values = palettes$stages)+
+      labs(title = plot_cols[i])+
+      mytheme$large() + 
+      geom_smooth(aes(group = 1), method = "loess")
+    # print(p)
+    fn <- paste0(paste(today, "Immune", "Pseudotime", "Score", celltypes[h],
+                       plot_cols[i], sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param))
+  }
+}
+```
+
+## A2.2: Pseudotime vs Infiltration Scores per CT (per sample)
+Aggregate by Sample.
+```{r pseudotime-by-sample}
+all_sample <- all |> 
+  group_by(case_id, donor_type, cell_type) |> 
+  summarize(across(where(is.numeric), \(x) mean(x, na.rm = TRUE)), .groups = "drop")
+
+plot_cols <- c("Density", "NormScoreArea")
+
+for (i in seq_along(plot_cols)) {
+  for(h in seq_along(celltypes)) {
+    # i <- 1; h <- 1
+    p <- all_sample %>%
+      filter(cell_type %in% celltypes[h]) %>%
+      ggplot(aes(x=slingshot, y=log1p(get(plot_cols[i])), color=donor_type))+
+      geom_point(size=5)+
+      scale_color_manual(values = palettes$stages)+
+      labs(title = plot_cols[i])+
+      mytheme$large() + 
+      geom_smooth(aes(group = 1), method = "loess")
+    # print(p)
+    fn <- paste0(paste(today, "Immune", "Pseudotime", "Sample", "Score", celltypes[h],
+                       plot_cols[i], sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param))
+  }
+}
+```
+
+## A2.3: Pseudotime vs Infiltration Scores per CT (main Immune CT)
+
+Repeat for Major Cell Types (T_CD4, T_CD8, Myeloid, Neutrophil).
+Plot as a facet. Previous Main Figure; not anymore. 
+BUT: Can be nicely seen how pseudotime directly correlates with the Infiltration Scores.
+
+```{r slingshot-vs-DistScore-major}
+## Make plot of Myeloid, T_CD4, T_CD8, Neutrophil
+plot_col <- "NormScoreArea"
+celltypes <- c("Myeloid", "T_CD4", "T_CD8", "Neutrophil")
+
+p <- all %>%
+  filter(cell_type %in% celltypes) %>%
+  ggplot(aes(x=slingshot, y=log1p(NormScoreArea), color=donor_type))+
+  geom_point(size=0.1)+
+  scale_color_manual(values = palettes$stages)+
+  mytheme$large() + 
+  labs(x = "log1p: Pseudotime",
+       y = "Mean normalized Score") + 
+  # fit a loess curve through ALL points; not separate lines by stage
+  geom_smooth(aes(group = 1), method = "loess") + 
+  facet_wrap(~cell_type, ncol = 2, scales = "free_y") + 
+  theme(legend.position = "none")
+
+# print(p)
+fn <- paste0(paste(today, "Immune", "Pseudotime", "Score", "Major",
+                  plot_col, sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+Repeat for whole-samples.
+```{r slingshot-vs-DistScore-major-sample}
+## Repeat for Sample
+plot_col <- "NormScoreArea"
+celltypes <- c("Myeloid", "T_CD4", "T_CD8", "Neutrophil")
+
+p <- all_sample %>%
+  filter(cell_type %in% celltypes) %>%
+  ggplot(aes(x=slingshot, y=log1p(NormScoreArea), color=donor_type))+
+  geom_point(size=2)+
+  scale_color_manual(values = palettes$stages)+
+  mytheme$large() + 
+  labs(x = "Pseudotime",
+       y = "Mean normalized Score") + 
+  # fit a loess curve through ALL points; not separate lines by stage
+  geom_smooth(aes(group = 1), method = "loess") + 
+  facet_wrap(~cell_type, ncol = 2, scales = "free_y") + 
+  theme(legend.position = "none")
+
+# print(p)
+fn <- paste0(paste(today, "Immune", "Pseudotime", "Score", "Major", "Sample",
+                  plot_col, sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+## A2.4: Pseudotime vs Infiltration Scores per CT (minor Immune CT)
+
+Repeat for Minor Cell Types (B, NK, CD303_VIM, T_DN).
+Plot as a facet. -> Previous Supplementary.
+```{r slingshot-vs-DistScore-minor}
+plot_col <- "NormScoreArea"
+msuppl_celltypes <- c("B", "NK", "CD303_VIM", "T_DN")
+
+p <- all %>%
+  filter(cell_type %in% msuppl_celltypes) %>%
+  ggplot(aes(x=slingshot, y=log1p(NormScoreArea), color=donor_type))+
+  geom_point(size=0.1)+
+  scale_color_manual(values = palettes$stages)+
+  mytheme$large() + 
+  labs(x = "Pseudotime",
+       y = "Mean normalized Score") + 
+  # fit a loess curve through ALL points; not separate lines by stage
+  geom_smooth(aes(group = 1), method = "loess") + 
+  facet_wrap(~cell_type, ncol = 2, scales = "free_y") + 
+  theme(legend.position = "none")
+
+# print(p)
+fn <- paste0(paste(today, "Immune", "Pseudotime", "Score", "Minor",
+                  plot_col, sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+
+## A2.5: Co-infiltration T-cells + Myeloid-cells
+
+Plot joint as 1 plot. 
+Visualize co-infiltration of T-cells; and prior increase in Myeloid cells.
+```{r slingshot-vs-DistScore-tcells-myeloid}
+# Plot T_CD4, T_CD8, Myeloid together.
+plot_col <- "NormScoreArea"
+celltypes <- c("Myeloid", "T_CD4", "T_CD8")
+col_ois <- paste0(plot_col, "_", celltypes)
+palette_test <- list(Myeloid = "#B17BA6",
+                     T_CD4 = "#DC050C",
+                     T_CD8 = "#FB8072")
+
+data_tt <- all %>%
+  filter(cell_type %in% c("T_CD4", "T_CD8", "Myeloid")) |> 
+  mutate(cell_type = factor(cell_type, levels = c("T_CD4", "T_CD8", "Myeloid")))
+
+p <- data_tt |> 
+  ggplot(aes(x=slingshot, y=log1p(NormScoreArea), color=cell_type, fill=cell_type))+
+  geom_point(size=0.1, alpha = 0.5)+
+  labs(y = "log1p: Infiltration Score", x = "Pseudotime") +
+  # fit a loess curve through ALL points; not separate lines by stage
+  geom_smooth(method = "loess", se = TRUE, alpha = 0.1, linewidth = 2) + 
+  scale_color_manual(values = palette_test, name = "Cell Type") + 
+  scale_fill_manual(values = palette_test, name = "Cell Type")+
+  # xlim(c(0.002, 0.016)) + 
+  mytheme$standard_new() 
+
+print(p)
+fn <- paste0(paste(today, "Immune", "Pseudotime", "Tcells", "Major",
+                  plot_col, sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+extfig5e <- p
+saveRDS(extfig5e, file.path(paths$home_git, "figures", "extfig5e.rds"))
+
+## Sample:
+data_tt <- all |> 
+  filter(cell_type %in% c("T_CD4", "T_CD8", "Myeloid")) |> 
+  mutate(cell_type = factor(cell_type, levels = c("T_CD4", "T_CD8", "Myeloid"))) |> 
+  group_by(case_id, cell_type, donor_type) |> 
+  summarize(across(where(is.numeric), \(x) mean(x, na.rm = TRUE)), .groups = "drop")
+
+p <- data_tt |> 
+  ggplot(aes(x=slingshot, y=log1p(NormScoreArea), color=cell_type, fill=cell_type))+
+  geom_point(size=0.1, alpha = 0.5)+
+  labs(y = "log1p: Infiltration Score", x = "Pseudotime") +
+  # fit a loess curve through ALL points; not separate lines by stage
+  geom_smooth(method = "loess", se = TRUE, alpha = 0.1, linewidth = 2) + 
+  geom_vline(xintercept = 0.53, linetype = "dashed") + 
+  scale_color_manual(values = palette_test, name = "Cell Type") + 
+  scale_fill_manual(values = palette_test, name = "Cell Type")+
+  # xlim(c(0.002, 0.016)) + 
+  mytheme$standard_new() 
+print(p)
+fn <- paste0(paste(today, "Immune", "Pseudotime", "Tcells", "Major", "SAMPLES",
+                  plot_col, sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+# A3: Pseudotime to Infiltraiton score (**Clusters.**)
+
+## A3.1 Prepare Data.
+Aggregate Pseudotime + Beta-cell Expression by image for **CLUSTERS**.
+```{r aggregate-pseudotime-by-image2}
+# aggregate by Image.
+gc()
+channels_oi <- rownames(beta)
+
+dist_score_clusters <- metadata(spe)$cluster_compo_score[[1]] |> as_tibble() |> 
+  select(image_id, case_id, donor_type, starts_with("NormScoreArea_"), starts_with("Density"), starts_with("AbsScore")) |> 
+  pivot_longer(cols = starts_with("NormScoreArea_"), 
+               names_to = "cell_type", values_to = "NormScoreArea") |>
+  mutate(cell_type = stringr::str_remove(cell_type, "NormScoreArea_")) |>
+  pivot_longer(cols = starts_with("AbsScore"), 
+               names_to = "cell_type2", values_to = "DistScore") |> 
+  mutate(cell_type2 = stringr::str_remove(cell_type2, "AbsScore_")) |> 
+  filter(cell_type == cell_type2) |> 
+  pivot_longer(cols = starts_with("Density"), 
+               names_to = "cell_type3", values_to = "Density") |> 
+  mutate(cell_type3 = stringr::str_remove(cell_type3, "density_")) |> 
+  filter(cell_type == cell_type3)
+
+## DF with all clusters.
+all_clusters <- dplyr::inner_join(cur_dat, dist_score_clusters, by = c("case_id", "image_id", "donor_type")) %>%
+  as_tibble() |> 
+  dplyr::rename("cluster" = cell_type) |> 
+  # remove [1-9] from cluster names
+  mutate(cell_type = stringr::str_remove(cluster, "_[0-9]+")) |>
+  mutate(cell_type = stringr::str_remove(cell_type, "_Other")) |>
+  mutate(cell_type = ifelse(cell_type %in% c("T.naive", "T.EMRA"), "T_CD8", cell_type))
+
+clusters <- all_clusters |> distinct(cell_type, cluster) |> pull(cluster)
+names(clusters) <- all_clusters |> distinct(cell_type, cluster) |> pull(cell_type) 
+```
+
+## A3.2: Plot SLINGSHOT Pseudotime vs Immune Cell Scores per Image.
+Plot SLINGSHOT Pseudotime vs Immune Cell Scores per Image.
+
+```{r plot-slingshot-clusters}
+plot_cols <- c("NormScoreArea", "density")
+
+# Aggregate by Sample.
+all_clusters_sample <- all_clusters |> 
+  group_by(case_id, donor_type) |> 
+  summarize(across(where(is.numeric), \(x) mean(x, na.rm = TRUE)), .groups = "drop")
+
+for (i in seq_along(plot_cols)) {
+  for(h in seq_along(celltypes)) {
+    # Look for partial match: h <- 1
+    clusters_oi <- clusters[grepl(celltypes[h], clusters)]
+
+    p <- all_clusters %>%
+      filter(cluster %in% clusters_oi) %>%
+      ggplot(aes(x=slingshot, y=log1p(NormScoreArea), color=donor_type))+
+      geom_point(size=0.5)+
+      scale_color_manual(values = palettes$stages)+
+      labs(title = plot_cols[i])+
+      mytheme$large() + 
+      geom_smooth(aes(group = 1), method = "loess") +
+      facet_wrap(~cluster, scales = "free_y")
+    # print(p)
+    
+    fn <- paste0(paste(today, "Immune", "Clusters", "Pseudotime", "Score", celltypes[h],
+                       plot_cols[i], sep = "_"), ".png")
+    print(fn)
+    do.call(ggsave, c(list(fn, p), plotsave_param_large))
+  }
+}
+```
+
+# A4: CELLTYPES: Channels to DISTSCORES!
+
+
+Partly already done in 13_Immune.
+Here, we correlate beta-cell expression levels to immune cell densitiy + Infiltraiton Scores. 
+
+Calculate which **Channels** are associated to **DistScores**.
+Here: They ARE NOT aligned by Slingshot Pseudotime.
+
+First, done by CELL TYPES.
+
+```{r stats}
+gc()
+cols_oi <- rownames(beta)[!rownames(beta) %in% c("ARX", "Ki67", "PDL1")]
+celltypes2 <- c("T_CD4", "T_CD8", "Neutrophil", "Myeloid")
+```
+
+Calculate which beta-cell expressions are associated to which Immune Cell DistScores. 
+**NOT aligned to Pseudotime.**
+Of course: HLA-ABC, B2M, (ARX), MX1, ADAR strongest - as in Pseudotime.
+
+
+## A4.1: Beta-cell Expression vs Immune Cell Infiltration Scores.
+```{r distscore-beta-cell-expression}
+exprs_image <- all |> 
+  pivot_longer(cols = all_of(cols_oi), 
+               names_to = "channel",
+               values_to = "exprs") |>
+  filter(cell_type %in% celltypes2)  |> 
+  inner_join(case_stages, by = c("case_id", "donor_type")) |> 
+  filter(!channel %in% c("ARX", "Ki67", "PDL1"))
+
+results_norm <- exprs_image |>
+  tidyr::nest(data = -c(cell_type, channel, donor_type)) |> 
+  mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(NormScoreArea ~ exprs + age_group + (1|case_id), data = .x)))) |> 
+  tidyr::unnest(test) |> 
+  filter(term == "exprs") |> 
+  arrange(p.value) |> 
+  select(cell_type, channel, term, estimate, statistic, p.value, donor_type) |> 
+  filter(donor_type %in% c("mAAb+", "RecentOnset"))
+
+results_norm |> print(n = 50)
+```
+
+Plot for HLA-ABC. DENSITY.
+
+```{r hla-abc-infiltration-scores}
+results_norm |> filter(donor_type == "RecentOnset", channel == "HLA_ABC")
+
+a <- exprs_image |> 
+  filter(channel == "HLA_ABC") |> 
+  group_by(case_id, donor_type, Density, cell_type) |> 
+  summarise(exprs = mean(exprs), density = log1p(mean(Density)), .groups = "drop") |> 
+  ggscatter(x = "exprs", y = "density", color = "donor_type", facet.by = "cell_type", conf.int = TRUE, cor.coef = TRUE, 
+            cor.method = "spearman", add = "reg.line", scales = "free_y", 
+            size = 1, add.params = list(alpha = 0.1)) + 
+  labs(x = expression(beta ~ "-cell normalized counts"), y = "log1p: Cell Density (cells/mm^2)") + 
+  scale_color_manual(name = "Stage", values = palettes[["stages"]], 
+    breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"),
+    labels = c("Control", "sAAb+", "mAAb+", "Onset")) + 
+  scale_fill_manual(name = "Stage", values = palettes[["stages"]],
+   breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"),
+   labels = c("Control", "sAAb+", "mAAb+", "Onset")) + 
+  facet_wrap(~ cell_type, scales = "free_y", axes = "all", labeller = 
+    as_labeller(c("T_CD4" = "T-CD4", "T_CD8" = "T-CD8", "Neutrophil" = "Neutrophil", "Myeloid" = "Myeloid"))) + 
+  mytheme$standard_new()
+
+print(a)
+fn <- paste0(paste(today, "Immune", "Infiltration", "HLA_ABC", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, a), plotsave_param))
+```
+
+HLA-ABC. INFILTRATION SCORE.
+
+```{r extfig6g}
+p <- exprs_image |> 
+  filter(channel == "HLA_ABC") |> 
+  ggplot(aes(x = exprs, y = log1p(Density), color = donor_type)) +
+  geom_point(size = 1) +
+  scale_color_manual(values = palettes[["stages"]], breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset")) + 
+  geom_smooth(method = "lm") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(x = expression(beta ~ "-cell HLA-ABC expression"), y = "log1p: Cell Density (cells/mm^2)", color = "Stage") +
+  mytheme$large_new() + 
+  facet_wrap(~ cell_type, scales = "free_y") + 
+  theme(legend.position = "none") + 
+  ggpubr::stat_cor(method = "spearman", aes(color = donor_type, label = ..r.label..),
+            label.x = 0, label.y.npc = "top", size = 10, r.digits = 2,
+            show.legend = FALSE) + 
+  # extend x-axis
+  scale_x_continuous(expand = c(0.01, 0.01)) + 
+  xlim(c(0, 6))
+
+print(p)
+fn <- paste0(paste(today, "Immune", "Infiltration", "HLA_ABC", "images", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+
+Calculate which channels are associated to Immune Cell Type Densities. Global Overview.
+**NOT aligned to Pseudotime.**
+
+## A4.2: Beta-cell Expression vs Immune Cell Densities.
+
+Run LMM.
+
+```{r density-beta-cell-expression}
+results_density <- exprs_image |> 
+  tidyr::nest(data = -c(cell_type, channel)) |> 
+  mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(Density ~ exprs + age_group + (1|case_id), data = .x)))) |> 
+  tidyr::unnest(test) |> 
+  filter(term == "exprs") |> 
+  arrange(p.value) |> 
+  select(cell_type, channel, term, estimate, statistic, p.value)
+```
+
+Join both results (Infiltration SCore + Density.)
+```{r join-density-Infiltration-score}
+joint_results <- dplyr::inner_join(results_density, results_norm, suffix = c("den", "norm"), by = c("channel", "cell_type"))
+
+joint_results |> 
+  arrange(p.valuenorm) |> 
+  filter(cell_type == "Myeloid") |> 
+  print(n = 30)
+
+joint_results |> filter(cell_type == "Myeloid") |> print(n = 30)
+joint_results |> filter(cell_type == "T_CD8") |> print(n = 30)
+```
+Predicted mainly HLA-ABC, B2M. Also MX1, ADAR.
+Other non IFN-depedent markers, e.g. IAPP; 
+are rather associated with density than infiltration score.
+-> Likely not directly related to islet-directed immune inflammation.
+
+# A5: Cross-correlations across Pseudotimes.
+
+Calculate Cross-Correlations!
+
+## A5.1: Helper Functions.
+
+Helper Functions.
+```{r helper-functions-ccf}
+# Function to interpolate data to make it evenly spaced
+interpolate_data <- function(time, exprs, new_time) {
+  interpolated <- approx(time, exprs, xout = new_time)
+  return(interpolated$y)
+}
+
+# Function to compute cross-correlation and return max correlation with corresponding lag
+calculate_cross_correlation <- function(time, exprs, NormScoreTot, lag.max = 10) {
+  # Interpolate data
+  new_time <- seq(min(time), max(time), length.out = length(time))
+  exprs_interp <- interpolate_data(time, exprs, new_time)
+  NormScoreTot_interp <- interpolate_data(time, NormScoreTot, new_time)
+  
+  # Compute cross-correlation
+  ccf_result <- ccf(exprs_interp, NormScoreTot_interp, plot = FALSE, lag.max = lag.max)
+  
+  # Find the lag with the maximum cross-correlation
+  max_cor_index <- which.max(abs(ccf_result$acf))
+  max_cor <- ccf_result$acf[max_cor_index]
+  max_lag <- ccf_result$lag[max_cor_index]
+  
+  # p-vals:
+  corr_at_lag_0 <- ccf_result$acf[which(ccf_result$lag == 0)]
+  N <- length(exprs_interp)
+  se <- 1 / sqrt(N)
+  z_value <- corr_at_lag_0 / se
+  p_value <- 2 * pnorm(-abs(z_value))
+
+  # Return a data frame
+  return(data.frame(max_cor = max_cor, max_lag = max_lag, pval = p_value))
+}
+```
+
+## A5.2: Pseudotime samples vs Infiltration Scores.
+
+Aggregate Expression + Infiltration Score + Density + Pseudotime by Donor and Cell Type.
+```{r prepare-cross-correlations}
+slingshot_sample <- exprs_image |> 
+  group_by(case_id, donor_type, channel, cell_type) |> 
+  summarize(exprs = mean(exprs), density = mean(Density), 
+            NormScoreArea = mean(NormScoreArea), 
+            DistScore = mean(DistScore),
+            slingshot = mean(slingshot), .groups = "drop") |>
+  arrange(slingshot)
+```
+
+Calculate Cross-Correlations from **SAMPLES** Infiltration Score to **CELL TYPES expressions**.
+Observe very high correlations for key cell types.
+
+```{r}
+# Apply the function within each group and unpack results
+result_normscore <- slingshot_sample %>%
+  group_by(cell_type, channel) %>%
+  summarize(cross_corr = list(calculate_cross_correlation(slingshot, exprs, NormScoreArea, lag.max = 10))) %>%
+  unnest(cols = c(cross_corr)) %>%
+  arrange(max_cor)
+
+result_normscore |> filter(channel == "HLA_ABC")
+## 
+
+# T-cells: SAMPLE: CCF InfiltrationScore = 0.95.
+slingshot_sample %>%
+  filter(channel == "HLA_ABC", cell_type %in% c("T_CD4", "T_CD8")) |> 
+  select(-density) |> 
+  pivot_wider(names_from = cell_type, values_from = NormScoreArea) |>
+  summarize(cross_corr = list(calculate_cross_correlation(slingshot, T_CD4, T_CD8, lag.max = 10))) %>%
+  unnest(cols = c(cross_corr)) %>%
+  arrange(max_cor)
+
+# T-cells: SAMPLE CCF DENSITY = 0.88.
+slingshot_sample %>%
+  filter(channel == "HLA_ABC", cell_type %in% c("T_CD4", "T_CD8")) |> 
+  select(-NormScoreArea) |> 
+  pivot_wider(names_from = cell_type, values_from = density) |>
+  summarize(cross_corr = list(calculate_cross_correlation(slingshot, T_CD4, T_CD8, lag.max = 10))) %>%
+  unnest(cols = c(cross_corr)) %>%
+  arrange(max_cor)
+
+# ISLET: CCF DENSITY = 0.8.
+exprs_image %>%
+  filter(channel == "HLA_ABC", cell_type %in% c("T_CD4", "T_CD8")) |> 
+  pivot_wider(names_from = cell_type, values_from = Density) |>
+  summarize(cross_corr = list(calculate_cross_correlation(slingshot, T_CD4, T_CD8, lag.max = 10))) %>%
+  unnest(cols = c(cross_corr)) %>%
+  arrange(max_cor)
+
+# Islet: CCF InfiltrationScore = 0.78.
+exprs_image %>%
+  filter(channel == "HLA_ABC", cell_type %in% c("T_CD4", "T_CD8")) |> 
+  select(-Density) |> 
+  pivot_wider(names_from = cell_type, values_from = NormScoreArea) |>
+  summarize(cross_corr = list(calculate_cross_correlation(slingshot, T_CD4, T_CD8, lag.max = 10))) %>%
+  unnest(cols = c(cross_corr)) %>%
+  arrange(max_cor)
+```
+
+Calculate Cross-Correlations from IMAGES Infiltration Score to CELL TYPES expressions.
+-> Dont use these; given iid assumption violation; 
+
+However, we show that even on the islet level the infiltration scores are still strongly correlated.
+
+```{r infiltration-score-image-level}
+# Apply the function within each group and unpack results
+result_normscore_img <- exprs_image %>%
+  arrange(slingshot) |> 
+  group_by(cell_type, channel) %>%
+  summarize(cross_corr = list(calculate_cross_correlation(slingshot, exprs, NormScoreArea, lag.max = 10))) %>%
+  unnest(cols = c(cross_corr)) %>%
+  arrange(max_cor)
+
+result_normscore_img |> filter(channel == "HLA_ABC")
+```
+
+# A6: Analysis Granger-Causality.
+
+## A6.1: Calculate Granger-Causality
+
+Check, if we can see potential earlier/later effects along pseudotime.
+Use Granger Causality.
+
+Check between cell types and between expression + celltypes (denisty/infiltration score).
+
+```{r granger-causality}
+# Time-Lag suggests: HLA-ABC & T-cells = 0 -> same time.
+# Test with Granger-causality (Note: non-ideal to apply to non-stationary TS).
+granger_test <- function(df, name, channel, formula, order){
+  norm_score <- df |> filter(cell_type == !!name, channel == !!channel) |> pull(NormScoreArea)
+  exprs <- df |> filter(cell_type == !!name, channel == !!channel) |> pull(exprs)
+  lmtest::grangertest(as.formula(formula), order = order)
+}
+
+granger_test_density <- function(df, name, channel, formula, order){
+  density <- df |> filter(cell_type == !!name, channel == !!channel) |> pull(density)
+  exprs <- df |> filter(cell_type == !!name, channel == !!channel) |> pull(exprs)
+  lmtest::grangertest(as.formula(formula), order = order)
+}
+
+granger_test_ct <- function(df, ct1, ct2, formula, order){
+  ct1 <- df |> filter(cell_type == !!ct1) |> pull(NormScoreArea)
+  ct2 <- df |> filter(cell_type == !!ct2) |> pull(NormScoreArea)
+  lmtest::grangertest(as.formula(formula), order = order)
+}
+
+granger_density_ct <- function(df, ct1, ct2, formula, order){
+  ct1 <- df |> filter(cell_type == !!ct1) |> pull(density)
+  ct2 <- df |> filter(cell_type == !!ct2) |> pull(density)
+  lmtest::grangertest(as.formula(formula), order = order)
+}
+```
+
+
+Calculate different contrasts.
+Read as: x ~ y -> y granger-causes x.
+We cant claim real causality, but rather correlation in time-series.
+
+```{r calculate-granger-causality}
+# Whole PS-time (images)
+granger_test_ct(exprs_image, "Myeloid", "T_CD8", "ct1 ~ ct2", 1)
+granger_test_ct(exprs_image, "T_CD8", "Myeloid", "ct1 ~ ct2", 1)
+
+## Note: Test for early time-frame.
+test_dat <- slingshot_sample |> filter(slingshot > 0.3 & slingshot < 0.53)
+granger_test_ct(test_dat, "Myeloid", "T_CD8", "ct1 ~ ct2", 1)
+granger_test_ct(test_dat, "T_CD8", "Myeloid", "ct1 ~ ct2", 1)
+
+## Actually sig. T-CD8 before T-CD4? Careful within this.
+test_dat_image <- exprs_image |> filter(slingshot > 0.3 & slingshot < 0.6)
+granger_test_ct(test_dat_image, "T_CD8", "T_CD4", "ct1 ~ ct2", 1)
+granger_test_ct(test_dat_image, "T_CD4", "T_CD8", "ct1 ~ ct2", 1)
+
+## Not significant for T-cells on sample-level.
+test_dat <- slingshot_sample |> filter(slingshot > 0.3 & slingshot < 0.6)
+granger_density_ct(test_dat, "T_CD8", "T_CD4", "ct1 ~ ct2", 1)
+granger_density_ct(test_dat, "T_CD4", "T_CD8", "ct1 ~ ct2", 1)
+
+## Does HLA-ABC expression Granger-cause T-CD8 DistScore?
+set.seed(123)
+granger_test(df = slingshot_sample, "T_CD8", "HLA_ABC", formula = "norm_score ~ exprs", order = 1)
+# -> p = 0.003 (**) -> HLA-ABC Granger-causes T-CD8 levels.
+# Reverse not predictive. 
+# granger_test(slingshot_sample, "T_CD8", "HLA_ABC", formula = "exprs ~ norm_score", 1)
+
+## Does IAPP expression Granger-cause Myeloid DistScore?
+set.seed(123)
+granger_test(slingshot_sample, "Myeloid", "IAPP", formula = "norm_score ~ exprs", 1)
+granger_test(slingshot_sample, "Myeloid", "IAPP", formula = "exprs ~ norm_score", 1)
+# -> p = 0.0004 (***) -> IAPP Granger-causes Myeloid. Myeloid react to IAPP dysregulations?
+# Reverse: p = 0.02 (*). -> Myeloid less predictive.
+
+## Does HLA-ABC expression Granger-cause Myeloid DistScore?
+set.seed(123)
+granger_test(test_dat_image, "Myeloid", "HLA_ABC", formula = "norm_score ~ exprs", 1)
+granger_test(test_dat_image, "Myeloid", "HLA_ABC", formula = "exprs ~ norm_score", 1)
+granger_test(test_dat, "Myeloid", "HLA_ABC", formula = "norm_score ~ exprs", 1)
+granger_test(test_dat, "Myeloid", "HLA_ABC", formula = "exprs ~ norm_score", 1)
+# -> p = 0.005 (**) -> HLA-ABC Granger-causes Myeloid.
+
+## Does HLA-ABC expression Granger-cause T-CD4 density? Yes.
+set.seed(123)
+granger_test_density(test_dat, "T_CD4", "HLA_ABC", formula = "density ~ exprs", 1)
+granger_test_density(test_dat, "T_CD4", "HLA_ABC", formula = "exprs ~ density", 1)
+```
+
+## A6.2: Helper Functions for Plots.
+```{r helper-function-distscore-expression}
+## Plot on X-axis SLingshot and on y-axis both IAPP and Myeloid.
+sample_type <- "Islet"; df <- exprs_image; celltype <- "T_CD8"; channel <- "HLA_ABC"; v1_x = 0.0065; v2_x = 0.0085
+plot_exprs_distscore <- function(df, celltype, channel, v1_x = NULL, v2_x = NULL, sample_type = "Sample"){
+  if (sample_type == "Islet"){
+    size <- 0.1
+    alpha <- 0.5
+  }
+  if (sample_type == "Sample"){
+    size <- 1
+    alpha <- 0.5
+  }
+  temp <- df |>
+    filter(cell_type == !!celltype, channel == !!channel) |> 
+      # scale both into 0-1
+    mutate(exprs = (exprs - min(exprs)) / (max(exprs) - min(exprs)),
+          NormScoreArea = (NormScoreArea - min(NormScoreArea)) / (max(NormScoreArea) - min(NormScoreArea))) |>
+    tidyr::pivot_longer(all_of(c("exprs", "NormScoreArea")), names_to = "metric", values_to = "exprs") |> 
+    mutate(metric = ifelse(metric == "exprs", paste(channel, "expression"), paste(celltype, "Infiltration Score")))
+
+  p <- temp |> 
+    ggplot(aes(x = slingshot, y = exprs, color = metric, fill = metric))+
+    geom_point(size = size, alpha = alpha)+
+    mytheme$standard_new() + 
+    geom_smooth(method = "loess", se = TRUE, alpha = 0.1, linewidth = 2) +
+    labs(x = "Pseudotime", y = "Metric")
+  
+  if (!is.null(v1_x)){
+   p <- p +  geom_vline(xintercept = v1_x, linetype = "dashed")
+  }
+
+  if (!is.null(v2_x)){
+   p <- p + geom_vline(xintercept = v2_x, linetype = "dashed")
+  }
+  print(p)
+}
+
+# df <- exprs_image; celltype <- "Myeloid_3"; channel <- "HLA_ABC"; v1_x = 0.0065; v2_x = NULL; sample_type = "Islet"
+plot_exprs_density <- function(df, celltype, channel, v1_x = NULL, v2_x = NULL, sample_type = NULL){
+  if (sample_type == "Sample"){
+    size <- 1
+    alpha <- 0.5
+  }
+  if (sample_type == "Islet"){
+    size <- 0.1
+    alpha <- 0.5
+  }
+
+  temp <- df |>
+    filter(cell_type == !!celltype, channel == !!channel) |> 
+      # scale both into 0-1
+    mutate(exprs = (exprs - min(exprs)) / (max(exprs) - min(exprs)),
+          density = (density - min(density)) / (max(density) - min(density))) |>
+    tidyr::pivot_longer(all_of(c("exprs", "density")), names_to = "metric", values_to = "exprs") |> 
+    mutate(metric = ifelse(metric == "exprs", paste(channel, "expression"), paste(celltype, "density")))
+
+ p <- temp |> 
+  ggplot(aes(x=slingshot, y=exprs, color=metric, fill = metric))+
+  geom_point(size=size, alpha = alpha)+
+  geom_smooth(method = "loess", se = TRUE, alpha = 0.15, linewidth = 2) + 
+  geom_vline(xintercept = 0.0065, linetype = "dashed") + 
+  #geom_vline(xintercept = 0.009, linetype = "dashed") + 
+  labs(y = "Scaled metric", x = "Pseudotime") + 
+  scale_color_manual(values = palettes$colors[c(3, 7)], name = "Metric") +
+  scale_fill_manual(values = palettes$colors[c(3, 7)], name = "Metric") + 
+  #                  breaks = c("Density" = "density_scaled", "Infiltration Score" = "NormScoreTot_scaled")) +
+  theme(legend.position = "top") + 
+  mytheme$standard_new()
+  
+  if (!is.null(v1_x)){
+   p <- p +  geom_vline(xintercept = v1_x, linetype = "dashed")
+  }
+
+  if (!is.null(v2_x)){
+   p <- p + geom_hline(yintercept = v2_x, linetype = "dashed")
+  }
+  return(p)
+}
+```
+
+## A6.3: Plot Expression along Pseudotime.
+Plot Expression along Pseudotime.
+```{r}
+## This yields the following results:
+## T-CD8/T-CD4: associated to HLA-ABC, ARX, B2M, ProINS, INS.
+## IAPP: to all Myeloid, T_CD4, T_CD8
+celltype <- "T_CD8"; channel <- "HLA_ABC"; sample_type <- "Islet"
+p <- plot_exprs_distscore(exprs_image, celltype = celltype, channel = channel, 
+                          v1_x = NULL, v2_x = NULL, sample_type = sample_type) + 
+      xlim(0, 1)
+
+fn <- paste0(paste(today, "Immune", "DistScore", celltype, channel, sample_type,
+                  sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+
+plot_exprs_distscore(exprs_image, "Myeloid", "HLA_ABC", v1_x = NULL, v2_x = 0.53, sample_type = "Islet")
+
+plot_exprs_distscore(slingshot_sample, "Myeloid", "HLA_ABC", sample_type = "Sample")
+plot_exprs_distscore(slingshot_sample, "T_CD8", "HLA_ABC", sample_type = "Sample")
+
+plot_exprs_distscore(slingshot_sample, "Myeloid", "IAPP")
+## IAPP: not explained by Immune Cells. Only with Myeloid cells.
+## HLA-ABC: strongly explained by IC.
+
+## Q: Does IAPP Expression correlate with Myeloid DistScore -> 
+## only weakly.
+```
+
+## A6.4: logFC in early progression.
+
+Calculate LogFC of early Immune Cells.
+Here, for myeloid vs T-cells.
+
+```{r logfc-early}
+# Myeloid Abundances.
+temp2 <- exprs_image |> 
+  filter(cell_type == "Myeloid")  |> 
+  filter(channel == "HLA_ABC") |> 
+  distinct(image_id, case_id, slingshot, NormScoreArea, exprs)
+
+# Fit a LOESS model
+loess_model <- loess(NormScoreArea ~ slingshot, data = temp2)
+x_vals <- seq(min(temp2$slingshot), max(temp2$slingshot), length.out = 1000)
+predicted_vals <- predict(loess_model, newdata = data.frame(slingshot = x_vals))
+predicted_data <- tibble(slingshot = x_vals, smoothed = predicted_vals)
+
+start_exprs <- predicted_data$smoothed[which.min(predicted_data$slingshot)]
+later_exprs <- predicted_data  |> filter(slingshot > 0.53, slingshot < 0.531 ) |> pull(smoothed)
+later2_exprs <- predicted_data  |> filter(slingshot > 0.41, slingshot < 0.411 ) |> pull(smoothed)
+
+final_exprs <- predicted_data$smoothed[which.max(predicted_data$slingshot)]
+
+# log2FC
+log2(later2_exprs / start_exprs) # T-CD4:  0.4; T-CD8: 0.9; Myeloid: 2.4
+log2(later_exprs / later2_exprs) # T-CD4: 0.9; T-CD8: 0.56; Myeloid: 0.53
+log2(later_exprs /start_exprs) # T-CD4:  1.28 # T-CD8: 1.48; Myeloid: 3
+log2(final_exprs / start_exprs) # T-CD4: 4.5; T-CD8: 4.8; Myeloid: 4.1
+
+# Cross-correlation: T-CD8, T-CD4: across IMAGES.
+ccf_result <- ccf(exprs_image |> filter(cell_type == "T_CD8", channel == "HLA_ABC") |> pull(Density), 
+    exprs_image |> filter(cell_type == "T_CD4", channel == "HLA_ABC") |> pull(Density), 
+    plot = FALSE, lag.max = 10)
+
+# Cross-correlation: T-CD8, T-CD4; across SAMPLES (0.85)
+ccf(slingshot_sample |> filter(cell_type == "T_CD8", channel == "HLA_ABC") |> pull(density), 
+    slingshot_sample |> filter(cell_type == "T_CD4", channel == "HLA_ABC") |> pull(density), 
+    plot = FALSE, lag.max = 10)
+
+corr_at_lag_0 <- ccf_result$acf[which(ccf_result$lag == 0)]
+N <- length(exprs_image |> filter(cell_type == "T_CD8", channel == "HLA_ABC") |> pull(Density))
+se <- 1 / sqrt(N)
+z_value <- corr_at_lag_0 / se
+p_value <- 2 * pnorm(-abs(z_value))
+p_value
+# -> highly significant.
+```
+
+
+## A6.5: Pseudotime Plots for HLA-ABC + Myeloid + T-CD8.
+
+PLOT: Co-infiltraiton of T-cells + Myeloid. Sample.
+```{r hla-abc-celltypes}
+p2 <- readRDS(file.path(paths$home_git, "figures", "pseudotime_flat.rds")) + 
+  xlim(0.13, 1)
+
+temp <- slingshot_sample |>
+  ungroup() |> 
+  filter(cell_type %in% c("Myeloid", "T_CD8"), channel == "HLA_ABC") |> 
+      # scale both into 0-1
+  group_by(cell_type) |>
+  mutate(exprs = (exprs - min(exprs)) / (max(exprs) - min(exprs)),
+        NormScoreArea = (NormScoreArea - min(NormScoreArea)) / (max(NormScoreArea) - min(NormScoreArea))) |>
+  ungroup() |> 
+  tidyr::pivot_longer(all_of(c("exprs", "NormScoreArea")), names_to = "metric", values_to = "exprs") |> 
+  mutate(metric = ifelse(metric == "exprs", paste(channel, "beta-cell expression"), 
+                        paste(cell_type, "Infiltration Score")))
+
+unique(temp$metric)
+palette_custom <- c("Myeloid Infiltration Score" = "#B17BA6", 
+                   "T_CD8 Infiltration Score" = "#FB8072",
+                   "HLA_ABC beta-cell expression" = "#1965B0")
+p <- temp |> 
+  ggplot(aes(x = slingshot, y = exprs, color = metric, fill = metric))+
+  geom_point(size = 1, alpha = 0.5)+
+  labs(x = "Pseudotime", y = "Metric") + 
+  geom_smooth(method = "loess", se = TRUE, alpha = 0.1, 
+              linewidth = 2) + 
+  # vertical line at 0.0085 -> cutoff early PS.
+  scale_color_manual(values = palette_custom, name = "Metric") + 
+  scale_fill_manual(values = palette_custom, name = "Metric") +
+    theme(legend.position = "top") + 
+  guides(color = guide_legend(ncol = 1)) + 
+  xlim(c(0, 1)) + 
+  mytheme$large_new()
+  # put legend above plot
+p
+p3 <- p + p2 + plot_layout(nrow = 2, heights = c(4, 1)) 
+print(p3)
+
+plotsave_param_custom <- list(device = "png", units = "mm", 
+                              width = 400, height = 300, dpi = 300,
+                              path = plotsave_param$path)
+fn <- paste0(paste(today, "Immune", "HLA_ABC", "Myeloid", "T_CD8",
+                sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p3), plotsave_param_custom))
+```
+
+
+```{r hla-abc-celltypes}
+temp <- exprs_image |>
+  ungroup() |> 
+  filter(cell_type %in% c("Myeloid", "T_CD8"), channel == "HLA_ABC") |> 
+      # scale both into 0-1
+  group_by(cell_type) |>
+  mutate(exprs = (exprs - min(exprs)) / (max(exprs) - min(exprs)),
+        NormScoreArea = (NormScoreArea - min(NormScoreArea)) / (max(NormScoreArea) - min(NormScoreArea))) |>
+  ungroup() |> 
+  tidyr::pivot_longer(all_of(c("exprs", "NormScoreArea")), names_to = "metric", values_to = "exprs") |> 
+  mutate(metric = ifelse(metric == "exprs", paste(channel, "beta-cell expression"), 
+                        paste(cell_type, "Infiltration Score")))
+
+unique(temp$metric)
+palette_custom <- c("Myeloid Infiltration Score" = "#B17BA6", 
+                   "T_CD8 Infiltration Score" = "#FB8072",
+                   "HLA_ABC beta-cell expression" = "#1965B0")
+p <- temp |> 
+  ggplot(aes(x = slingshot, y = exprs, color = metric, fill = metric))+
+  geom_point(size = 0.1, alpha = 0.5)+
+  labs(x = "Pseudotime", y = "Metric") + 
+  geom_smooth(method = "loess", se = TRUE, alpha = 0.1, 
+              linewidth = 2.5) + 
+  # vertical line at 0.53 -> cutoff early PS.
+  geom_vline(xintercept = 0.53, linetype = "dashed") + 
+  scale_color_manual(values = palette_custom, name = "Metric") + 
+  scale_fill_manual(values = palette_custom, name = "Metric") +
+    theme(legend.position = "top") + 
+  guides(color = guide_legend(ncol = 1)) + 
+  mytheme$large_new()
+  # put legend above plot
+
+print(p)
+
+plotsave_param_custom <- list(device = "png", units = "mm", 
+                              width = 400, height = 300, dpi = 300,
+                              path = plotsave_param$path)
+fn <- paste0(paste(today, "Immune", "HLA_ABC", "Myeloid", "T_CD8", "Islet",
+                sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_custom))
+```
+
+
+# A7: CELL CLUSTERS.
+Repeat above analysis for Cell Clusters.
+
+```{r stats}
+gc()
+cols_oi <- rownames(beta)[!rownames(beta) %in% c("ARX", "Ki67", "PDL1")]
+plot_cols <- c("NormScoreArea", "Density")
+```
+
+Reshape. Channel x CellType x Islet (600k rows).
+Only myeloid, T-cells, Neutrophils.
+```{r expression-clusters}
+exprs_image <- all_clusters |> 
+  pivot_longer(cols = all_of(cols_oi), 
+               names_to = "channel",
+               values_to = "exprs") |>
+  filter(cell_type %in% c("Myeloid", "T_CD4", "T_CD8", "NK", "Neutrophil"))  |> 
+  inner_join(case_stages, by = c("case_id", "donor_type")) |> 
+  filter(!channel %in% c("ARX", "Ki67", "PDL1")) |> 
+  select(-cell_type2, -cell_type3)
+
+exprs_image
+```
+
+## A7.1: DistScore Correlations.
+
+Calculate which beta-cell expression are associated to DistScores of which Immune Cell CLusters. 
+**NOT aligned to Pseudotime.**
+
+```{r distscore-clusters}
+results_norm <- exprs_image |> 
+  tidyr::nest(data = -c(cluster, channel, donor_type)) |> 
+  mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(NormScoreArea ~ exprs + age_group + (1|case_id), data = .x)))) |> 
+  tidyr::unnest(test) |> 
+  filter(term == "exprs") |> 
+  arrange(p.value) |> 
+  select(channel, term, estimate, statistic, p.value, donor_type, cluster)
+
+## Here, test against Immune Cell Type Density.
+results_density <- exprs_image |> 
+  tidyr::nest(data = -c(cluster, channel, donor_type)) |> 
+  mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(Density ~ exprs + age_group + (1|case_id), data = .x)))) |> 
+  tidyr::unnest(test) |> 
+  filter(term == "exprs") |> 
+  arrange(p.value) |> 
+  select(channel, term, estimate, statistic, p.value, donor_type, cluster)
+```
+
+Join both results (Infiltration Score + Density.)
+```{r join-density-Infiltration-score}
+joint_results <- dplyr::inner_join(results_density, results_norm, suffix = c("den", "norm"), by = c("channel", "cluster", "donor_type"))
+
+## Main T-CD4 clusters correlating with MHC-I.
+joint_results |> filter(channel == "HLA_ABC") |> 
+  arrange(p.valueden) |> 
+  filter(grepl("T_CD4", cluster))
+
+joint_results |> filter(channel %in% c("MX1", "B2M", "ADAR", "HLA_ABC")) |> arrange(p.valuenorm)
+
+joint_results |> filter(channel %in% c("ERN1", "XBP1", "WFS1", "TXNIP", 
+                                       "NFkB", "CD9", "IAPP", "CD155")) |> 
+  arrange(p.valuenorm)
+```
+
+Myeloid cell states associated with beta-cell state markers (ERN1/XBP1/TXNIP/NFkB/CD9/WFS1/IAPP/CD155).
+Myeloid-3 + T-CD8-7 most associated with IFN-dependent markers (MHC-I + MX1/ADAR).
+
+
+## A7.2: T-CD4 Infiltration Score vs HLA-ABC Expression 
+
+-> How do T-CD4 cluster relate to sequential HLA-ABC expression?
+
+```{r t-cd4-4-hla-abc}
+t_cd4_df <- exprs_image |> 
+  filter(channel == "HLA_ABC") |> 
+  filter(grepl("T_CD4", cluster) | grepl("T_CD8", cluster) | 
+        grepl("T.naive", cluster) | grepl("T.EMRA", cluster)) |> 
+#   mutate(NormScoreTot = density) |>
+  select(case_id, image_id, donor_type, exprs, NormScoreArea, cluster, channel, age) |> 
+  # scale predictors
+  group_by(cluster) |> 
+  mutate(NormScoreArea = (NormScoreArea - min(NormScoreArea)) / (max(NormScoreArea) - min(NormScoreArea))) |>
+  ungroup() |> 
+  pivot_wider(names_from = "cluster", values_from = c("NormScoreArea"), values_fill = 0)
+
+# Delete non-present cases.
+to_del <- t_cd4_df |> 
+  filter(channel == "HLA_ABC", donor_type == "RecentOnset") |> 
+  select(case_id, image_id, exprs, T_CD4_5, T_CD4_10) |> 
+  pivot_longer(!exprs & all_of(c("T_CD4_10", "T_CD4_5")), names_to = "cluster", values_to = "NormScoreArea") |> 
+  group_by(case_id, cluster) |> 
+  summarise(mean_norm = mean(NormScoreArea, na.rm = TRUE), .groups = "drop") |> 
+  filter(mean_norm == "0") |> distinct(case_id) |> pull(case_id)
+
+### 
+p <- t_cd4_df |> 
+  filter(channel == "HLA_ABC") |> 
+  filter(donor_type == "RecentOnset") |> 
+  filter(!case_id %in% to_del) |>
+  select(case_id, image_id, exprs, T_CD4_5, T_CD4_10, T_CD4_7) |> 
+  pivot_longer(!exprs & all_of(c("T_CD4_10", "T_CD4_5", "T_CD4_7")), names_to = "cluster", values_to = "NormScoreArea") |> 
+  mutate(cluster = case_when(cluster == "T_CD4_5" ~ "PD1+ act.", 
+                             cluster == "T_CD4_10" ~ "Treg",
+                            cluster == "T_CD4_7" ~ "PD1low act.")) |>
+  group_by(case_id, cluster) |>
+  summarise(NormScoreArea = mean(NormScoreArea), exprs = mean(exprs)) |>
+  ggplot(aes(x = exprs, y = NormScoreArea)) +
+  ggpubr::stat_cor(method = "spearman", cor.coef.name = "r", size = 5,
+                   label.y = 0.1) +
+  geom_jitter(width = 0.2)+
+  mytheme$standard_new() +
+  facet_wrap(~cluster, scales = "fixed") + 
+  geom_smooth(method = "lm", se = TRUE, alpha = 0.1, linewidth = 2, color = "black") +
+  labs(x = expression(beta ~ "-cell HLA-ABC expression"), y = "Infiltration Score")
+
+print(p)
+fn <- paste0(paste(today, "Immune", "T_CD4", "HLA_ABC", "RecentOnset",
+                sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+## A7.3: T-CD4 cluster Infiltration Score along Pseudotime.
+
+-> Subtract T-CD4-5 and T-CD4-7 from T-CD4-10 (T-regs)!
+-> This shows the outcompetition of T-regs in the islets by these 
+inflammatory CD4+ clusters.
+We see T-CD4-5 + T-CD4-7 outcompete T-regs in late pseudotime in islets.
+
+```{r plot-t-cd4-clusters-pseudotime}
+palettes$custom <- c(rate = palettes$colors[1], rate2 = palettes$colors[2], 
+                     rate3 = palettes$colors[3])
+
+p <- all_clusters |> 
+  filter(cluster %in% c("T_CD4_5", "T_CD4_10", "T_CD4_7")) |>
+  select(case_id, image_id, donor_type, slingshot, cluster, NormScoreArea) |> 
+  pivot_wider(names_from = "cluster", values_from = "NormScoreArea") |>
+  mutate(rate = (T_CD4_10) - (T_CD4_5)) |>
+  mutate(rate2 = (T_CD4_10) - (T_CD4_7)) |>
+  group_by(case_id, image_id, donor_type) |>
+  summarise(rate = mean(rate, na.rm = TRUE), 
+            slingshot = mean(slingshot),
+            rate2 = mean(rate2, na.rm = TRUE)) |> 
+  pivot_longer(c(rate, rate2), names_to = "cl", values_to = "rate") |>
+  ggplot(aes(x = slingshot, y = rate, color = cl, fill = cl)) +
+  geom_smooth(method = "loess", se = TRUE, 
+              alpha = 0.05, linewidth = 2) +  
+  mytheme$standard_new() + 
+  scale_fill_manual(values = palettes$custom,
+                     name = "T-eff",  
+                     breaks = c("rate", "rate2"),
+                     labels = c("PD1+ act", "PD1low act.")) +
+    scale_color_manual(values = palettes$custom,
+                     name = "T-eff",  
+                     breaks = c("rate", "rate2"),
+                     labels = c("PD1+ act", "PD1low act.")) +
+#  facet_wrap(~ cl, scales = "free_y", label = as_labeller(c("rate" = "Treg - PD1+ act.", "rate3" = "Treg - PD1low act."))) + 
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  ylab("Infiltration Score: Treg - T-eff") + 
+  xlab("Pseudotime")  
+
+p2 <- readRDS(file.path(paths$home_git, "figures", "pseudotime_flat.rds"))
+
+p3 <- p + p2 + plot_layout(nrow = 2, heights = c(15, 1), guides = "collect") + 
+  theme(legend.position = "right",  # Move legend to top
+        legend.direction = "vertical",
+        legend.text = element_text(size = 20),
+        legend.title = element_text(size = 20),
+        axis.text.x = element_text(size = 22),
+        axis.title.x = element_text(size = 22) ) 
+p3
+
+print(p)
+fn <- paste0(paste(today, "Immune", "T_CD4", "T_reg_T_eff_ratio",
+                sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p3), plotsave_param))
+
+extfig7d <- p
+saveRDS(extfig7d, file.path(paths$home_git, "figures", "extfig7d.rds"))
+```
+
+## A7.3: T-CD8 cluster Infiltration Score along Pseudotime.
+
+```{r tcd8-clusters-pseudotime}
+# Repeat for T-CD8s
+p <- all_clusters |> 
+  filter(cluster %in% c("T_CD8_4", "T.naive", "T_CD8_7", "T_CD4_10")) |>
+  select(case_id, image_id, donor_type, slingshot, cluster, NormScoreArea) |> 
+  pivot_wider(names_from = "cluster", values_from = "NormScoreArea") |> 
+  mutate(rate = (T_CD4_10) - (T_CD8_4),
+        rate2 = (T_CD4_10) - (`T.naive`),
+        rate3 = (T_CD4_10) - (T_CD8_7)) |> 
+  group_by(case_id, image_id, donor_type) |>
+  summarise(rate = mean(rate, na.rm = TRUE), 
+            rate2 = mean(rate2, na.rm = TRUE),
+            slingshot = mean(slingshot),
+            rate3 = mean(rate3, na.rm = TRUE)) |> 
+  pivot_longer(c(rate, rate2, rate3), names_to = "cl", values_to = "rate") |>
+  ggplot(aes(x = slingshot, y = rate, color = cl, fill = cl)) +
+  geom_smooth(method = "loess", se = TRUE, 
+              alpha = 0.05, linewidth = 2) +  
+  mytheme$standard_new() + 
+  scale_fill_manual(values = palettes$custom,
+                     name = "T-eff",  
+                     breaks = c("rate", "rate2", "rate3"),
+                     labels = c("T-CM/EM-like", "T-naive", "T-ex-eff")) +
+    scale_color_manual(values = palettes$custom,
+                     name = "T-eff",  
+                     breaks = c("rate", "rate2", "rate3"),
+                     labels = c("T-CM/EM-like", "T-naive", "T-ex-eff")) +
+#  facet_wrap(~ cl, scales = "free_y", label = as_labeller(c("rate" = "Treg - PD1+ act.", "rate3" = "Treg - PD1low act."))) + 
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  ylab("Infiltration Score: Treg - T-eff") + 
+  xlab("Pseudotime")  
+
+p2 <- readRDS(file.path(paths$home_git, "figures", "pseudotime_flat.rds"))
+
+p3 <- p + p2 + plot_layout(nrow = 2, heights = c(15, 1), guides = "collect") + 
+  theme(legend.position = "right",  # Move legend to top
+        legend.direction = "vertical",
+        legend.text = element_text(size = 20),
+        legend.title = element_text(size = 20),
+        axis.text.x = element_text(size = 22),
+        axis.title.x = element_text(size = 22) ) 
+p3
+
+fn <- paste0(paste(today, "Immune", "T_CD8", "T_reg_T_eff_ratio",
+                sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p3), plotsave_param))
+saveRDS(p, file.path(paths$home_git, "figures", "fig4h.rds"))
+```
+
+# A8: Cross-correlations Cluster DistScores and Beta-cell Pseudotime.
+Calculate Cross-Correlations between Cluster DistScores and Beta-cell Pseudotime-Expression.
+Remember: max-lag indicative of time-order of events.
+
+Group by Donor and Cell Type.
+```{r cross-correlations}
+slingshot_sample <- exprs_image |> 
+  group_by(case_id, donor_type, channel, cluster) |> 
+  summarize(exprs = mean(exprs), density = mean(Density), NormScoreArea = mean(NormScoreArea), slingshot = mean(slingshot), .groups = "drop") |>
+  arrange(slingshot)
+```
+
+## A8.1: Calculate Cross-Correlation between Cluster Infiltration Scores and Beta-cell Pseudotime-Expression.
+Calculate Cross-Correlation between Cluster Infiltration Scores and Beta-cell Pseudotime-Expression.
+```{r cross-correlation-cluster}
+# Apply the function within each group and unpack results
+result_normscore <- exprs_image %>%
+  group_by(cluster, channel) %>%
+  summarize(cross_corr = list(calculate_cross_correlation(slingshot, exprs, NormScoreArea, lag.max = 10)), .groups = "drop") %>%
+  unnest(cols = c(cross_corr)) %>%
+  arrange(max_cor)
+
+# Apply the function within each group and unpack results
+result_density <- exprs_image %>%
+  group_by(cluster, channel) %>%
+  summarize(cross_corr = list(calculate_cross_correlation(slingshot, exprs, Density, lag.max = 10)), .groups = "drop") %>%
+  unnest(cols = c(cross_corr)) %>%
+  arrange(max_cor)
+```
+
+IAPP: negatively with Myeloid 3/6/5 (pro-inflamm.)
+
+
+## A8.2: Plot Main Cross-Correlations to MHC-I.
+
+As expected: T-CD4-5 + T-CD8-7 + Myeloid-3 strongest associated to HLA-ABC. 
+
+```{r cross-correlations-clusters-hla-abc}
+channels <- c("HLA_ABC", "IAPP")
+cell_types <- c("Myeloid_3", "Myeloid_5", "Myeloid_6", "T_CD4_5", "T_CD8_7", "T_CD4_10")
+sample_types <- list("Islet", "Sample")
+
+purrr::map(channels, \(cur_channel){
+  purrr::map(cell_types, \(cur_celltype){
+    purrr::map(sample_types, \(sample_type){
+      message("Plotting Cross-Correlation for Cell Type:", cur_celltype, "Sample Type:", sample_type)
+
+      if (sample_type == "Islet") {
+        df <- exprs_image |> dplyr::select(-cell_type) |> dplyr::rename("cell_type" = cluster)
+      } else {
+        df <- slingshot_sample |> dplyr::rename("cell_type" = cluster)
+      }
+
+      label_leg <- ifelse(cur_celltype == "T_CD4_5", "PD1+ act.", 
+                    ifelse(cur_celltype == "T_CD8_7", "PD1+,CD27+", 
+                      ifelse(cur_celltype == "Myeloid_3", "Act. M1/M2-like", "T-reg")))
+      label_leg <- paste("Infiltration Score:", label_leg)
+      p <- plot_exprs_distscore(df = df, celltype = cur_celltype, channel = cur_channel, 
+                                v1_x = NULL, v2_x = NULL, sample = sample_type)
+      
+      p <- p + 
+        scale_color_manual(values = palettes$colors[c(3, 7)], name = "Metric",
+                          labels = c("HLA-ABC expression", label_leg)) + 
+        scale_fill_manual(values = palettes$colors[c(3, 7)], name = "Metric",
+                          labels = c("HLA-ABC expression", label_leg)) +
+        theme(legend.position = "top") + 
+        labs(x = "Pseudotime", y = "Scaled metric")
+      
+      fn <- paste0(paste(today, "Immune", "Infiltration_Score", cur_channel, cur_celltype, sample_type,
+                sep = "_"), ".png")
+      do.call(ggsave, c(list(fn, p), plotsave_param))
+    })
+  })
+})
+```
+
+# A9: Pseudotime and other expression data 
+
+## A9.1: Myeloid-3 expression levels 
+```{r myeloid-3-df}
+features_oi <- metadata(spe_imm)$channels$Myeloid
+myeloid_df <- spe_imm[features_oi, spe_imm$cell_type == "Myeloid"]
+
+cur_dat_immune <- makePerCellDF(myeloid_df, 
+  assay.type = "exprs",
+  features = features_oi,
+  use_dimred = FALSE) %>%
+  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages)) %>%
+  arrange(case_id, donor_type) |> 
+  as_tibble() |> 
+  filter(!donor_type %in% c("LongDuration", "Pancreatitis"))
+
+# Aggregate by Image
+cur_dat_immune_image <- cur_dat_immune |> 
+  filter(cell_cluster_scaled == "Myeloid_3") |> 
+  group_by(cell_cluster_scaled, case_id, donor_type, image_id) |> 
+  summarize(across(where(is.numeric), \(x) mean(x, na.rm = TRUE)), .groups = "drop") |> 
+  dplyr::rename(cluster = cell_cluster_scaled)
+
+cur_dat_immune_image <- cur_dat_immune_image |> 
+  select(donor_type, image_id, case_id, cluster, all_of(features_oi))
+```
+
+Joint Cell Type and beta-cell Islet + Immune Panel (Myeloid-3) Expression.
+```{r}
+all_redux <- all_clusters |> select(-starts_with(c("CellNb", "fraction", "NormScore_", "AbsScore")))
+
+joint <- all_redux |> 
+  inner_join(cur_dat_immune_image, suffix = c("islet", "immune"), by = c("case_id", "donor_type", "image_id", "cluster"))
+
+joint
+```
+
+## Plot Joint on PSEUDOTIME.
+
+## Plot on X-axis SLingshot and on y-axis both IAPP and Myeloid.
+```{r}
+# df <- joint; channel1 <- "HLA_ABC"; channel2 <- "CD16"; cell_type <- "Myeloid_3"; sample_type = NULL
+plot_exprs_channels <- function(df, channel1, channel2, cur_celltype, sample_type = NULL){
+  size_point <- ifelse(is.null(sample_type), 0.2, 3)
+  size_point <- ifelse(sample_type == "Sample", 3, 0.1)
+  n_color <- length(channels)
+  palettes_test <- palettes$colors[1:n_color]
+  names(palettes_test) <- channels
+  
+  temp <- df |>
+      select(slingshot, donor_type, all_of(c(channel1, channel2))) |> 
+      pivot_longer(cols = all_of(c(channel1, channel2)), names_to = "metric", values_to = "exprs") |> 
+      group_by(metric) |> 
+        # scale both into 0-1
+      mutate(exprs = (exprs - min(exprs)) / (max(exprs) - min(exprs))) |> 
+      ungroup()
+
+    p <- temp |> 
+      ggplot(aes(x = slingshot, y = exprs, color = metric))+
+      geom_point(size = size_point)+
+      mytheme$large() + 
+      geom_smooth(aes(group = metric), method = "loess") + 
+      labs(x = "Slingshot", y = "Channel")
+
+  fn <- paste0(paste(today, "Immune", "Pseudotime", channel1, channel2, cur_celltype, sample_type, 
+                  sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param))
+}
+
+# df <- joint; channels <- c("CD16", "CS", "CD206", "HLA_DR", "CD54", "HK1"); 
+# cur_celltype <- "Myeloid_3"; sample_type <- "Islet"
+plot_exprs_channels_multiple <- function(df, channels, cur_celltype, palette = NULL, sample_type = NULL,
+                                          y_label = "Scaled metric"){
+  size_point <- ifelse(sample_type == "Sample", 3, 0.1)
+  n_color <- length(channels)
+  palettes_test <- palettes$colors[1:n_color]
+  # ifelse(!is.null(palette), palettes_test <- palette, palettes_test)
+  names(palettes_test) <- channels
+
+  temp <- df |>
+      select(slingshot, donor_type, all_of(channels)) |> 
+      pivot_longer(cols = all_of(channels), names_to = "metric", values_to = "exprs") |> 
+      group_by(metric) |> 
+        # scale both into 0-1
+      mutate(exprs = (exprs - min(exprs)) / (max(exprs) - min(exprs))) |> 
+      ungroup()
+
+  p <- temp |> 
+      ggplot(aes(x = slingshot, y = exprs, color = metric, fill = metric))+
+      geom_point(size = size_point, alpha = 0.5)+
+      geom_smooth(method = "loess", se = TRUE, alpha = 0.1, linewidth = 2) + 
+      labs(x = "Pseudotime", y = y_label) + 
+      scale_color_manual(values = palettes_test, name = "Channel")+ 
+      scale_fill_manual(values = palettes_test, name = "Channel") +
+      guides(color = guide_legend(ncol = 1)) + 
+      #xlim(c(0.002, 0.016)) + 
+      mytheme$standard_new()
+
+  fn <- paste0(paste(today, "Immune", "Pseudotime", paste(channels, collapse = "_"), cur_celltype, sample_type, 
+                  sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param))
+
+  if (cur_celltype == "Myeloid_3" & sample_type == "Islet"){
+    extfig8e <- p
+    saveRDS(extfig8e, file.path(paths$home_git, "figures", "extfig8e.rds"))
+  }
+  return(p)
+}
+```
+
+```{r}
+plot_exprs_channels_multiple(joint, 
+  channels = c("CD16", "CS", "CD206", "HLA_DR", "CD54", "HK1"), 
+  cur_celltype = "Myeloid_3", 
+  sample_type = "Islet",
+  y_label = "Activated M1/M2 expression")
+
+```
+
+# A10: Beta-cells HLA-DR along Pseudotime.
+HLA-DR Immune panel along pseudotime. 
+
+Fig 2 D/E in manuscript.
+```{r beta-cell-pseudotime-expression}
+gc()
+features_oi <- metadata(spe)$channels$Beta
+beta_immune <- spe[, spe$cell_type == "Beta"]
+
+cur_dat_immune <- makePerCellDF(beta_immune, 
+  assay.type = "exprs",
+  features = features_oi,
+  use_dimred = FALSE) %>%
+  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages)) %>%
+  arrange(case_id, donor_type) |> 
+  as_tibble()
+
+# Aggregate by Image
+cur_dat_immune_image <- cur_dat_immune |> 
+  group_by(case_id, donor_type, image_id) |> 
+  summarize(across(where(is.numeric), \(x) mean(x, na.rm = TRUE)), .groups = "drop") |> 
+  select(donor_type, image_id, case_id, all_of(features_oi))
+```
+
+```{r}
+full_beta_df <- cur_dat_immune_image |> 
+  inner_join(cur_dat, suffix = c("_immune", "_islet"), by = c("case_id", "donor_type", "image_id")) |> 
+  select(-c("ARX", "Ki67_immune", "Ki67_islet", "PDL1", "LDHA"))
+
+joint <- all_redux |> inner_join(cur_dat_immune_image, suffix = c("islet", "immune"), by = c("case_id", "donor_type", "image_id"))
+
+all_clusters_redux  <- all_clusters |> 
+  select(-starts_with(c("CellNb", "fraction", "AbsScore", "NormScore_")))
+
+joint_clusters <- all_clusters_redux |>
+  inner_join(cur_dat_immune_image, suffix = c("islet", "immune"), by = c("case_id", "donor_type", "image_id"))
+
+joint_clusters_sample <- joint_clusters |> 
+  group_by(case_id, donor_type, cluster) |> 
+  summarize(across(where(is.numeric), \(x) mean(x, na.rm = TRUE)), .groups = "drop")
+```
+
+## A10.1: Co-expression plot of ALL relevant beta-cell channels.
+
+```{r}
+library(corrplot)
+fn <- file.path(paths$folder_script, paste0(paste(today, "Immune", "Beta-Cell", "Coexpression", sep = "_"), ".png"))
+png(fn, width = 1000, height = 1000, res = 300)
+full_beta_df |> select(where(is.numeric)) |> 
+  cor() |>
+  corrplot(method = "color", type = "upper", tl.col = "black", tl.srt = 45, tl.cex = 0.7)
+dev.off()
+
+fn <- file.path(paths$folder_script, paste0(paste(today, "Immune", "Beta-Cell", "Coexpression_RecentOnset", sep = "_"), ".png"))
+png(fn, width = 1000, height = 1000, res = 300)
+full_beta_df |> 
+  filter(donor_type == "RecentOnset") |>
+  select(where(is.numeric)) |> 
+  cor() |>
+  corrplot(method = "color", type = "upper", tl.col = "black", tl.srt = 45, tl.cex = 0.7)
+dev.off()
+
+# Insulitic
+insulitic_images <- readRDS(file.path(paths$folder_out, "13_MarkerExpression_cells_Immune", "insulitic_images.rds"))
+
+fn <- file.path(paths$folder_script, paste0(paste(today, "Immune", "Beta-Cell", "Coexpression_Insulitic", sep = "_"), ".png"))
+png(fn, width = 3000, height = 3000, res = 300)
+full_beta_df |> 
+  filter(donor_type == "RecentOnset") |>
+  filter(image_id %in% insulitic_images) |>
+  select(where(is.numeric)) |> 
+  cor() |>
+  corrplot(method = "color", type = "upper", tl.col = "black", tl.srt = 45, tl.cex = 0.7)
+dev.off()
+```
+
+## A10.2: Co-expression of HLA-ABC and HLA-DR.
+Plot Co-expression of HLA-ABC and HLA-DR.
+
+```{r plot-hladr-hlaabc}
+## Plot HLA-ABC vs HLA-DR
+p <- full_beta_df |> 
+  ggplot(aes(x = HLA_ABC, y = HLA_DR, color = donor_type))+
+  geom_point(size = 0.5, alpha = 0.7)+
+  scale_color_manual(values = palettes$stages)+
+  labs(x = expression(beta~"-cell HLA-ABC expression"), 
+        y = expression(beta~"-cell HLA-DR expression"))+
+  geom_smooth(method = "loess", se = TRUE, alpha = 0.1, linewidth = 2) + 
+  facet_wrap(~donor_type, scales = "free_y") + 
+  mytheme$standard_new() + 
+  theme(legend.position = "none")
+print(p)
+
+fn <- paste0(paste(today, "Immune", "HLA-ABC", "HLA-DR", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+extfig4c <- p
+saveRDS(extfig4c, file.path(paths$home_git, "figures", "extfig4c.rds"))
+```
+
+## A10.3: Plot HLA-ABC and HLA-DR along Pseudotime.
+
+```{r}
+palette_custom <- c("HLA_ABC" = "#1965B0",
+                   "HLA_DR" = "#FF7F00")
+channels <- c("HLA_ABC", "HLA_DR")
+cell_type <- "Beta"; sample_type <- "Islet"
+
+p <- plot_exprs_channels_multiple(
+    full_beta_df, channels = channels,
+    cur_celltype = cell_type,
+    palette = palette_custom,
+    sample_type = sample_type,
+    y_label = expression(beta~"-cell expression"))
+
+p <- p + 
+ mytheme$standard_new()
+print(p)
+
+p2 <- readRDS(file.path(paths$home_git, "figures", "pseudotime_flat.rds"))
+p3 <- p + p2 + plot_layout(nrow = 2, heights = c(15, 1), guides = "collect") + 
+  theme(legend.position = "right",  # Move legend to top
+        legend.direction = "vertical",
+        legend.text = element_text(size = 20),
+        legend.title = element_text(size = 20),
+        axis.text.x = element_text(size = 22),
+        axis.title.x = element_text(size = 22) )
+
+fn <- paste0(paste(today, "Immune", "Pseudotime", 
+      paste(channels, collapse = "_"), sample_type, cell_type, 
+                  sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p3), plotsave_param))
+
+# FIg 2D.
+print(p)
+fig2d <- p
+saveRDS(fig2d, file.path(paths$home_git, "figures", "fig2d.rds"))
+```
+
+## A10.4: HLA-DR with T-CD8-7.
+Print HLA-DR with T-CD8-7.
+```{r} 
+temp_sample <- joint_clusters_sample |>
+  filter(cluster %in% c("T_CD8_7", "T_CD4_5", "Myeloid_3")) |>
+  select(HLA_DR, HLA_ABC, slingshot, case_id, NormScoreArea, cluster) |> 
+  pivot_wider(names_from = "cluster", values_from = "NormScoreArea") |>
+  mutate(HLA_DR = (HLA_DR - min(HLA_DR)) / (max(HLA_DR) - min(HLA_DR)),
+         HLA_ABC = (HLA_ABC - min(HLA_ABC)) / (max(HLA_ABC) - min(HLA_ABC)),
+         Myeloid_3 = (Myeloid_3 - min(Myeloid_3)) / (max(Myeloid_3) - min(Myeloid_3)),
+         T_CD4_5 = (T_CD4_5 - min(T_CD4_5)) / (max(T_CD4_5) - min(T_CD4_5)), 
+         T_CD8_7 = (T_CD8_7 - min(T_CD8_7)) / (max(T_CD8_7) - min(T_CD8_7))) |>
+  tidyr::pivot_longer(all_of(c("HLA_DR","HLA_ABC", "T_CD8_7", "T_CD4_5", "Myeloid_3")), 
+                      names_to = "metric", values_to = "exprs")
+
+temp_image <- joint_clusters |>
+  filter(cluster %in% c("T_CD8_7", "T_CD4_5", "Myeloid_3")) |>
+  select(HLA_DR, HLA_ABC, slingshot, case_id, NormScoreArea, cluster) |> 
+  pivot_wider(names_from = "cluster", values_from = "NormScoreArea") |>
+  mutate(HLA_DR = (HLA_DR - min(HLA_DR)) / (max(HLA_DR) - min(HLA_DR)),
+         HLA_ABC = (HLA_ABC - min(HLA_ABC)) / (max(HLA_ABC) - min(HLA_ABC)),
+        Myeloid_3 = (Myeloid_3 - min(Myeloid_3)) / (max(Myeloid_3) - min(Myeloid_3)),
+         T_CD4_5 = (T_CD4_5 - min(T_CD4_5)) / (max(T_CD4_5) - min(T_CD4_5)), 
+         T_CD8_7 = (T_CD8_7 - min(T_CD8_7)) / (max(T_CD8_7) - min(T_CD8_7))) |>
+  tidyr::pivot_longer(all_of(c("HLA_DR","HLA_ABC", "T_CD8_7", "T_CD4_5", "Myeloid_3")), 
+                      names_to = "metric", values_to = "exprs")
+```
+
+```{r}
+## 
+palette_custom <- c("HLA_DR" = "#1965B0",
+                   "T_CD8_7" = "#1B9E77",
+                   "HLA_ABC" = "#FF7F00",
+                   "T_CD4_5" = "#7570B3"
+                   )
+breaks <- c("HLA_ABC", "HLA_DR", "T_CD8_7", "T_CD4_5")
+labels <- c(
+      expression(beta ~ "-cell HLA-ABC normalized counts"),
+      expression(beta ~ "-cell HLA-DR normalized counts"),
+      bquote("Infiltration score T-ex"^eff),
+      "Infiltration score PD1+ act."
+)
+
+sample_type <- "Islet"
+if (sample_type == "Sample") { size <- 1; alpha <- 0.5; df <- temp_sample |> filter(metric != "Myeloid_3"); xlim2 <- 0.9 } 
+if (sample_type == "Islet") { size <- 0.1; alpha <- 0.05; df <- temp_image |> filter(metric != "Myeloid_3"); xlim2 <- 1 } 
+
+p <- df |> 
+    ggplot(aes(x = slingshot, y = exprs, color = metric, fill = metric))+
+    geom_point(size = size, alpha = alpha)+
+    mytheme$standard_new() + 
+    geom_smooth(method = "loess", se = TRUE, alpha = 0.1, linewidth = 2) +
+    labs(x = "Pseudotime", y = "Scaled value") + 
+    scale_color_manual(values = palette_custom, name = "Metric",
+      labels = labels, breaks = breaks)+ 
+    scale_fill_manual(values = palette_custom, name = "Metric", labels = labels, breaks = breaks) + 
+    xlim(0.13, xlim2)
+
+p2 <- readRDS(file.path(paths$home_git, "figures", "pseudotime_flat.rds")) + 
+  xlim(0.13, xlim2)
+
+p3 <- p + p2 + plot_layout(nrow = 2, heights = c(15, 1), guides = "collect") &
+  theme(legend.position = "top",  # Move legend to top
+        legend.direction = "vertical",
+        legend.text = element_text(size = 20),
+        legend.title = element_text(size = 20),
+        axis.text.x = element_text(size = 22),
+        axis.title.x = element_text(size = 22) )
+
+fn <- paste0(paste(today, "Immune", "Pseudotime", "HLA-ABC", "HLA-DR", "T_CD8_7", "T_CD4_5", sample_type, 
+                  sep = "_"), ".png")
+plotsave_param2 <- plotsave_param
+plotsave_param2$width <- 200
+plotsave_param2$height <- 250
+do.call(ggsave, c(list(fn, p3), plotsave_param2))
+
+saveRDS(p3, file.path(paths$home_git, "figures", "extfig6e.rds"))
+```
+
+```{r}
+## 
+palette_custom <- c("HLA_DR" = "#1965B0",
+                   "HLA_ABC" = "#FF7F00",
+                   "Myeloid_3" = "#1B9E77"
+                   )
+
+breaks <- c("HLA_ABC", "HLA_DR", "Myeloid_3")
+#"NormScoreTot_T_CD8_7")
+labels <- c(
+      expression(beta ~ "-cell HLA-ABC normalized counts"),
+      expression(beta ~ "-cell HLA-DR normalized counts"),
+#      bquote("Infiltration Score T-ex"^eff),
+      "Infiltration score M1/M2-like act. cells"
+)
+
+sample_type <- "Sample"
+if (sample_type == "Sample") { size <- 1; alpha <- 0.5; df <- temp_sample |> filter(metric %in% c("HLA_DR", "HLA_ABC", "Myeloid_3")); xlim2 <- 0.9 } 
+if (sample_type == "Islet") { size <- 0.1; alpha <- 0.05; df <- temp_image |> filter(metric %in% c("HLA_DR", "HLA_ABC", "Myeloid_3")); xlim2 <- 1 } 
+
+p <- df |> 
+    ggplot(aes(x = slingshot, y = exprs, color = metric, fill = metric))+
+    geom_point(size = size, alpha = alpha)+
+    mytheme$standard_new() + 
+    geom_smooth(method = "loess", se = TRUE, alpha = 0.1, linewidth = 2) +
+    labs(x = "Pseudotime", y = "Scaled value") + 
+    scale_color_manual(values = palette_custom, name = "Metric", labels = labels, breaks = breaks)+ 
+    scale_fill_manual(values = palette_custom, name = "Metric", labels = labels, breaks = breaks) + 
+    xlim(0.13, xlim2)
+
+p3 <- p + p2 + plot_layout(nrow = 2, heights = c(15, 1), guides = "collect") &
+  theme(legend.position = "top",  # Move legend to top
+        legend.direction = "vertical",
+        legend.text = element_text(size = 20),
+        legend.title = element_text(size = 20),
+        axis.text.x = element_text(size = 22),
+        axis.title.x = element_text(size = 22) )
+
+print(p3)
+fn <- paste0(paste(today, "Immune", "Pseudotime", "HLA-ABC", "HLA-DR", "Myeloid_3", sample_type, 
+                  sep = "_"), ".png")
+plotsave_param2 <- plotsave_param
+plotsave_param2$width <- 300
+plotsave_param2$height <- 250
+do.call(ggsave, c(list(fn, p3), plotsave_param2))
+
+saveRDS(p3, file.path(paths$home_git, "figures", "fig5e.rds"))
+```
+
+# A11: Insulitis:
+
+```{r}
+# Relabel Insulitic by using Immune Panel -> more accurate.
+fn <- file.path(paths$folder_out, "13_MarkerExpression_cells_Immune", "insulitic_images.rds")
+
+if (file.exists(fn)) {
+  image_ids <- readRDS(fn)
+  insulitic_joint <- joint_clusters |> 
+    mutate(insulitic = if_else(image_id %in% image_ids, "insulitis", "non-insulitis")) |> 
+    mutate(insulitic = ifelse(insulitic == "insulitis", "Insulitic", "Non-Insulitic")) |> 
+    mutate(insulitic = factor(insulitic, levels = c("Insulitic", "Non-Insulitic")))
+}
+```
+
+```{r}
+## Plot DistScore T-CD8 & Insulitic
+p <- insulitic_joint |> 
+  filter(cluster == "T_CD8_7") |>
+  ggplot(aes(x = slingshot, y = log1p(NormScoreArea), color = insulitic))+
+  geom_point(alpha = 0.5)+
+  labs(title = "T-CD8-7 DistScore vs Insulitic")+
+  mytheme$large()
+
+print(p)
+fn <- paste0(paste(today, "Immune", "Insulitic", "T_CD8", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+```{r}
+## Plot on X-axis SLingshot and on y-axis both IAPP and Myeloid.
+plot_exprs_insulitic <- function(df, channel, coloring){
+  temp <- df |>
+    select(slingshot, donor_type, case_id, coloring, dplyr::all_of(c(channel, coloring))) |>
+    pivot_longer(cols = c(channel), names_to = "channels", values_to = "exprs") |>
+    filter(channels == !!channel) |> 
+      # scale both into 0-1
+    mutate(exprs = (exprs - min(exprs)) / (max(exprs) - min(exprs))) |> 
+    tidyr::pivot_longer(all_of(c("exprs")), names_to = "metric", values_to = "exprs")
+
+  p <- temp |> 
+    ggplot(aes(x = slingshot, y = exprs, color = get(coloring)))+
+    geom_point(size = 3, alpha = 1) +
+    mytheme$large() + 
+    labs(x = "Pseudotime", y = paste(channel, "Expression"))
+}
+
+channel <- "HLA_ABC"; coloring <- "insulitic"
+p <- plot_exprs_insulitic(insulitic_joint |> filter(cluster == "T_CD8_7"), "HLA_ABC", "insulitic")
+p <- p + labs(y = expression(beta~"-cell HLA-ABC expression")) + 
+  mytheme$standard_new() + 
+  scale_color_manual(values = palettes$colors[1:2], name = "Insulitic")
+print(p)
+
+fn <- paste0(paste(today, "Immune", "Expression", channel, coloring, 
+                  sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+extfig4e <- p
+saveRDS(extfig4e, file.path(paths$home_git, "figures", "extfig4e.rds"))
+
+channel <- "HLA_DR"; coloring <- "insulitic"
+p <- plot_exprs_insulitic(insulitic_joint |> filter(cluster == "T_CD8_7"), channel, "insulitic")
+p <- p + labs(y = expression(beta~"-cell HLA-DR expression")) + 
+  mytheme$standard_new() + 
+  scale_color_manual(values = palettes$colors[1:2], name = "Insulitic")
+print(p)
+
+fn <- paste0(paste(today, "Immune", "Expression", channel, coloring, 
+                  sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+fig2e <- p
+saveRDS(fig2e, file.path(paths$home_git, "figures", "fig2e.rds"))
+```

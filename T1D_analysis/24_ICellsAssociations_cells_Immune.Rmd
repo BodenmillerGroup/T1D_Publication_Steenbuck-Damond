@@ -1,0 +1,1722 @@
+```{r setup, include=FALSE}
+if (rstudioapi::isAvailable()) {
+  script_name <- basename(rstudioapi::getSourceEditorContext()$path)
+} else {
+  script_name <- knitr::current_input()
+}
+
+cur_user <- Sys.info()[["user"]]
+script_name <- "24_ICellsAssociations_cells_Immune.Rmd"
+
+if (cur_user == "ubuntu") {
+  source(file.path("/", "mnt", "central_nas", "projects", "type1_diabetes", "nathan", 
+                   "T1D_Vol", "T1D_analysis", "analysis", "helpers.R"))
+  #n_cores <- future::availableCores() - 1
+  n_cores <- 4
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  knitr::opts_knit$set(root_dir = paths$home_data)
+  do_print <- FALSE
+} else {
+  source(file.path("/", "home", "nsteen", "scripts", "T1D_analysis", "analysis", "helpers.R"))
+  n_cores <- 8
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  paths$folder_script <- paths$cluster_folder_script
+  paths$folder_in <- paths$cluster_folder_in
+  paths$folder_out <- paths$cluster_home 
+  knitr::opts_knit$set(root_dir = paths$cluster_home)
+  do_print <- TRUE
+}
+
+seed <- 123456
+set.seed(seed)
+options <- furrr::furrr_options(seed = seed)
+paths$prev <- paste("08_CellTypesIslet", paths$object_type, paths$panel_type, sep = "_")
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# **Goal**
+
+Correlate immune cell densities with metadata, such as GRS2, GADA titers, and other co-variates.
+
+# **Settings**
+
+## Load packages
+
+```{r packages, results='hide'}
+suppressPackageStartupMessages(c(
+  library(data.table),
+  library(dplyr),
+  library(SpatialExperiment),
+  library(scuttle),
+  library(parallel),
+  library(patchwork),
+  library(tidyr),
+  library(RSpectra)
+))
+```
+
+## Paths and settings
+
+```{r settings}
+# Paths
+if (!dir.exists(paths$folder_script)) dir.create(paths$folder_script)
+plotsave_param$path <- paths$folder_script
+plotsave_param_large$path <- paths$folder_script
+
+# Misc settings
+today <- gsub("-", "", Sys.Date())
+```
+
+##  Read in the data
+
+Load the SpatialExperiment (SPE) object saved at the previous step.
+
+```{r load-data}
+fn_spe <- file.path(paths$folder_out, paths$prev, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+spe <- readRDS(fn_spe)
+print(spe)
+
+# Get unique Case-IDs.
+case_stages <- colData(spe)[, c("case_id", "donor_type", "age", "race", "gender", "diabetes_duration", "BMI")] |> 
+  as_tibble() |> 
+  dplyr::distinct() |> 
+  mutate(age_group = if_else(age >= 13, "old", "young")) |>
+  mutate(age_group = factor(age_group, levels = c("young", "old"))) |>
+  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages))
+case_stages
+```
+
+
+# **A.1 Check association with co-variates**
+
+Check expression across stages, i.e. NoDiabetes, sAAb+, mAAb+, RecentOnset, and check for association to:
+**race (ethnicity)**, **gender (sex)**, **BMI**, **Overweight**, i.e. BMI >= 25 vs < 25, and **BMIhigh**, i.e. obese (BMI >= 30).
+Also, **ICU_time** and **cold-ischemia time** (=transit_time_minutes).
+Note: only 10 total cases with BMI >= 30, so this is barely robust.
+
+We do not test against life-style and cause of death, which might influence beta-cell function, 
+as lifestyle & causes of death are simply too diverse for robust testing. Larger cohorts are needed.
+
+## **A.1.1 Add co-variates.**
+
+### **A1.1.2 Age-adjust BMI.**
+First: Load in full metadata, which also contains the covariates such as serotypes, ICU time, cold-ischemia time.
+These are all downloaded from the nPOD dataportal. (Time: 2025-06-01).
+
+```{r check-metadata-oi} 
+library(childsds)
+
+fn_cases_full <- file.path(paths$folder_in, "cases_full.xlsx")
+cases_full <- readxl::read_excel(fn_cases_full) |> 
+  mutate(case_id = as.character(case_id)) |> 
+  select(        # Clinical variables:
+        age_years, height_cm, weight_kg,
+        case_id, admission_course, case_recovery_type, hemodiluted_status, 
+        clinical_history, cause_of_death, 
+        transit_time_minutes, ICU_time_days,  
+        downtime_minutes, BMI, RIN,
+        diabetes_hx_years, clinical_history,
+        # Treatment:
+        meds_home, meds_hospital) |> 
+  right_join(case_stages, by = c("case_id")) |> 
+  select(-BMI.x) |> 
+  dplyr::rename(BMI = "BMI.y") |> 
+  mutate(transfusion = ifelse(grepl("transfusion|Transfusion", admission_course), "Yes", "No")) |>
+  mutate(transfusion = ifelse(hemodiluted_status == "Yes", "Yes", transfusion))
+
+## Full cases.
+cases_full <- cases_full |> filter(case_id %in% metadata(spe)$cases)
+cases_full
+```
+
+BMI needs to be age-adjusted for pediatric cases for more accurate classification.
+Use the CDC reference data to calculate BMI percentiles.
+
+Split into < 20 years and >= 20 years.
+Use the `childsds` package to calculate BMI percentiles.
+
+```{r cdc-bmi-percentiles}
+pediatric_cases <- cases_full |> 
+  filter(age < 20) |> 
+  arrange(age) |> 
+  select(case_id, gender, age, BMI, height_cm, weight_kg)
+
+pediatric_cases$bmi_percentile <- sds(pediatric_cases$BMI, 
+   age = pediatric_cases$age, 
+   sex = pediatric_cases$gender, 
+   male = "Male", female = "Female", 
+   ref = cdc.ref, 
+   item = "bmi", 
+   type = "perc")
+
+pediatric_cases <- pediatric_cases |> 
+  mutate(class_weight = case_when(bmi_percentile < 0.05 ~ "Underweight",
+                                 (bmi_percentile >= 0.05 & bmi_percentile < 0.85) ~ "Healthy weight",
+                                 (bmi_percentile >= 0.85 & bmi_percentile < 0.95) ~ "Overweight",
+                                  bmi_percentile >= 0.95 ~ "Obese"))     
+
+# Non-pediatric cases. Older than 20 years.
+non_pediatric_cases <- cases_full |> 
+  filter(age >= 20) |> 
+  arrange(age) |> 
+  select(case_id, age, BMI) |> 
+  mutate(class_weight = case_when(BMI < 18.5 ~ "Underweight",
+                                 (BMI >= 18.5 & BMI < 25) ~ "Healthy weight",
+                                 (BMI >= 25 & BMI < 30) ~ "Overweight",
+                                  BMI >= 30 ~ "Obese"))
+
+bmi_cases <- bind_rows(pediatric_cases, non_pediatric_cases) |> 
+  select(case_id, class_weight) |> 
+  arrange(case_id)
+```
+
+### **A1.1.3 Clean data.**
+Delete cases with few beta-cells (< 10 cells) to delete later downstream.
+
+```{r few-beta-cells}
+celltype_compo <- metadata(spe)$celltype_compo |> as_tibble()
+cluster_compo <- metadata(spe)$cluster_compo[[1]] |> as_tibble()
+
+to_del <- colData(spe)[, c("case_id", "cell_type", "donor_type")] |> 
+  as_tibble() |> 
+  filter(cell_type == "Beta") |> 
+  dplyr::count(case_id, donor_type) |> 
+  arrange(n) |> 
+  filter(n < 10) |> 
+  pull(case_id)
+
+print(to_del)
+print("Cases with less than 10 beta-cells.")
+```
+
+Join Data. Clean Data further.
+```{r clean-data}
+## Clean data.
+compo <- celltype_compo |> 
+  inner_join(cluster_compo, by = "image_id") |> 
+  mutate(case_id = stringr::str_extract(image_id, "^[A-Z0-9]+")) |> 
+  inner_join(cases_full, by = "case_id") |> 
+  select(image_id, case_id, donor_type, gender, BMI, age, age_group, race, 
+        cause_of_death, transit_time_minutes, case_recovery_type, clinical_history, diabetes_hx_years, RIN, ICU_time_days, starts_with("density_")) |> 
+  left_join(bmi_cases, by = "case_id") |> 
+  mutate(transit_time_minutes = stringr::str_remove(transit_time_minutes, ".00 minutes")) |> 
+  mutate(ICU_time_days = stringr::str_remove(ICU_time_days, " days")) |>
+  mutate(transit_time_minutes = stringr::str_remove(transit_time_minutes, "-")) |> 
+  mutate(transit_time_minutes = as.numeric(transit_time_minutes),
+                ICU_time_days = as.numeric(ICU_time_days)) |> 
+  mutate(cause_of_death = case_when(
+    "Anoxia" == cause_of_death ~ "Anoxia",
+    grepl("Head Trauma", cause_of_death) ~ "Head Trauma",
+    grepl("DKA", cause_of_death) ~ "DKA",
+    grepl("Other", cause_of_death) ~ "Other",
+    TRUE ~ "Other"
+  ))  |> mutate(cause_of_death = factor(cause_of_death, levels = c("Anoxia", "Head Trauma", "DKA", "Other")))
+
+## Set Factors. 
+## Set caucasian; "Normal" in Obesity/Overweight as base levels (largest groups).
+compo_cleaned <- compo |> 
+  mutate(Overweight = ifelse(class_weight %in% c("Overweight", "Obese"), "High", "Normal")) |>
+  mutate(Obese = ifelse(class_weight == "Obese", "High", "Normal")) |>
+  mutate(Overweight = factor(Overweight, levels = c("Normal", "High"))) |>
+  mutate(Obese = factor(Obese, levels = c("Normal", "High"))) |>
+  dplyr::rename(ethnicity = "race", sex = "gender") |> 
+  mutate(ethnicity = factor(ethnicity, levels = c("Caucasian", "Hispanic_Latino", "African_American")))
+
+dist_score_clusters <- metadata(spe)$cluster_compo_score[[1]] |> 
+  as_tibble() |> 
+  filter(image_id %in% compo_cleaned$image_id) |> 
+  select(image_id, donor_type, case_id, starts_with("NormScoreArea_")) |> 
+  pivot_longer(cols = starts_with("NormScoreArea_"), 
+             names_to = "cell_cluster", values_to = "NormScoreArea") |> 
+  mutate(cell_cluster = stringr::str_remove(cell_cluster, "NormScoreArea_")) |>
+  inner_join(case_stages, by = c("donor_type", "case_id"))
+
+dist_score <- metadata(spe)$celltype_compo_score |> 
+  as_tibble() |> 
+  filter(image_id %in% compo_cleaned$image_id) |> 
+  select(image_id, donor_type, case_id, starts_with("NormScoreArea_")) |> 
+  pivot_longer(cols = starts_with("NormScoreArea_"), 
+             names_to = "cell_type", values_to = "NormScoreArea") |> 
+  mutate(cell_type = stringr::str_remove(cell_type, "NormScoreArea_")) |>
+  inner_join(case_stages, by = c("donor_type", "case_id")) |> 
+  dplyr::rename("cell_cluster" = cell_type)
+
+dist_score_full <- bind_rows(dist_score_clusters, dist_score)
+
+compo_cleaned |> distinct(case_id) |> dplyr::count()
+
+## 
+compo_cleaned <- compo_cleaned |> 
+  pivot_longer(cols = starts_with("density"), names_to = "cell_cluster", values_to = "density") |> 
+  mutate(cell_cluster = stringr::str_remove(cell_cluster, "density_")) |>
+  mutate(type = ifelse(cell_cluster %in% c("B", "T_CD4", "NK", "Myeloid", "Neutrophil", "T_CD8", "CD303_VIM"), "Cell_Type", "Cell_Cluster"))
+
+compo_cleaned <- compo_cleaned |> 
+  left_join(dist_score_full, by = c("image_id", "donor_type", "case_id", "age", "age_group", "cell_cluster", "BMI")) |> 
+  mutate(sex = factor(sex, levels = c("Male", "Female")))  |> 
+  mutate(drug_use = ifelse(
+      grepl("Drug|drug|Alcohol|alcohol|MDMA|Amphetamine|amphetamine|Meth|meth|Marihuana|mariuhana|Cocaine|cocaine|Heroin|heroin|Crack|crack|Benzo|benzo|Nicotine|nicotine|smoking|Smoking", clinical_history), "yes", "no"))
+
+
+compo_cleaned |> distinct(case_id)
+compo_cleaned |> dplyr::distinct(case_id, Obese, donor_type) |> dplyr::count(Obese, donor_type)
+compo_cleaned |> dplyr::distinct(case_id, Overweight, donor_type) |> dplyr::count(Overweight, donor_type)
+# we actually slightly more overweight cases in the NoDiabetes group. All in all, well balanced.
+```
+
+## **A1.2 LMM against co-variates.**
+
+Test association of beta-cell expression with the co-variates.
+Use linear mixed-effects model. Adjust by age.
+
+**- value ~ covariate + donor_type + age_group + (1 | case_id)**
+
+Same results if adding "batch" as covariate. Data is not batch-effected.
+Tested: log1p transformations or using only ICIs do not majorly change results.
+
+```{r check-metadata-lmm}
+metadata_oi <- c("BMI", "Overweight", "Obese", "ethnicity", "sex", 
+                 "transit_time_minutes", "ICU_time_days", "cause_of_death", "drug_use",
+                 "case_recovery_type")
+dependent_vars <- c("density", "NormScoreArea")
+transformations <- c("log1p", "none")
+
+# Mixed-effects model: Cell Type.
+res_lmm <- purrr::map(transformations, \(transformation) {
+  purrr::map(dependent_vars, \(dependent_var) {
+   purrr::map(metadata_oi, \(covariate) {
+    # covariate <- "ICU_time_days"
+    # transformation <- "log1p"
+    # dependent_var <- "density"
+    message("Testing covariate: ", covariate)
+
+    covariate2 <- covariate
+    if (transformation == "log1p" & covariate %in% c("transit_time_minutes", "ICU_time_days")){
+      covariate2 <- paste0("log1p(", covariate, ")")
+    }
+
+    formula <- paste0(dependent_var, " ~ ", covariate2, " + donor_type + age_group + (1 | case_id)")
+
+    ## Check for NA entries.
+    tt <- compo_cleaned |> 
+      dplyr::rename("covariate" = !!covariate) |> 
+      distinct(case_id, covariate) |> 
+      dplyr::filter(is.na(covariate)) |> pull(case_id)
+    
+    message("Cases with NA in covariate: ", length(tt))
+    message("Cases: ", paste(tt, collapse = ", "))
+
+    res_lmm <- compo_cleaned |> 
+      filter(type == "Cell_Type") |>
+      tidyr::nest(data = -c(cell_cluster)) |>
+      dplyr::mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(data = ., 
+        formula)))) |> 
+      tidyr::unnest(test) |> 
+      filter(term !="(Intercept)", effect == "fixed") |>
+      arrange(p.value) |> 
+      mutate(term = stringr::str_remove(term, "donor_type")) |>
+      filter(!term %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration")) |>
+      mutate(p.adj = p.adjust(p.value, method = "fdr")) |> 
+      mutate(logpadj = -log10(p.adj)) |> 
+      mutate(covariate = covariate) |>
+      select(cell_cluster, effect, term, estimate, p.adj, statistic, covariate, logpadj) |> 
+      mutate(term2 = !!dependent_var) |> 
+      mutate(term3 = !!transformation) |> 
+      mutate(term2 = stringr::str_remove(term2, "log1p\\(")) |>
+      mutate(term2 = stringr::str_remove(term2, "\\)")) 
+    res_lmm
+    }) |> bind_rows()
+  }) |> bind_rows()
+})
+
+res_lmm <- res_lmm |> bind_rows() |>
+      arrange(covariate, desc(logpadj)) |> 
+  mutate(covariate = factor(covariate, levels = metadata_oi))
+res_lmm
+```
+
+
+Plot results of the linear mixed-effects model. Use this as a supplementary figure, not Extended Figure.
+
+```{r plot-covariate-results, fig.width=15, fig.height=10}
+purrr::map(transformations, \(transformation) {
+  purrr::map(dependent_vars, \(dependent_var) {
+    # transformation <- "log1p"; dependent_var <- "NormScoreArea"; 
+    message("Plotting results for transformation: ", transformation, " and dependent variable: ", dependent_var)
+    test_t <- res_lmm |> 
+      filter(grepl(!!transformation, term3)) |>
+      filter(grepl(!!dependent_var, term2))
+    message(nrow(test_t), " results to plot.")
+    
+    p <- test_t |>
+      filter(term != "age_groupold") |>
+      mutate(direction = ifelse(estimate > 0, "Higher", "Lower")) |>
+      arrange(desc(logpadj)) |> 
+      ggplot(aes(x = forcats::fct_reorder(cell_cluster, -abs(statistic)), y = logpadj, 
+                fill = direction, color = term)) +
+      geom_bar(stat = "identity", position = "dodge") +
+      labs(x = "Cell Type", y = "-log10(p.adj)") + 
+      mytheme$standard_new() + 
+      theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
+      geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") + 
+      scale_fill_manual("Direction", values = palettes$colors[1:2]) +
+      facet_wrap(~ covariate, scales = "free_y", axes = "all")
+    
+    fn <- paste0(paste(today, "LMM", "T1D1", "Progression", "covariates", transformation, dependent_var, sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param_large))
+    print(p)
+  })
+})
+```
+
+-> Note: NormScoreArea reduces association; likely as confounders are unspecific, 
+but NormScoreArea is specific diabetogenic processes.
+
+Case-recovery-type no influence; also way too few cases.
+Heatmap-like:
+```{r}
+library(scales)
+
+# Build a matrix-like grid: one row per feature, one column per (covariate×level) or numeric covariate
+panel <- res_lmm |> 
+  filter(term != "age_groupold", term2 == "density", term3 == "log1p") |> 
+  mutate(term = stringr::str_remove(term, "cause_of_death")) |>
+  mutate(term = stringr::str_remove(term, "Obese|ethnicity|Overweight|sex")) |>
+  filter(covariate != "case_recovery_type") |> 
+  mutate(col_key = if_else(is.na(term),
+                           covariate,                       # numeric covariates
+                           paste(covariate, term, sep = ":")),
+        neglog10_p = -log10(p.adj),
+        sig = p.adj < 0.05,
+        direction = sign(estimate)) |> 
+  select(cell_cluster, col_key, estimate, p.adj, neglog10_p, sig) |> 
+  dplyr::mutate(col_key = stringr::str_remove(col_key, "BMI:|ICU_time_days:|transit_time_minutes:")) |> 
+  mutate(col_key = ifelse(col_key == "log1p(transit_time_minutes)", "log(Organ transit time)", col_key)) |> 
+  mutate(col_key = ifelse(col_key == "log1p(ICU_time_days)", "log(ICU time)", col_key)) |> 
+  mutate(col_key = ifelse(col_key == "cause_of_death:DKA", "Cause of death:DKA", col_key)) |> 
+  mutate(col_key = ifelse(col_key == "cause_of_death:Anoxia", "Cause of death:Anoxia", col_key)) |> 
+  mutate(col_key = ifelse(col_key == "cause_of_death:Head Trauma", "Cause of death:Trauma", col_key)) |>
+  mutate(col_key = ifelse(col_key == "cause_of_death:Other", "Cause of death:Other", col_key)) |>
+  mutate(col_key = stringr::str_replace(col_key, "ethnicity", "Ethnicity")) |>
+  mutate(col_key = stringr::str_replace(col_key, "Obese:High", "Obese: >= 95 % BMI")) |> 
+  mutate(col_key = stringr::str_replace(col_key, "Overweight:High", "Overweight: >= 85 % BMI")) |> 
+  mutate(col_key = stringr::str_replace(col_key, "drug_use:drug_useyes", "Drug use: Yes"))
+
+max <- round(max(panel$neglog10_p), 2)
+sig_thr  <- -log10(0.05)        # ~1.30103
+
+# Rows to mark + contrast-aware label color
+p <- ggplot(panel, aes(col_key, cell_cluster, fill = neglog10_p)) +
+  geom_tile() +
+  scale_fill_distiller(
+    palette = "Blues",
+    direction = 1,                 # light → dark blue as values increase
+    limits = c(0, max),
+    oob = squish,                  # cap anything > thr at the top color
+    labels = c(0.4, 2.0, 4.0),
+    breaks = c(0.4, 2.0, 4.0),
+    na.value = "grey90",
+    guide = guide_colorbar(title.position = "top")
+  )+ 
+  labs(x = "Covariate : Level (or Numeric Covariate)", y = "Cell type",
+       fill = "-log10(p.adj)") +
+  mytheme$large_new() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+fn <- paste0(paste(today, "Heatmap", "EffectSize", "Covariates", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+print(p)
+
+rev_supplfig2a <- p
+saveRDS(rev_supplfig2a, file.path(paths$home_git, "figures", "rev_supplfig2a.rds"))
+```
+
+-> NOTE:
+Observe association of immune cell types to ICU-time-days, but
+this is unspecific. This is demonstrated by that the associations 
+falls by ~ factor 100x after changing density to NormScoreArea for myeloid cells.
+Similarly, an analysis with decreasing window-size around Islets reaches the same conclusion.  
+Likely diffuse exocrine pancreatitis.
+Hence, we have unspecific noise, over the specific increase in the given immune cell types. 
+
+## **A1.4 Organ transport time**
+### **A1.4.1 Across disease stages:**
+
+Check time in organ transport across disease stages.
+```{r organ-transport-time}
+p <- compo_cleaned |> 
+  distinct(donor_type, case_id, transit_time_minutes) |> 
+  ggplot(aes(x = donor_type, y = log10(transit_time_minutes), fill = donor_type)) +
+  geom_boxplot(position = position_dodge(width = 0.75), outliers = FALSE) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.75), 
+             size = 2, alpha = 0.7) +
+  labs(x = "Donor Type", y = "log10: Organ Transport Time (Minutes)") +
+  mytheme$standard_new() +
+  scale_fill_manual(values = palettes$stages)
+
+print(p)
+fn <- paste0(paste(today, "Organ_transport_time", "Boxplot", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+palettes$stages2 <- palettes$stages
+names(palettes$stages2) <- c("Control", "sAAb+", "mAAb+", "Onset", "LD")
+
+## Show T-CD8 with Organ Transport Time. 
+p <- compo_cleaned |> 
+  filter(cell_cluster %in% c("T_CD8", "T_CD4", "Myeloid")) |> 
+  distinct(donor_type, cell_cluster, case_id, transit_time_minutes, density, image_id) |> 
+  group_by(donor_type, cell_cluster, case_id) |>
+  summarize(transit_time_minutes = mean(transit_time_minutes, na.rm = TRUE), 
+            density = mean(density, na.rm = TRUE), .groups = "drop") |> 
+  mutate(donor_type = case_when(
+    donor_type == "NoDiabetes" ~ "Control",donor_type == "sAAb+" ~ "sAAb+",
+    donor_type == "mAAb+" ~ "mAAb+", donor_type == "RecentOnset" ~ "Onset",
+    donor_type == "LongDuration" ~ "LD"
+  )) |>
+  mutate(donor_type = factor(donor_type, levels = c("Control", "sAAb+", "mAAb+", "Onset", "LD"))) |>
+  ggplot(aes(x = log1p(transit_time_minutes), y = log1p(density), color = donor_type)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = TRUE, aes(group = donor_type)) +
+  labs(x = "log1p: Organ transport time (minutes)", y = "log1p: Cell density (cells/mm^2)") + 
+  mytheme$large_new() +
+  ggpubr::stat_cor(aes(label = paste(..r.label.., sep = "~`,`~")), r.accuracy = 0.01,
+           digits = 2, method = "spearman", label.x.npc = "left", label.y.npc = "top", size = 8.5) +
+  scale_color_manual(values = palettes$stages2, name = "Stage") + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  facet_wrap(~ cell_cluster, scales = "free_y", axes = "all")
+
+p
+## 
+library(RColorBrewer)
+temp_cols <- brewer.pal(n = 8, name = "Dark2")
+
+palettes$cause_of_death <- c("Anoxia" = temp_cols[1], 
+                            "Trauma" = temp_cols[2],
+                            "DKA" = temp_cols[3], 
+                            "Other" = temp_cols[4])
+
+q <- compo_cleaned |> 
+  filter(cell_cluster %in% c("T_CD8", "T_CD4", "Myeloid")) |> 
+  mutate(cause_of_death = ifelse(cause_of_death == "Head Trauma", "Trauma", as.character(cause_of_death))) |>
+  distinct(donor_type, cell_cluster, case_id, cause_of_death, density, image_id) |> 
+  group_by(donor_type, cell_cluster, case_id, cause_of_death) |>
+  summarize(density = mean(density, na.rm = TRUE), .groups = "drop") |> 
+    mutate(donor_type = case_when(
+    donor_type == "NoDiabetes" ~ "Control",donor_type == "sAAb+" ~ "sAAb+",
+    donor_type == "mAAb+" ~ "mAAb+", donor_type == "RecentOnset" ~ "Onset",
+    donor_type == "LongDuration" ~ "LD"
+  )) |>
+  mutate(donor_type = factor(donor_type, levels = c("Control", "sAAb+", "mAAb+", "Onset", "LD"))) |>
+  ggplot(aes(x = donor_type, y = log1p(density), fill = cause_of_death)) +
+  geom_boxplot(position = position_dodge(width = 0.75), outliers = FALSE) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.75)) +
+  labs(x = "Stage", y = "log1p: Cell density (cells/mm^2)") + 
+  mytheme$large_new() +
+  scale_fill_manual(values = palettes$cause_of_death, name = "Cause of Death") + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  facet_wrap(~ cell_cluster, scales = "free_y", axes = "all")
+
+library(cowplot)
+fig <- (p + q + plot_layout(nrow = 2, guides = "collect")) & 
+  ylab(NULL)  # remove duplicate y label
+
+fig <- ggdraw(fig + theme(plot.margin = margin(10, 25, 10, 50))) + 
+  draw_label(
+    "log1p: Cell density (cells/mm^2)",
+    x = 0.01,        # closer to edge
+    y = 0.5, 
+    angle = 90, 
+    vjust = 0.5, 
+    hjust = 0.5, 
+    size = 35
+  ) +
+  theme(
+    plot.background = element_rect(fill = "white", colour = NA)  # non-transparent
+  )
+print(fig)
+plotsave_param_large2 <- plotsave_param_large
+plotsave_param_large2$width <- 500
+
+fn <- paste0(paste(today, "Metadata", "Scatterplot", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, fig), plotsave_param_large2))
+
+saveRDS(fig, file.path(paths$home_git, "figures", "rev_supplfig2b.rds"))
+```
+
+- Checked below with ANOVA for association to disease-stages.
+ 
+## A.2: association with GRS2
+
+Other Meta-data, obtained from the nPOD website. Here, GRS2.
+
+### A2.1: Read in GRS2 data. 
+```{r read-in-grs2}
+# Get GRS2. 
+grs2 <- readxl::read_xlsx(file.path(paths$folder_in, "grs2.xlsx")) |> 
+  dplyr::select(case_id, starts_with("GRS2")) |> 
+  mutate(GRS2_score = as.numeric(GRS2_score)) |>
+  mutate(GRS2_percentile = as.numeric(GRS2_percentile)) |>
+  dplyr::right_join(case_stages, by = "case_id")
+
+grs2_long <- grs2 |> 
+  dplyr::select(GRS2_score, GRS2_percentile, case_id) |>
+  pivot_longer(cols = starts_with("GRS2_"), names_to = "SNP", values_to = "value")
+
+grs2_long |> distinct(case_id) |> dplyr::count()
+```
+
+Overview of GRS2 data.
+```{r overview-grs2}
+## Print overview of GRS2 data.
+# 1: How many non-NA/NA values? Barplot per Donor-Type.
+grs2 |> 
+  mutate(is_na = ifelse(is.na(GRS2_score), "NA", "non-NA")) |>
+  dplyr::count(donor_type, is_na) |> 
+    filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration")) |>
+  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages)) |>
+  ggplot(aes(x = donor_type, y = n, fill = as.factor(is_na))) +
+  geom_bar(stat = "identity") +
+  labs(x = "Donor Type", y = "Count available GRS2 data", fill = "GRS2 Score") +
+  mytheme$standard_new() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# 2. How high are the GRS2 scores? Do Barplots with GRS2 scores per Donor-Type.
+grs2 |> 
+  filter(!is.na(GRS2_score)) |> 
+  filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration")) |>
+  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages)) |>
+  ggplot(aes(x = donor_type, y = GRS2_score)) +
+  geom_boxplot() +
+  geom_point()+
+  labs(x = "Donor Type", y = "GRS2 Score") +
+  mytheme$standard_new() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# 3. How do they correlate with age?
+grs2 |> 
+  filter(!is.na(GRS2_score)) |> 
+  filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration")) |>
+  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages)) |>
+  ggplot(aes(x = donor_type, y = GRS2_score, fill = age_group)) +
+  geom_boxplot(position = position_dodge(width = 0.9)) +
+  geom_point(position = position_dodge(width = 0.9)) +
+  labs(x = "Age", y = "GRS2 Score") +
+  mytheme$standard_new() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# 4. Which percentile do they belong to?
+grs2 |> 
+  filter(!is.na(GRS2_score)) |> 
+  filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration")) |>
+  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages)) |>
+  ggplot(aes(x = donor_type, y = GRS2_percentile, fill = age_group)) +
+  geom_boxplot(position = position_dodge(width = 0.9)) +
+  geom_point(position = position_dodge(width = 0.9)) +
+  labs(x = "Age", y = "GRS2 Percentile") +
+  mytheme$standard_new() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  ylim(0, 100)
+
+# 5. Which SNPs are frequently present?
+# 5.1 Make stacked barplots for each snp for occurence.
+grs2 |>
+    filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration")) |>
+  dplyr::select(starts_with("GRS2_")) |> 
+  dplyr::select(-c(GRS2_percentile, GRS2_score, GRS2_SNPs)) |>
+  pivot_longer(cols = everything(), names_to = "SNP", values_to = "value") |>
+  dplyr::filter(value != "NA") |>
+  mutate(SNP = gsub("GRS2_", "", SNP)) |>
+  ggplot(aes(x = SNP, fill = value)) +
+  geom_bar() +
+  labs(x = "SNP", y = "Count") + 
+  mytheme$standard() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+### A2.2 Correlate GRS2 with Cell Type Density.
+First test, if GRS2 correlates with Cell Type density.
+```{r correlate-grs2-density}
+### Filter by ICIs. 
+icis <- colData(spe)[, c("image_id", "cell_type")] |> 
+  dplyr::as_tibble() |> 
+  filter(cell_type == "Beta") |> 
+  dplyr::distinct(image_id) |> 
+  dplyr::pull(image_id)
+
+tt <- grs2 |> dplyr::select(case_id, donor_type, GRS2_percentile, age, age_group) 
+
+df_oi <- compo_cleaned |> left_join(tt, by = c("case_id", "donor_type", "age", "age_group"))
+df_oi |> dplyr::distinct(case_id) |> dplyr::count()
+
+# Density of Cell types vs GRS2_percentile.
+res_lmm <- df_oi |> 
+  tidyr::nest(data = -c(cell_cluster)) |> 
+  filter(!cell_cluster %in% to_del_clusters) |> 
+  mutate(lm = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(density ~ donor_type + age_group + log1p(ICU_time_days) + GRS2_percentile + (1|case_id), data = .x)))) |> 
+  tidyr::unnest(lm) |> 
+  filter(term != "(Intercept)") |>
+  filter(term %in% c("age_groupold", "GRS2_percentile")) |> 
+  arrange(p.value)
+```
+
+
+# A.3: GADA Titer data.
+
+Test assocaition of GADA titers with immune-cell type densities.
+Data for both sAAb+ and mAAb+ cases.
+
+## A3.1: Add GADA titers.
+```{r load-gada-titers}
+## Load GADA.
+aab_titers <- readxl::read_xlsx(file.path(paths$folder_in, "titers_AAb.xlsx")) |> 
+  dplyr::rename(gada_index = `GADA Index`, ia2a_index = `IA-2A Index`,
+                znt8a_index = `ZnT8A Index`, mIAA_index = `IAA Index`, case_id = "CaseID",
+                gada_pos = "GADA", ia2a_pos = "IA2A", znt8a_pos = "ZnT8A",
+                mIAA_pos = "mIAA", `number_of_AAbs` = `nb Antibody`) |> 
+  mutate(case_id = as.character(case_id)) |>
+  dplyr::right_join(case_stages, by = "case_id") |> 
+  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages)) |>
+  mutate(age_group = factor(age_group, levels = c("young", "old"))) |> 
+  filter(!is.na(gada_index) | gada_index != "NA")
+
+# summarize and group - as for 6496 we have two GADA titers (there are very close together).
+gada_titers <- aab_titers |> 
+  filter(gada_pos == "Positive") |>
+  select(case_id, gada_index, donor_type, age, age_group, gada_index, gada_pos, number_of_AAbs, diabetes_duration) |> 
+  group_by(case_id, donor_type, age, age_group, gada_pos, diabetes_duration) |> 
+  summarize(gada_index = mean(gada_index, na.rm = TRUE), .groups = "drop")
+
+gada_titers <- gada_titers |> 
+  inner_join(cases_full, by = c("case_id", "donor_type", "age", "age_group", "diabetes_duration"))
+
+# Almost all are positive for GADA.
+gada_titers |> dplyr::count(gada_pos, donor_type, age_group)
+
+# Recent-Onsets: number of AAb+ cases.
+rec_onset_titers <- aab_titers |> filter(donor_type == "RecentOnset") |> 
+  dplyr::select(case_id, donor_type, age, age_group, number_of_AAbs, gada_index, znt8a_index, ia2a_index, mIAA_index, diabetes_duration) 
+```
+
+## A3.2: GADA titers association with immune-cell type densities.
+
+```{r test-beta-gada-titers}
+tt <- gada_titers |> dplyr::select(case_id, donor_type, gada_index, age, age_group, transfusion) 
+
+df_oi <- compo_cleaned |> left_join(tt, by = c("case_id", "donor_type", "age", "age_group"))
+
+# N = 19, with N = 13 gada pos.
+rec_df_oi <- compo_cleaned |> 
+  inner_join(rec_onset_titers, by = c("case_id", "donor_type", "diabetes_duration",  "age", "age_group")) |> 
+  filter(!case_id %in% to_del)
+
+rec_df_oi |> distinct(case_id)
+```
+
+### A3.2.1: sAAb+: GADA titers 
+```{r saab-gada}
+# Density of Cell types vs GADA index.
+res_lmm_gada_saab <- df_oi |> 
+  filter(donor_type == "sAAb+", image_id %in% icis) |> 
+  # filter(blood == "not_altered") |>
+  tidyr::nest(data = -c(cell_cluster)) |> 
+  filter(!cell_cluster %in% to_del_clusters) |> 
+  #mutate(lm = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(density ~ ICU_time_days + age_group + gada_index + (1|case_id), data = .x)))) |> 
+  mutate(lm = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(log1p(density) ~ transfusion + age_group + gada_index + log1p(ICU_time_days) + (1|case_id), data = .x)))) |> 
+  tidyr::unnest(lm) |> 
+  filter(term != "(Intercept)") |>
+  filter(term %in% c("age_groupold", "gada_index")) |> 
+  arrange(p.value) |> 
+  mutate(donor_type = "sAAb+")
+
+res_lmm_gada_saab |> filter(term == "gada_index")
+```
+
+Nothing interesting. Subsetting to those without transfions/Hemodilution makes no difference.
+
+```{r mAAb}
+res_lmm_gada_mab <- df_oi |> 
+  filter(donor_type == "mAAb+", image_id %in% icis) |> 
+  tidyr::nest(data = -c(cell_cluster)) |> 
+  filter(!cell_cluster %in% to_del_clusters) |> 
+  mutate(lm = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(log1p(density) ~ transfusion + age_group + gada_index + log1p(ICU_time_days) + (1|case_id), data = .x)))) |> 
+  tidyr::unnest(lm) |> 
+  filter(term != "(Intercept)") |>
+  filter(term %in% c("age_groupold", "gada_index")) |> 
+  arrange(p.value) |> 
+  mutate(donor_type = "mAAb+")
+
+res_lmm_gada_mab |> filter(term == "gada_index")
+```
+
+- Not significant; but association with different "aggressive" subtypes (i.e. T-CD8-7, T-CD8-4, Myeloid-4).
+-> In line with results from beta-cells (HLA-ABC).
+-> Nothing observed.
+
+```{r recent-onset-gada}
+res_lmm_gada_rec <- df_oi |> 
+  filter(donor_type == "RecentOnset", image_id %in% icis, age_group == "old") |> 
+  tidyr::nest(data = -c(cell_cluster)) |> 
+  filter(!cell_cluster %in% to_del_clusters) |> 
+  # mutate(lm = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(density ~ number_of_AAbs + log1p(ICU_time_days) + (1|case_id), data = .x)))) |>
+  mutate(lm = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(log1p(density) ~ log1p(ICU_time_days) + gada_index + (1|case_id), data = .x)))) |> 
+  tidyr::unnest(lm) |> 
+  filter(term != "(Intercept)") |>
+  filter(term %in% c("age_groupold", "gada_index", "number_of_AAbs")) |> 
+  arrange(p.value) |> 
+  mutate(donor_type = "RecentOnset")
+
+res_lmm_gada_rec
+
+### Recent-Onsets -number-of-AAbs:
+## test different indeces.
+index_oi <- c("gada_index", "znt8a_index", "mIAA_index", "ia2a_index", "number_of_AAbs")
+
+res_lmm_gada_rec_n_aab <- purrr::map(index_oi, \(.x){
+  rec_df_oi |> 
+    dplyr::rename(index = .x) |>
+    select(diabetes_duration, cell_cluster, case_id, donor_type, index, age_group, density) |> 
+    filter(age_group == "old") |> 
+    tidyr::nest(data = -c(cell_cluster)) |> 
+    filter(!cell_cluster %in% to_del_clusters) |> 
+#    mutate(lm = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(density ~ age_group + diabetes_duration + index + (1|case_id), data = .x)))) |> 
+    mutate(lm = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(log1p(density) ~ index + (1|case_id), data = .x)))) |> 
+    tidyr::unnest(lm) |> 
+    filter(term != "(Intercept)") |>
+    mutate(index = .x) |>
+    filter(term %in% c("index", "number_of_AAbs", "diabetes_duration")) |> 
+    arrange(p.value)
+}) |> bind_rows()
+
+### Nothing associated.
+res_lmm_gada_rec_n_aab |> arrange(p.value) |> filter(term == "index")
+```
+
+Here, shown for T-CD8-7.
+Partial association with GADA titers.
+```{r}
+### T-CD8-7
+df_oi |> 
+  filter(cell_cluster == "T_CD8_7") |> 
+  filter(donor_type %in% c("sAAb+", "mAAb+")) |>
+  mutate(donor_type = factor(donor_type, levels = c("sAAb+", "mAAb+"))) |>
+  group_by(case_id, donor_type, age_group, cell_cluster) |>
+  summarise(density = mean(density, na.rm = TRUE), gada_index = mean(gada_index, na.rm = TRUE), .groups = "drop") |>
+  ggplot(aes(x = log1p(gada_index), y = log1p(density), color = donor_type, shape = age_group)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm", se = FALSE, alpha = 0.1) +
+  ggpubr::stat_cor(method = "spearman") +
+  mytheme$standard_new() +
+  labs(x = "GADA Index", y = "log1p Density T-CD8-7") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  scale_color_manual(values = palettes$stages) + 
+  facet_wrap(~ donor_type, scales = "free_y", axes = "all")
+```
+
+
+GRS2 correlation is (very) partly associated with GADA titers.
+
+## A3.3: Plot results of the linear mixed-effects model.
+
+### A3.3.1: Celltypes.
+
+```{r plot-gada-titers-results}
+## Results of the linear mixed-effects model.
+## CellTypes.
+p <- bind_rows(res_lmm_gada_saab, res_lmm_gada_mab, res_lmm_gada_rec) |>
+  filter(term == "gada_index") |>
+  filter(!grepl("Other", cell_cluster)) |>
+  filter(cell_cluster %in% all_immune) |> 
+  mutate(direction = ifelse(estimate < 0, "Lower", "Higher")) |>
+  mutate(p.adj = p.adjust(p.value, method = "fdr")) |> 
+  mutate(logpadj = -log10(p.adj)) |> 
+  arrange(desc(logpadj)) |>
+  ggplot(aes(x = forcats::fct_reorder(cell_cluster, -abs(statistic)), y = logpadj, fill = direction)) +
+  geom_bar(stat = "identity") +
+  labs(x = "Channel", y = "-log10(p.adj)") + 
+  mytheme$standard_new() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") + 
+  facet_wrap(~ donor_type, scales = "free_y", axes = "all")
+
+print(p)
+fn <- paste0(paste(today, "GADA", "Association", "celltype", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+### A3.3.2: Cell Clusters.
+
+```{r}
+### For Cell-clusters.
+p <- bind_rows(res_lmm_gada_saab, res_lmm_gada_mab, res_lmm_gada_rec) |> 
+  filter(term == "gada_index") |>
+  filter(!grepl("Other", cell_cluster)) |>
+  filter(grepl("Myeloid_|T_", cell_cluster)) |> 
+  filter(!cell_cluster %in% all_immune) |>
+  mutate(direction = ifelse(estimate < 0, "Lower", "Higher")) |>
+  mutate(p.adj = p.adjust(p.value, method = "fdr")) |> 
+  mutate(logpadj = -log10(p.adj)) |> 
+  arrange(desc(logpadj)) |>
+  ggplot(aes(x = forcats::fct_reorder(cell_cluster, -abs(statistic)), y = logpadj, fill = direction)) +
+  geom_bar(stat = "identity") +
+  labs(x = "Channel", y = "-log10(p.adj)") + 
+  mytheme$standard_new() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") + 
+  facet_wrap(~ donor_type, scales = "free_y", axes = "all", nrow = 2)
+
+print(p)
+fn <- paste0(paste(today, "GADA", "Association", "cell_cluster", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+
+- Partial association with GADA titers in mAAb - thats also why 
+IFN signature seen for beta-cells.
+
+
+# A4: Complex-Heatmap of Cohort. 
+
+Make Complex-Heatmap to show important Metadata.
+GSIS + GRS2 + Age + Donor-Type + AutoAb count.
+Define Insulitic Islets + ICIs.
+
+## A4.1: Define Insulitic Islets + ICIs.
+```{r label-insulitic}
+channels <- metadata(spe)$channels
+channels_imm <- c("INS")
+metadata_oi <- c("case_id", "age", "donor_type", "image_id", "diabetes_duration", 
+                 "number_of_AAbs", "GADA", "IA2A", "mIAA", "batch", "HbA1c")
+
+## Define Insulitic Islets + ICIs.
+## Filter Pancreatitis
+exprs_df <- as_tibble(scuttle::makePerCellDF(spe, features = channels_imm, assay.type = "exprs", use.dimred = FALSE)) |> 
+  select(all_of(channels_imm), cell_type, distance_to_islet, all_of(metadata_oi)) |> 
+  filter(donor_type != "Pancreatitis") |> 
+  group_by(case_id, age, donor_type, image_id, diabetes_duration, 
+          number_of_AAbs, GADA, IA2A, mIAA, HbA1c, batch) |>
+  mutate(islet_type = if_else(sum(cell_type == "Beta") > 0, "ICI", "IDI")) |> 
+  ungroup() |> 
+  # collapse by image_id.
+  distinct(case_id, age, donor_type, image_id, diabetes_duration, 
+           number_of_AAbs, GADA, IA2A, mIAA, HbA1c, islet_type, batch)
+
+# Get Image-IDs of insulitic islets.
+insulitic_ids2 <- colData(spe) |> 
+  as_tibble() |> 
+  select(image_id, cell_type, donor_type, islet_id, distance_to_islet) |>
+  mutate(insulitic2 = ifelse(distance_to_islet > -5, "inside", "outside")) |>
+  filter(cell_type %in% c("T_DN", "T_CD8", "T_CD4")) |> 
+  dplyr::count(donor_type, image_id, islet_id, insulitic2) |> 
+  filter(insulitic2 == "inside") |>
+  arrange(desc(n)) |>
+  filter(n >= 6) |>
+  distinct(image_id) |> pull(image_id)
+
+# Percent Insulitis.
+exprs_df2 <- exprs_df |> 
+    ungroup() |> 
+    mutate(insulitic = if_else(image_id %in% insulitic_ids2, "insulitis", "non-insulitis")) |> 
+    group_by(case_id, age, donor_type, diabetes_duration, 
+             number_of_AAbs, GADA, IA2A, mIAA, HbA1c) |>
+    mutate(sum_islets = n()) |> 
+    add_count(islet_type) |>
+    add_count(insulitic) |>
+    mutate(pr_ici = n / sum_islets * 100) |> 
+    mutate(pr_ins = nn / sum_islets * 100) |>
+    ungroup() |>
+    filter(islet_type == "ICI") |>
+    filter(insulitic == "non-insulitis") |>
+    distinct(case_id, pr_ici, pr_ins)
+```
+
+## A4.2 Add additional co-variates.
+
+First: Load in full metadata, which also contains the covariates such as serotypes, ICU time, cold-ischemia time.
+These are all downloaded from the nPOD dataportal. (Time: 2025-06-01).
+
+```{r check-metadata-oi} 
+library(childsds)
+
+fn_cases_full <- file.path(paths$folder_in, "cases_full.xlsx")
+cases_full <- readxl::read_excel(fn_cases_full) |> 
+  mutate(case_id = as.character(case_id)) |> 
+  select(case_id, weight_kg, age_years, height_cm, 
+        HLA_transplant, 
+        # Clinical variables:
+        admission_course, case_recovery_type, hemodiluted_status, 
+        clinical_history, cause_of_death, 
+        transit_time_minutes, ICU_time_days,  
+        downtime_minutes, 
+        # Treatment:
+        meds_home, meds_hospital) |> 
+  right_join(case_stages, by = "case_id") |> 
+  filter(donor_type != "Pancreatitis")
+
+cases_full <- cases_full |> 
+  filter(case_id %in% metadata(spe)$cases)
+
+cases_full
+
+cases_full |> distinct(meds_home) # very diverse.
+cases_full |> distinct(meds_hospital) # very diverse. 4 Narcan cases.
+cases_full |> dplyr::count(cause_of_death) # mostly anoxia, Head trauma or other (+DKA).
+cases_full |> dplyr::count(hemodiluted_status)
+
+cases_full |> dplyr::distinct(downtime_minutes) # not available.
+cases_full |> dplyr::count(case_recovery_type) # mostly DBD (brain-death); few DCDs (circulatory-death).
+```
+
+BMI needs to be age-adjusted for pediatric cases for more accurate classification.
+Use the CDC reference data to calculate BMI percentiles.
+
+Split into < 20 years and >= 20 years.
+Use the `childsds` package to calculate BMI percentiles.
+
+```{r cdc-bmi-percentiles}
+pediatric_cases <- cases_full |> 
+  filter(age < 20) |> 
+  arrange(age) |> 
+  select(case_id, gender, age, BMI, height_cm, weight_kg)
+
+pediatric_cases$bmi_percentile <- sds(pediatric_cases$BMI, 
+   age = pediatric_cases$age, 
+   sex = pediatric_cases$gender, 
+   male = "Male", female = "Female", 
+   ref = cdc.ref, 
+   item = "bmi", 
+   type = "perc")
+
+pediatric_cases <- pediatric_cases |> 
+  mutate(class_weight = case_when(bmi_percentile < 0.05 ~ "Underweight",
+                                 (bmi_percentile >= 0.05 & bmi_percentile < 0.85) ~ "Healthy weight",
+                                 (bmi_percentile >= 0.85 & bmi_percentile < 0.95) ~ "Overweight",
+                                  bmi_percentile >= 0.95 ~ "Obese"))     
+
+# Non-pediatric cases. Older than 20 years.
+non_pediatric_cases <- cases_full |> 
+  filter(age_years >= 20) |> 
+  arrange(age_years) |> 
+  select(case_id, age_years, BMI) |> 
+  mutate(class_weight = case_when(BMI < 18.5 ~ "Underweight",
+                                 (BMI >= 18.5 & BMI < 25) ~ "Healthy weight",
+                                 (BMI >= 25 & BMI < 30) ~ "Overweight",
+                                  BMI >= 30 ~ "Obese"))
+
+bmi_cases <- bind_rows(pediatric_cases, non_pediatric_cases) |> 
+  select(case_id, class_weight) |> 
+  arrange(case_id)
+```
+
+### A4.3 Add GRS2, TITER additional metadata.
+
+```{r complex-heatmap}
+library(ComplexHeatmap)
+library(circlize)
+
+## GRS2 data.
+grs2_sub <- grs2 |> 
+  select(case_id, GRS2_percentile)
+
+## TITER data.
+titers_sub <- aab_titers |> 
+  select(case_id, gada_index, ia2a_index, mIAA_index, znt8a_index, gada_pos, ia2a_pos, mIAA_pos, znt8a_pos) |> 
+  mutate(mIAA_index = ifelse(mIAA_pos == "Positive", mIAA_index * 100, 0)) |>
+  mutate(znt8a_index = ifelse(znt8a_pos == "Positive", znt8a_index * 100, 0)) |>
+  mutate(gada_index = ifelse(gada_pos == "Positive", gada_index, 0)) |>
+  mutate(ia2a_index = ifelse(ia2a_pos == "Positive", ia2a_index, 0)) |>
+  select(case_id, gada_index, ia2a_index, mIAA_index, znt8a_index) |> 
+  group_by(case_id) |> 
+  summarise(across(everything(), ~ mean(.x, na.rm = TRUE)), .groups = "drop")
+
+# Total-data:
+metadata_oi <- c("case_id", "age", "donor_type", "diabetes_duration", "batch",
+                 "number_of_AAbs", "GADA", "IA2A", "race", "gender", "mIAA", "ZnT8A", "HbA1c",
+                 "BMI", "C_peptide")
+
+case_information <- colData(spe)[, metadata_oi] |>
+  as_tibble() |> distinct() |> 
+  filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration")) |>
+  mutate(donor_type = case_when(
+    donor_type == "NoDiabetes" ~ "Control",
+    donor_type == "sAAb+" ~ "sAAb+",
+    donor_type == "mAAb+" ~ "mAAb+",
+    donor_type == "RecentOnset" ~ "Onset",
+    donor_type == "LongDuration" ~ "LD"
+  )) |> 
+  mutate(age_group = if_else(age >= 13, ">= 13", "< 13")) |>
+  mutate(age_group = factor(age_group, levels = c("< 13", ">= 13"))) |>
+  mutate(donor_type = factor(donor_type, levels = c("Control", "sAAb+", "mAAb+", "Onset", "LD"))) |>
+  dplyr::rename(sex = "gender", ethnicity = "race") |> 
+  mutate(across(c("number_of_AAbs", "GADA", "IA2A", "mIAA"), ~replace_na(.x, 0))) |> 
+  mutate(age_group_onset = age - diabetes_duration) |> 
+  mutate(age_group_onset = ifelse(age_group_onset < 13, "< 13", ">= 13")) |> 
+  mutate(age_group_onset = factor(age_group_onset, levels = c("< 13", ">= 13"))) |> 
+  mutate(sex = factor(sex, levels = c("Male", "Female"))) |> 
+  mutate(batch = factor(batch, levels = c(1, 2, 3, 4)))
+  # also 
+
+temp <- cases_full |> 
+  inner_join(bmi_cases, by = "case_id") |> 
+  mutate(cause_of_death = case_when(
+    "Anoxia" == cause_of_death ~ "Anoxia",
+    grepl("Head Trauma", cause_of_death) ~ "Head Trauma",
+    grepl("DKA", cause_of_death) ~ "DKA",
+    grepl("Other", cause_of_death) ~ "Other",
+    TRUE ~ "Other"
+  )) |> 
+  mutate(drug_use = ifelse(
+      grepl("Drug|drug|Alcohol|alcohol|MDMA|Amphetamine|amphetamine|Meth|meth|Marihuana|mariuhana|Cocaine|cocaine|Heroin|heroin|Crack|crack|Benzo|benzo|Nicotine|nicotine|smoking|Smoking", clinical_history), "Yes", "No")) |>
+  mutate(case_recovery_type = ifelse(case_id %in% c("8002", "8011"), "Organ Donor", case_recovery_type)) |> 
+  select(case_id, class_weight, case_recovery_type, ICU_time_days, transit_time_minutes, 
+        cause_of_death, drug_use, meds_hospital)
+
+# Joint
+input_complex_heatmap <- case_information |> 
+  left_join(grs2_sub, by = "case_id") |> 
+  left_join(titers_sub, by = "case_id") |>
+  left_join(exprs_df2, by = "case_id") |>
+  arrange(donor_type, case_id) |> 
+  left_join(temp, by = "case_id") |> 
+  mutate(ICU_time_days = as.numeric(stringr::str_remove(ICU_time_days, " days"))) |>
+  mutate(transit_time_minutes = stringr::str_remove(transit_time_minutes, "-")) |>
+  mutate(transit_time_minutes = as.numeric(stringr::str_remove(transit_time_minutes, " minutes"))) |> 
+  mutate(cause_of_death = ifelse(cause_of_death == "Head Trauma", "Trauma", cause_of_death))
+
+# Numeric Data:
+numeric_data_df <- input_complex_heatmap |> 
+  select(GRS2_percentile, ICU_time_days, transit_time_minutes, BMI, HbA1c, diabetes_duration, C_peptide, gada_index, znt8a_index, mIAA_index, ia2a_index, pr_ici, pr_ins)
+
+numeric_data <- as.matrix(numeric_data_df)
+rownames(numeric_data) <- input_complex_heatmap$case_id  # if your data has rownames
+is.numeric(numeric_data)
+```
+
+```{r}
+write.csv(input_complex_heatmap, file.path(paths$folder_out, paste0(today, "_complex_heatmap_metadata.csv")))
+```
+
+
+## A4.4 Plot Complex Heatmap.
+
+```{r plot-complex-heatmap}
+library(RColorBrewer)
+categorical_data <- as.matrix(input_complex_heatmap)
+rownames(categorical_data) <- categorical_data[, "case_id"]  # if your data has rownames
+
+all(rownames(numeric_data) == rownames(categorical_data))
+
+# Heatmap body: GRS2
+col_grs2 <- colorRamp2(c(0, 20, 40, 60, 80), 
+                        c("#440154FF","#3B518BFF","#20938CFF",
+                          "#6ACD5AFF","#FDE725FF"))
+
+# Heatmap body: ICI
+col_ici <- colorRamp2(c(100, 80, 60, 40, 20), 
+                        c("#440154FF","#3B518BFF","#20938CFF",
+                          "#6ACD5AFF","#FDE725FF"))
+
+# Heatmap body: Insulitic
+col_ins <- colorRamp2(c(100, 95, 90, 80, 50), 
+                        c("#440154FF","#3B518BFF","#20938CFF",
+                          "#6ACD5AFF","#FDE725FF"))
+
+# Heatmap body: BMI
+col_bmi <- colorRamp2(c(10, 20, 25, 30, 40), 
+                        c("#440154FF","#3B518BFF","#20938CFF",
+                          "#6ACD5AFF","#FDE725FF"))
+
+# Heatmap body: HbA1c
+col_hba1c <- colorRamp2(c(4, 5, 7, 10, 15), 
+                        c("#440154FF","#3B518BFF","#20938CFF",
+                          "#6ACD5AFF","#FDE725FF"))
+
+# Heatmap body: Time in ICU.
+col_icu <- colorRamp2(c(0, 2.5, 5, 7.5, 10), 
+                        c("#440154FF","#3B518BFF","#20938CFF",
+                          "#6ACD5AFF","#FDE725FF"))
+
+# Heatmap body: Transit time minutes.
+col_transit <- colorRamp2(c(200, 500, 750, 1000, 1250), 
+                        c("#440154FF","#3B518BFF","#20938CFF",
+                          "#6ACD5AFF","#FDE725FF"))
+
+# Heatmap body: C-peptide
+col_cpeptide <- colorRamp2(c(0.02, 0.2, 2.5, 5, 7), 
+                        c("#440154FF","#3B518BFF","#20938CFF",
+                          "#6ACD5AFF","#FDE725FF"))
+
+# Heatmap body: gada-index:
+col_gada <- colorRamp2(c(0, 20, 100, 300, 600), 
+                        c("#440154FF","#3B518BFF","#20938CFF",
+                          "#6ACD5AFF","#FDE725FF"))
+
+# Heatmap body: ia2a-index:
+col_ia2a <- colorRamp2(c(0, 5, 50, 100, 200), 
+                        c("#440154FF","#3B518BFF","#20938CFF",
+                          "#6ACD5AFF","#FDE725FF"))
+
+# Heatmap body: mIAA-index:
+col_miaa <- colorRamp2(c(0, 1, 2, 5, 10), 
+                        c("#440154FF","#3B518BFF","#20938CFF",
+                          "#6ACD5AFF","#FDE725FF"))
+
+# Heatmap body: ZnT8A-index:
+col_znt8a <- colorRamp2(c(0, 2, 5, 10, 15), 
+                        c("#440154FF","#3B518BFF","#20938CFF",
+                          "#6ACD5AFF","#FDE725FF"))
+
+### 2.1  Metadata features
+palettes$stages2 <- c("Control" = palettes$stages[[1]], "sAAb+" = palettes$stages[[2]], "mAAb+" = palettes$stages[[3]], "Onset" = palettes$stages[[4]], "LD" = palettes$stages[[5]])
+palettes$age_group <- c(">= 13" = "#FF0000", "< 13" =  "#FF7F7F")
+palettes$ab_pos <- c("0" = "white", "1" = "red")
+
+temp_cols <- brewer.pal(n = 8, name = "Dark2")
+palettes$sex <- c("Male" = temp_cols[1], "Female" = temp_cols[2])
+palettes$ethnicity <- c("Caucasian" = temp_cols[3], "Hispanic_Latino" = temp_cols[4],
+                        "African_American" = temp_cols[5])
+
+palettes$class_weight <- c("Underweight" = temp_cols[1], 
+                           "Healthy weight" = temp_cols[2],
+                           "Overweight" = temp_cols[3], 
+                           "Obese" = temp_cols[4])
+
+palettes$cause_of_death <- c("Anoxia" = temp_cols[1], 
+                            "Trauma" = temp_cols[2],
+                            "DKA" = temp_cols[3], 
+                            "Other" = temp_cols[4])
+palettes$batch <- c("1" = temp_cols[1], "2" = temp_cols[2], "3" = temp_cols[3], "4" = temp_cols[4])
+palettes$case_recovery_type <- c("Organ Donor" = temp_cols[1], "DCD Organ Donor" = temp_cols[2])
+palettes$drug_use <- c("Yes" = temp_cols[1], "No" = temp_cols[2])
+                          
+# 1. Row annotation
+ha_anno <- ComplexHeatmap::rowAnnotation(
+
+  Stage = factor(categorical_data[, "donor_type", drop = FALSE],levels = c("Control", "sAAb+", "mAAb+", "Onset", "LD")),
+  `Age group` = factor(categorical_data[, "age_group", drop = FALSE], levels = c("< 13", ">= 13")),
+  `Age group onset` = factor(categorical_data[, "age_group_onset", drop = FALSE], levels = c("< 13", ">= 13")),
+  GADA = categorical_data[, "GADA", drop = FALSE],
+  IA2A = categorical_data[, "IA2A", drop = FALSE],
+  mIAA = categorical_data[, "mIAA", drop = FALSE],
+  ZnT8A = categorical_data[, "ZnT8A", drop = FALSE],
+  Sex = factor(categorical_data[, "sex", drop = FALSE], levels = c("Male", "Female")),
+  Ethnicity = factor(categorical_data[, "ethnicity", drop = FALSE], levels = c("Caucasian", "Hispanic_Latino", "African_American")),
+  `BMI percentile` = factor(categorical_data[, "class_weight", drop = FALSE], levels = c("Underweight", "Healthy weight", "Overweight", "Obese")),
+  `Cause of death` = factor(categorical_data[, "cause_of_death", drop = FALSE], levels = c("Anoxia", "Trauma", "DKA", "Other")),
+  `Drug use` = factor(categorical_data[, "drug_use", drop = FALSE], levels = c("Yes", "No")),
+  `Batch` = factor(categorical_data[, "batch", drop = FALSE], levels = c(1, 2, 3, 4)),
+  `Case recovery type` = factor(categorical_data[, "case_recovery_type", drop = FALSE], levels = c("Organ Donor", "DCD Organ Donor")),
+  # CaseID = categorical_data[, "case_id", drop = FALSE],
+  col = list(
+    Stage = palettes$stages2,
+    `Age group` = palettes$age_group,
+    `Age group onset` = palettes$age_group,
+    GADA = palettes$ab_pos,
+    IA2A = palettes$ab_pos,
+    mIAA = palettes$ab_pos,
+    ZnT8A = palettes$ab_pos,
+    Sex = palettes$sex,
+    Ethnicity = palettes$ethnicity,
+    `BMI percentile` = palettes$class_weight,
+    `Cause of death` = palettes$cause_of_death,
+    `Drug use` = palettes$drug_use,
+    `Batch` = palettes$batch,
+    `Case recovery type` = palettes$case_recovery_type
+    # CaseID = palettes$cases
+  ),
+
+  border = TRUE,
+  gap = unit(1, "mm"),
+  simple_anno_size = unit(1, "cm")
+)
+
+# 2. Heatmap Bodies
+# Heatmap body for GRS2_percentile.
+h_grs2 <- ComplexHeatmap::Heatmap(
+        numeric_data[, "GRS2_percentile", drop = FALSE], 
+        name = "GRS2 percentile",
+        cluster_rows = FALSE,
+        cluster_columns = FALSE,
+        show_row_names = FALSE,
+        show_column_names = FALSE,
+        column_title = "GRS2 percentile",
+        col = col_grs2,
+        width = unit(1, "cm"),
+        column_title_rot = 90,
+        column_title_side = "bottom"  # 👈 Move to bottom
+)
+
+# Heatmap body for ICI
+h_ici <- ComplexHeatmap::Heatmap(
+        numeric_data[, "pr_ici", drop = FALSE], 
+        name = "ICI",
+        cluster_rows = FALSE,
+        cluster_columns = FALSE,
+        show_row_names = FALSE,
+        show_column_names = FALSE,
+        column_title = "pr_ICI",
+        col = col_ici,
+        width = unit(1, "cm"),
+        column_title_rot = 90,
+        column_title_side = "bottom"  # 👈 Move to bottom
+)
+
+# Heatmap body for Insulitic:
+h_ins <- ComplexHeatmap::Heatmap(
+        numeric_data[, "pr_ins", drop = FALSE], 
+        name = "Insulitic",
+        cluster_rows = FALSE,
+        cluster_columns = FALSE,
+        show_row_names = FALSE,
+        show_column_names = FALSE,
+        column_title = "pr_Insulitic",
+        col = col_ins,
+        width = unit(1, "cm"),
+        column_title_rot = 90,
+        column_title_side = "bottom"  # 👈 Move to bottom
+)
+
+# Heatmap body for BMI
+h_bmi <- ComplexHeatmap::Heatmap(
+        numeric_data[, "BMI", drop = FALSE],   
+        name = "BMI",
+        cluster_rows = FALSE,
+        cluster_columns = FALSE,
+        show_row_names = FALSE,
+        show_column_names = FALSE,
+        column_title = "BMI",
+        col = col_bmi,
+        width = unit(1, "cm"),
+        column_title_side = "bottom",
+        column_title_rot = 90)
+
+# Heatmap body for HbA1c
+h_hba1c <- ComplexHeatmap::Heatmap(
+        numeric_data[, "HbA1c", drop = FALSE],
+        name = "HbA1c",     
+        cluster_rows = FALSE,
+        cluster_columns = FALSE,
+        show_row_names = FALSE,
+        show_column_names = FALSE,
+        column_title = "HbA1c",
+        col = col_hba1c,
+        width = unit(1, "cm"),
+        column_title_side = "bottom",
+        column_title_rot = 90)
+
+# Heatmap body for ICU time
+h_icu <- ComplexHeatmap::Heatmap(
+        numeric_data[, "ICU_time_days", drop = FALSE],
+        name = "ICU time (days)",
+        cluster_rows = FALSE,
+        cluster_columns = FALSE,
+        show_row_names = FALSE,
+        show_column_names = FALSE,
+        column_title = "ICU time (days)",
+        col = col_icu,
+        width = unit(1, "cm"),
+        column_title_side = "bottom",
+        column_title_rot = 90)
+
+# Heatmap body for Transit time minutes
+h_transit <- ComplexHeatmap::Heatmap(
+        numeric_data[, "transit_time_minutes", drop = FALSE],
+        name = "Organ transit time (minutes)",
+        cluster_rows = FALSE,
+        cluster_columns = FALSE,
+        show_row_names = FALSE,
+        show_column_names = FALSE,
+        column_title = "Organ transit time (minutes)",
+        col = col_transit,
+        width = unit(1, "cm"),
+        column_title_side = "bottom",
+        column_title_rot = 90)
+
+# Heatmap body for C-peptide
+h_cpeptide <- ComplexHeatmap::Heatmap(
+        numeric_data[, "C_peptide", drop = FALSE],
+        name = "C_peptide",
+        cluster_rows = FALSE,
+        cluster_columns = FALSE,
+        show_row_names = FALSE,
+        show_column_names = FALSE,
+        column_title = "C-peptide (ng/mL)",
+        col = col_cpeptide,
+        width = unit(1, "cm"),
+        column_title_side = "bottom",
+        column_title_rot = 90)
+
+h_gada_index <- ComplexHeatmap::Heatmap(
+        numeric_data[, "gada_index", drop = FALSE],
+        name = "GADAindex",
+        cluster_rows = FALSE,
+        cluster_columns = FALSE,
+        show_row_names = FALSE,
+        show_column_names = FALSE,
+        column_title = "GADA index",
+        col = col_gada,
+        width = unit(1, "cm"),
+        column_title_side = "bottom",
+        column_title_rot = 90)
+
+h_zn8a_index <- ComplexHeatmap::Heatmap(
+        numeric_data[, "znt8a_index", drop = FALSE],
+        name = "ZnT8A index",
+        cluster_rows = FALSE,
+        cluster_columns = FALSE,
+        show_row_names = FALSE,
+        show_column_names = FALSE,
+        column_title = "ZnT8A index",
+        col = col_znt8a,
+        width = unit(1, "cm"),
+        column_title_side = "bottom",
+        column_title_rot = 90)
+
+h_ia2a_index <- ComplexHeatmap::Heatmap(
+        numeric_data[, "ia2a_index", drop = FALSE],
+        name = "IA2A index",
+        cluster_rows = FALSE,
+        cluster_columns = FALSE,  
+        show_row_names = FALSE,
+        show_column_names = FALSE,
+        column_title = "IA2A index",
+        col = col_ia2a,
+        width = unit(1, "cm"),
+        column_title_side = "bottom",
+        column_title_rot = 90)
+
+h_miaa_index <- ComplexHeatmap::Heatmap(
+        numeric_data[, "mIAA_index", drop = FALSE],         
+        name = "mIAA index",
+        cluster_rows = FALSE,
+        cluster_columns = FALSE,
+        show_row_names = FALSE,
+        show_column_names = FALSE,
+        column_title = "mIAA index",
+        col = col_miaa,
+        width = unit(1, "cm"),
+        column_title_side = "bottom",
+        column_title_rot = 90)
+
+
+### 3. Plot rich heatmap ###
+
+# Create HeatmapList object
+h_list <- 
+  h_grs2 + 
+  h_cpeptide +
+  h_hba1c + 
+  h_bmi +
+  h_icu + 
+  h_transit + 
+  h_gada_index +
+  h_zn8a_index +
+  h_ia2a_index +
+  h_miaa_index + 
+  h_ici +
+  h_ins +
+   ha_anno 
+
+# Display the heatmap
+path <- paste0(paste(today, "GRS2", "ComplexHeatmap", sep = "_"), ".png")
+fn <- file.path(paths$folder_script, path)
+
+# plotsave_param
+png(fn, width = 1200, height = 800)
+draw(h_list)
+dev.off()
+
+### 4. Plot REDUCED heatmap ###
+
+# Create HeatmapList object
+h_list <- 
+  ha_anno  + 
+  h_grs2 + 
+  h_cpeptide +
+  h_hba1c + 
+  h_bmi +
+  h_icu + 
+  h_transit
+
+# Display the heatmap
+path <- paste0(paste(today, "GRS2", "ComplexHeatmap_reduced", sep = "_"), ".png")
+fn <- file.path(paths$folder_script, path)
+
+# plotsave_param
+png(fn, width = 3700, height = 3700, res = 300)
+draw(h_list)
+dev.off()
+```
+
+## A4.5 Save final Immune cell data.
+```{r}
+save_final_spe <- FALSE
+if (save_final_spe){
+  fn_cases_full <- file.path(paths$folder_in, "cases_full.xlsx")
+  cases_full <- readxl::read_excel(fn_cases_full) |> 
+    mutate(case_id = as.character(case_id)) |> 
+    select(age_years, height_cm, weight_kg,
+          case_id, BMI, transit_time_minutes, ICU_time_days, cause_of_death, 
+          clinical_history, admission_course, hemodiluted_status, case_recovery_type)
+
+  cases_full_sub <- cases_full |> 
+    mutate(cause_of_death = case_when(
+      "Anoxia" == cause_of_death ~ "Anoxia",
+      grepl("Head Trauma", cause_of_death) ~ "Head Trauma",
+      grepl("DKA", cause_of_death) ~ "DKA",
+      grepl("Other", cause_of_death) ~ "Other",
+      TRUE ~ "Other"
+    )) |> 
+    mutate(cause_of_death = factor(cause_of_death, 
+      levels = c("Anoxia", "Head Trauma", "DKA", "Other"))) |> 
+    mutate(drug_use = ifelse(
+        grepl("Drug|drug|Alcohol|alcohol|MDMA|Amphetamine|amphetamine|Meth|meth|Marihuana|mariuhana|Cocaine|cocaine|Heroin|heroin|Crack|crack|Benzo|benzo|Nicotine|nicotine|smoking|Smoking", clinical_history), "yes", "no")) |> 
+    mutate(case_recovery_type = factor(case_recovery_type, levels = c("Organ Donor", "DCD Organ Donor"))) |> 
+    select(-c(hemodiluted_status, admission_course, clinical_history))
+
+  cases_full_sub <- cases_full_sub |> inner_join(bmi_cases, by = "case_id") |> 
+    mutate(transit_time_minutes = stringr::str_remove(transit_time_minutes, ".00 minutes")) |> 
+    mutate(ICU_time_days = stringr::str_remove(ICU_time_days, " days")) |> 
+    mutate(transit_time_minutes = abs(as.numeric(transit_time_minutes)),
+          ICU_time_days = as.numeric(ICU_time_days)) |> 
+    select(-BMI)
+
+  coldata_spe <- as_tibble(colData(spe)) |> 
+    select(-starts_with("RR_id"),
+           -starts_with("hemodiluted_status"),
+            -starts_with("cause_of_death"),
+            -starts_with("case_recovery_type"),
+            -starts_with("ICU_time_days"),
+            -starts_with("transit_time_minutes"),
+            -starts_with("meds_hospital"),
+            -starts_with("clinical_history"),
+            -starts_with("admission_course"),
+            -starts_with("age_years"),
+            -starts_with("age_group")) |>
+    mutate(age_group = case_when(
+      age < 13 ~ "< 13",
+      age >= 13 ~ ">= 13"
+    )) |> 
+    mutate(age_group = factor(age_group, levels = c("< 13", ">= 13")))
+
+  new_coldata <- coldata_spe |> left_join(cases_full_sub, by = c("case_id"))
+
+  ## Correct ordering.
+  ordering_cells <- colData(spe)$cell_id
+  final_coldata_df <- DataFrame(new_coldata)
+  rownames(final_coldata_df) <- final_coldata_df$cell_id
+  final_coldata_df <- final_coldata_df[ordering_cells, ]
+
+  colData(spe) <- final_coldata_df
+
+  saveRDS(spe, file.path(paths$home_git, "data", "spe_Immune_full.rds"))
+}
+
+```
+
+
+# A5 Association of Variables with Donor-Type.
+
+Which variables are correlated to donor-type?
+Kruskal-wallis test ("non-parametric ANOVA"): for continuous variables; chi-sq for categorical variables.
+
+```{r aov-chisq-donor-type}
+## Iterate over all numeric variables and test for significance.
+## Use Welch-test ANOVA (= assuming unequal variances).
+numeric_vars <- c("transit_time_minutes", "ICU_time_days", 
+                  "BMI", "age", 
+                  "GRS2_percentile", "HbA1c", "C_peptide")
+
+input_complex_heatmap <- input_complex_heatmap |> 
+  mutate(donor_type_num = as.numeric(donor_type))
+
+numeric_cov <- numeric_vars |> 
+  purrr::map(\(.x){
+    formula <- as.formula(paste(.x, "~ donor_type"))
+    broom::tidy(kruskal.test(input_complex_heatmap[[.x]], input_complex_heatmap$donor_type_num)) |> 
+        mutate(variable = .x) |> select(statistic, p.value, variable)
+  }) |> bind_rows()
+
+## Chi-sq gives warning - but returns equal values to fisher-test.
+factor_vars <- c("cause_of_death", "drug_use", "class_weight", "case_recovery_type", "ethnicity", "sex", "age_group", "batch")
+
+factor_cov <- factor_vars |> 
+  purrr::map(\(.x) {
+    broom::tidy(chisq.test(input_complex_heatmap[[.x]], input_complex_heatmap$donor_type)) |> 
+      mutate(variable = .x)  |>  select(statistic, p.value, variable)
+  }) |> bind_rows()
+
+p <- rbind(numeric_cov, factor_cov) |> 
+  mutate(p.adj = p.adjust(p.value, method = "fdr")) |> 
+  arrange(p.adj) |> 
+  select(variable, statistic, p.value, p.adj) |> 
+  # 2D heatmap with p.value and p.adj
+  ggplot(aes(x = reorder(variable, log10(p.adj)), y = -log10(p.adj))) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  geom_bar(stat = "identity") +
+  mytheme$standard_new() +
+  labs(x = "", y = "-log10(p.adj)") + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p)
+fn <- paste0(paste(today, "Association", "donor_type", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+
+P-adj and P-value as heatmap.
+```{r}
+plot_df <- rbind(numeric_cov, factor_cov) |> 
+  mutate(p.adj = p.adjust(p.value, method = "fdr")) |> 
+  arrange(p.adj) |> 
+  select(variable, statistic, p.value, p.adj) |> 
+  mutate(adjusted = -log10(p.adj)) |> 
+  mutate(unadjusted = -log10(p.value)) |> 
+  pivot_longer(cols = c(unadjusted, adjusted), names_to = "type", values_to = "value") |> 
+  mutate(type = factor(type, levels = c("unadjusted", "adjusted"))) |> 
+  dplyr::mutate(variable = case_when(
+    variable == "age_group" ~ "Age group",
+    variable == "drug_use" ~ "Drug use",
+    variable == "transit_time_minutes" ~ "Organ Transit time (minutes)",
+    variable == "ICU_time_days" ~ "ICU time (days)",
+    variable == "BMI" ~ "BMI",
+    variable == "age" ~ "Age",
+    variable == "GRS2_percentile" ~ "GRS2 percentile",
+    variable == "HbA1c" ~ "HbA1c",
+    variable == "C_peptide" ~ "C-peptide (ng/mL)",
+    variable == "cause_of_death" ~ "Cause of death",
+    variable == "class_weight" ~ "BMI percentile",
+    variable == "ethnicity" ~ "Ethnicity",
+    variable == "sex" ~ "Sex",
+    variable == "batch" ~ "Batch",
+    variable == "case_recovery_type" ~ "Case recovery type"
+  )) |> 
+  mutate(variable = factor(variable, levels = rev(c(
+    "Age", "Age group", "Sex", "Ethnicity", "BMI percentile", 
+    "Cause of death", "Drug use", "Batch", "Case recovery type",
+    "GRS2 percentile", "C-peptide (ng/mL)", "HbA1c", 
+    "BMI", "ICU time (days)", "Organ Transit time (minutes)"
+  ))))
+
+max1 <- max(plot_df$value)
+
+switch_pt <- 0.6 * max1  # where to flip text color (tweak if needed)
+
+lab_df <- plot_df %>%
+  mutate(
+    # show ">max" when values exceed the color scale cap
+    label  = case_when(
+      is.na(value)        ~ NA_character_,
+      value > max1        ~ paste0(">", label_number(accuracy = 0.1)(max1)),
+      TRUE                ~ label_number(accuracy = 0.01)(value)
+    ),
+    # choose text color based on (capped) fill intensity
+    txt_col = "black"
+  )
+
+# Rows to mark + contrast-aware label color
+p <- 
+  ggplot(plot_df, aes(type, variable, fill = value)) +
+  geom_tile() +
+  # text labels on tiles
+  geom_text(
+    data = lab_df,
+    aes(label = label, color = txt_col),
+    fontface = "bold", size = 6, na.rm = TRUE, show.legend = FALSE
+  ) + 
+  scale_fill_distiller(
+    palette = "Blues",
+    direction = 1,                 # light → dark blue as values increase
+    limits = c(0, max1),
+    oob = squish,                  # cap anything > thr at the top color
+    labels = c(0, 1.3, 3.0, 5.0, 7.0, 9.0),
+    breaks = c(0, 1.3, 3.0, 5.0, 7.0, 9.0),
+    na.value = "grey90",
+    guide = guide_colorbar(title.position = "top")
+  )+ 
+  labs(x = "", y = "Covariate",
+       fill = "-log10(p)", title = "Association to Disease Stage") +
+  mytheme$standard_new() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+fn <- paste0(paste(today, "Heatmap", "EffectSize", "Covariates", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+print(p)
+```
+
+
+
+Plot significantly associated variables with donor-type.
+```{r}
+### Games-Howell post-hoc test for significant numeric variables.
+p_values_transit_time <- rstatix::games_howell_test(
+  data = input_complex_heatmap, 
+  transit_time_minutes ~ donor_type, 
+  conf.level = 0.95, detailed = FALSE) |>
+  mutate(y.position = seq(2500/60, 2800/60, length.out = n()))
+
+### Plot transit time minutes with P.values
+p <- ggpubr::ggviolin(input_complex_heatmap |> 
+  mutate(transit_time_minutes = transit_time_minutes/60), 
+  x = "donor_type",
+  y = "transit_time_minutes", 
+  fill = "donor_type", outliers = FALSE, 
+  draw_quantiles = c(0.25, 0.5, 0.75), 
+  add = "point") + 
+  scale_fill_manual(values = palettes$stages2) + 
+  labs(x = "Stage", y = "Transit Time (hours)") +
+  mytheme$standard_new() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  ggpubr::stat_pvalue_manual(p_values_transit_time, hide.ns = TRUE, 
+  remove.bracket = FALSE, tip.length = 0.03, size = 8) + 
+  guides(legend.position = "none")
+
+print(p)
+fn <- paste0(paste(today, "Metadata", "TransitTime", "donor_type", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+test_df <- input_complex_heatmap |> 
+  mutate(cause_of_death = factor(cause_of_death, 
+    levels = c("Anoxia", "Trauma", "DKA", "Other"))) |>
+  select(cause_of_death, donor_type) |> 
+  as.data.frame()
+
+### Plot Cause-of-death with P.values?
+p <- ggstatsplot::ggbarstats(
+  data = test_df,
+  x = donor_type,
+  y = cause_of_death,
+  results.subtitle = TRUE,
+  bf.message = FALSE,
+  conf.level = FALSE
+) +
+  labs(caption = NULL, x= "Cause of Death") + 
+  scale_fill_manual(values = palettes$stages2)
+
+print(p)
+fn <- paste0(paste(today,  "Metadata", "CauseOfDeath", "donor_type", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+## Assocation of Variables to Percent Insulitic Islets!
+```{r vif-calculate}
+## LM
+model <- lm(data = input_complex_heatmap |> filter(donor_type %in% c("sAAb+", "mAAb+", "RecentOnset")), pr_ins ~ HbA1c + age + ia2a_index + mIAA_index)
+
+vif_values <- car::vif(model)
+vif_values
+summary(model)
+```
+
+```{r}
+### Scatterplot:
+ggpubr::ggscatter(input_complex_heatmap |> mutate(ia2a_index = log1p(ia2a_index)), x = "ia2a_index", y = "pr_ins", color = "donor_type", shape = "age_group") + 
+  scale_color_manual(values = palettes$stages2[2:4]) + 
+  labs(x = "ia2a_index", y = "Percent Insulitic Islets") + 
+  mytheme$standard_new() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggpubr::stat_cor(method = "spearman", label.y.npc = "top", label.x.npc = "left", size = 5) + 
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  facet_wrap(~donor_type, ncol = 2, scales = "free")
+```

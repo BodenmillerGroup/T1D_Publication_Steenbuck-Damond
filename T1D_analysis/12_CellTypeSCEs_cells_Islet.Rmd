@@ -1,0 +1,200 @@
+---
+title: "12_CellTypeSCEs_cells_Islet"
+author: "Nicolas Damond, Nathan Steenbuck"
+date: "Created: 24 May, 2022; Compiled: `r format(Sys.time(), '%d %b, %Y')`"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+if (rstudioapi::isAvailable()) {
+  script_name <- basename(rstudioapi::getSourceEditorContext()$path)
+} else {
+  script_name <- knitr::current_input()
+}
+
+cur_user <- Sys.info()[["user"]]
+script_name <- "12_CellTypeSCEs_cells_Islet.Rmd"
+
+if (cur_user == "ubuntu") {
+  source(file.path("/", "mnt", "T1D_Vol", "T1D_analysis", "analysis", "helpers.R"))
+  #n_cores <- future::availableCores() - 1
+  n_cores <- 4
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  knitr::opts_knit$set(root_dir = paths$home_data)
+} else {
+  source(file.path("/", "home", "nsteen", "scripts", "T1D_analysis", "analysis", "helpers.R"))
+  n_cores <- 8
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  paths$folder_script <- paths$cluster_folder_script
+  paths$folder_in <- paths$cluster_folder_in
+  paths$folder_out <- paths$cluster_home 
+  knitr::opts_knit$set(root_dir = paths$cluster_home)
+}
+
+seed <- 123456
+set.seed(seed)
+options <- furrr::furrr_options(seed = seed)
+# FIXME: maybe perform also Infiltration score?
+paths$prev <- paste("08_SubclusteringBeta", paths$object_type, paths$panel_type, sep = "_")
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# **Goal**
+
+The goal of this script is to generate separate SCE objects for each 
+of the main cell types in the dataset.  
+
+
+# **Settings**  
+
+## Load packages
+
+```{r packages, results='hide'}
+suppressPackageStartupMessages(c(
+  library(data.table),
+  library(dplyr),
+  library(SpatialExperiment)
+))
+```
+
+## Paths and settings
+
+```{r settings}
+# Paths
+if (!dir.exists(paths$folder_script)) dir.create(paths$folder_script)
+plotsave_param$path <- paths$folder_script
+plotsave_param_large$path <- paths$folder_script
+
+# Misc settings
+today <- gsub("-", "", Sys.Date())
+```
+
+##  Read in the data
+
+Load the SpatialExperiment (SPE) object saved at the previous step.
+
+```{r load-data}
+fn_spe <- file.path(paths$folder_out, paths$prev, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+spe <- readRDS(fn_spe)
+print(spe)
+```
+
+If it already exists, load the list that contains an SCE object for each cell type.
+
+```{r load-spe-list}
+fn_spes <- file.path(paths$folder_script, paste0("celltypes", "_", paths$panel_type, ".rds"))
+
+if (file.exists(fn_spes)) {
+  exists_spes <- TRUE
+  spes <- readRDS(fn_spes)
+  print(spes)
+} else {
+  exists_spes <- FALSE
+}
+```
+
+
+# **Generate the SCEs**
+
+## Define the channels
+
+Define the markers expressed in each cell type.
+
+```{r list-channels}
+# Define relevant cell types
+celltypes <- c("Beta", "Alpha", "Delta",
+               "Acinar", "Ductal", "Endothelial", "Macrophage")
+names(celltypes) <- c("cell_type", "cell_type", "cell_type",
+                      "cell_type", "cell_type", "cell_type", "cell_type")
+
+# Define the channels for each of the cell types
+channels_state <- c(
+  "Ki67", "CAIX", "HLA_ABC", "B2M", "C3", "PDL1", "CD155", "CD9",
+  "XBP1", "ERN1", "TXNIP", "WFS1", "NFkB", "ATPIF1", "MX1", "ADAR")
+channels_islets <- c("CHGA", "SYP", "ECad", "NKX2_2", "FoxA2", "PAX6",
+                     channels_state)
+channels_exo <- c("FoxA2", "ECad", "HBP", channels_state)
+
+## Assign Channels
+channels <- list()
+# Beta:
+channels[[celltypes[1]]] <- c(
+  "INS", "ProINS", "Cpep", "IAPP", "PCSK1", "PDX1", "NKX6_1", "ARX", channels_islets)
+# Alpha:
+channels[[celltypes[2]]] <- c(
+  "GCG", "ProGCG", "PCSK2", "ARX", channels_islets)
+# Beta:
+channels[[celltypes[3]]] <- c(
+  "SST", "PCSK1", "PCSK2", "PDX1", channels_islets)
+
+# Acinar:
+channels[[celltypes[4]]] <- c("AMY", channels_exo)
+# Ductal:
+channels[[celltypes[5]]] <- c("KRT19", "CFTR", channels_exo)
+# Endothelial:
+channels[[celltypes[6]]] <- c("CAV1", "VIM", channels_state)
+# Macrophages:
+channels[[celltypes[7]]] <- c("CD163", channels_state)
+print(channels)
+
+# Add the channels to the metadata of the main SCE object
+metadata(spe)$channels <- channels
+```
+
+## Save the main SCE
+
+`metadata(spe)$channels` now contains a list of channels expressed in each cell type.
+
+```{r save-spe}
+fn_spe <- file.path(paths$folder_out, paths$prev, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+print(spe)
+saveRDS(spe, fn_spe)
+```
+
+```{r remove_pancreatitis} 
+remove_panreatitis <- TRUE
+if (remove_panreatitis) {
+  spe <- spe[, spe$donor_type != "Pancreatitis"]
+}
+spe$donor_type <- factor(spe$donor_type, levels = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration")) # , "Pancreatitis"))
+
+## Peri-Islet cells - if distance_to_islet > -20
+spe$periislet <- ifelse(spe$distance_to_islet > -20, "periislet", "Nonperiislet")
+```
+## Generate a list of SCE objects
+
+```{r generate-spe-list}
+if (isFALSE(exists_spes)) {
+  # Generate the SCE list
+  spes <- list()
+  for (h in seq_along(celltypes)){
+    # Subset by channel and cell type
+    level <- names(celltypes[h])
+    spes[[h]] <- spe[channels[[h]], spe[[level]] == celltypes[h]]
+    
+    # Add channels to the metadata
+    metadata(spes[[h]])$channels <- metadata(spe)$channels[[celltypes[h]]]
+    
+    # Remove original reduced dimensions
+    reducedDims(spes[[h]]) <- NULL
+    
+    # Name the SCE objects
+    mainExpName(spes[[h]]) <- celltypes[h]
+  }
+  names(spes) <- celltypes
+}
+```
+
+
+## Save the SCEs list
+
+```{r save-spe-list}
+fn_spes <- file.path(paths$folder_script, paste0("celltypes", "_", paths$panel_type, '.rds'))
+print(spes)
+saveRDS(spes, fn_spes)
+```

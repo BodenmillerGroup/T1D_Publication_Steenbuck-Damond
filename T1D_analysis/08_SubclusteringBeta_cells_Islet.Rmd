@@ -1,0 +1,1358 @@
+---
+title: "08_SubclusteringBeta_cells_Islet"
+author: "Nathan Steenbuck"
+date: "Created: 24 May, 2024; Compiled: `r format(Sys.time(), '%d %b, %Y')`"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+if (rstudioapi::isAvailable()) {
+  script_name <- basename(rstudioapi::getSourceEditorContext()$path)
+} else {
+  script_name <- knitr::current_input()
+}
+
+cur_user <- Sys.info()[["user"]]
+script_name <- "08_SubclusteringBeta_cells_Islet.Rmd"
+
+if (cur_user == "ubuntu") {
+    source(file.path("/", "mnt", "central_nas", "projects", 
+    "type1_diabetes", "nathan", "T1D_Vol", "T1D_analysis", 
+    "analysis", "helpers.R"))
+  #n_cores <- future::availableCores() - 1
+  n_cores <- 4
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  knitr::opts_knit$set(root_dir = paths$home_data)
+  do_print <- FALSE
+} else {
+  source(file.path("/", "home", "nsteen", "scripts", "T1D_analysis", "analysis", "helpers.R"))
+  n_cores <- 8
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  paths$folder_script <- paths$cluster_folder_script
+  paths$folder_in <- paths$cluster_folder_in
+  paths$folder_out <- paths$cluster_home 
+  knitr::opts_knit$set(root_dir = paths$cluster_home)
+  do_print <- TRUE
+}
+
+seed <- 123456
+set.seed(seed)
+options <- furrr::furrr_options(seed = seed)
+paths$prev <- paste("08_CellTypesNonIslet", paths$object_type, paths$panel_type, sep = "_")
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+# **Goal**
+
+Given the importance of alpha & beta-cells in the Islet panel the data is further sub-clustered to
+a) Allow finer-grained alpha/beta-cell annotation.
+b) To facilitate detecting potential subpopulations. 
+c) Todo: check islet-like cells.
+
+# **Settings**  
+
+## Load packages
+
+```{r packages, results='hide'}
+suppressPackageStartupMessages(c(
+  library(data.table),
+  library(dplyr),
+  library(SpatialExperiment),
+  library(parallel),
+  library(RSpectra)
+))
+```
+
+## Paths and settings
+
+```{r settings}
+# Paths
+if (!dir.exists(paths$folder_script)) dir.create(paths$folder_script)
+plotsave_param$path <- paths$folder_script
+plotsave_param_large$path <- paths$folder_script
+
+# Misc settings
+today <- gsub("-", "", Sys.Date())
+```
+
+##  Read in the data
+
+Load the SpatialExperiment (SPE) object saved at the previous step.
+
+```{r load-data}
+fn_spe <- file.path(paths$folder_out, paths$prev, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+spe <- readRDS(fn_spe)
+print(spe)
+```
+
+# Jointly subcluster Alpha and beta-cells.
+
+## Prepare Data
+Select alpha cells and Beta-cells.
+
+```{r subset_alphabeta}
+alpha_beta <- spe[, spe$cell_type %in% c("Alpha", "Beta")]
+fn <- file.path(paths$folder_script, paste0(paths$object_type, "_", paths$panel_type, "_AlphaBeta.rds"))
+saveRDS(alpha_beta, fn)
+# alpha_beta <- readRDS(fn)
+```
+
+Remove Pancreatitis samples.
+
+```{r remove-pancreatitis}
+## Select Subset & appropriate markers.
+remove_pancreatitis <- TRUE
+if (remove_pancreatitis) {
+  alpha_beta <- alpha_beta[, alpha_beta$donor_type != "Pancreatitis"]
+}
+```
+
+Select Features. -> No ER-stress markers. 
+```{r select_features}
+features_oi <- c(# Beta:
+                 "INS", "ProINS", "Cpep", "IAPP", "PCSK1", "NKX6_1", "PDX1", 
+                 # Inflammation
+                 "ADAR", "HLA_ABC", "B2M", "MX1",
+                 # Delta:
+                 "CD9", "SST",
+                 # Alpha:
+                 "ARX", "CHGA", "GCG", "ProGCG", "PCSK2",
+                 # Islet-cell TFs
+                 "NKX2_2", "PAX6", "FoxA2")
+
+## Select subset
+nb_cells <- 50000
+
+# Subset the SPE object (nb_cells (50.000 per case)
+set.seed(seed)
+cell_subset <- as_tibble(cbind(rn = rownames(colData(alpha_beta)),
+                               case_id = colData(alpha_beta)$case_id)) |> 
+  group_by(case_id) |>
+  sample_n(nb_cells, replace = TRUE) |>
+  pull(rn) |>
+  unique()
+
+# Keep the subset cell ids in SPE metadata
+metadata(alpha_beta)[["subset"]] <- sort(as.vector(cell_subset))
+
+## Subset Alpha-beta cells. Note: now only take features. Run on full dataset.
+# sce_sub <- alpha_beta[features_oi, metadata(alpha_beta)[["subset"]]]
+sce_sub <- alpha_beta[features_oi, ]
+```
+
+
+## Dimensionality Reduction
+
+### UMAP
+Run UMAP of selected features using arcsinh-transformed assay.
+```{r umap}
+set.seed(222)
+cur_assay <- "exprs"
+dimred_name <- paste("UMAP", cur_assay, "beta_alpha", sep = "_")
+
+cur_umap <- uwot::umap(t(assay(sce_sub, cur_assay)), n_neighbors = 15) # , n_threads = 4)
+colnames(cur_umap) <- c("UMAP1", "UMAP2")
+rownames(cur_umap) <- colnames(assay(sce_sub, cur_assay))
+reducedDim(sce_sub, dimred_name) <- cur_umap
+remove(cur_umap)
+```
+
+### Prepare data for visualization.
+
+Data is fetched from the SPE object and prepared for plotting.
+Scaled-assay is retrieved just for easier visualization. 
+
+```{r get_umap_dfs}
+cur_assay <- "scaled"
+df_img <- scuttle::makePerCellDF(
+  x = sce_sub,
+  assay.type = cur_assay,
+  features = features_oi,
+  use.coldata = c("cell_type", "donor_type", "case_id", "image_id"),
+  use.dimred = TRUE
+)  |> as_tibble(rownames = "cell_id") |> 
+  dplyr::select(cell_id, cell_type, donor_type, image_id, case_id, starts_with("UMAP"), all_of(features_oi))
+```
+
+### Plot UMAP
+Plot UMAP. Color cells by cell type and donor type.
+
+-> Results: separation into 3 major clusters (Beta, Alpha + ICI, ALpha + IDI).
+Also multiple smaller clusters.
+
+```{r plot_umap}
+## pivot-longer.
+palette_ct <- palettes$colors[1:2]
+
+## Cell Type
+p <- plot_dim_red(dat = df_img, dimred = dimred_name, color_by = "cell_type", palette = palette_ct)
+fn <- paste(paste(today, "UMAP", "alpha_beta", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+## Donor Type
+q <- plot_dim_red(dat = df_img, dimred = dimred_name, color_by = "donor_type", palette = palettes$stages)
+fn <- paste(paste(today, "UMAP", "alpha_beta", "donor", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, q), plotsave_param))
+```
+
+### Channel Visualization
+
+Plot channels on UMAP.
+
+-> Observe "Inflammation-Cluster" defined by strong HLA-ABC expression.
+Also: ARX, MX1, B2M upregulation. 
+
+
+```{r plot_dim_redchannels}
+df_img_long <- df_img |> 
+  tidyr::pivot_longer(cols = all_of(features_oi), names_to = "channel", values_to = cur_assay)
+
+p <- plot_dim_red_channels(dat = df_img_long, censor_val = 0.95, dimred = dimred_name, expr_values = cur_assay, channels = features_oi)
+fn <- paste(paste(today, "UMAP", "alpha_beta_channels", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+## Plot only specific markers on UMAP.
+umap_channels <- c("ProINS", "NKX6_1", "GCG", "PAX6",  
+                   "ARX", "HLA_ABC", "B2M", "MX1", "IAPP")
+
+p <- plot_dim_red_channels(dat = df_img_long, censor_val = 0.95, dimred = dimred_name, expr_values = cur_assay, channels = umap_channels)
+fn <- paste(paste(today, "UMAP", "alpha_beta_channels_reduced", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+
+## Subcluster alpha  & beta cells
+
+Use RPhenoGraph to subcluster the cells; using a **k** of 30. 
+
+```{r subclustering}
+set.seed(seed)
+k <- 30
+clust_name <- "PhenoGraph"
+
+cur_pheno_annoy <- Rphenoannoy::Rphenoannoy(t(assay(sce_sub, cur_assay)), k = k)
+
+cur_pheno <- DataFrame(cur_pheno_annoy[[2]]$membership)
+rownames(cur_pheno) <- colnames(assay(sce_sub, cur_assay))
+colData(sce_sub)[, clust_name] <- cur_pheno
+sce_sub[[clust_name]] <- factor(sce_sub[[clust_name]], levels = unique(sce_sub[[clust_name]]))
+```
+
+Plot abundances of each cluster.
+```{r plot_barplot_abundances}
+tib <- tibble(n = c(table(sce_sub[[clust_name]])), cluster = names(table(sce_sub[[clust_name]])))
+p <- tib  |> 
+  # barplot
+  ggplot(aes(x = reorder(cluster, n), y = n)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(x = "Cluster", y = "Number of cells") +
+  mytheme$standard()
+
+if (do_print) print(p)
+fn <- paste0(paste(today, "Clusters", clust_name, "Barplot",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+### Visualize Expression of clusters.
+Expression is plotted as a heatmap for the subclusters.
+Manual check: potential potential very rare clusters (see barplot).
+```{r plot_heatmap}
+hm <- summarize_heatmap(sce_sub,
+                        expr_values = "exprs",
+                        cluster_by = clust_name)
+# Remove cluster 40 (very low abundance)
+hm <- hm[-40, ]
+
+# Display the heatmap
+fn <- paste0(paste(today, "Clusters", clust_name, "Heatmap",
+                   sep = "_"), ".html")
+heatmaply::heatmaply(
+  heatmaply::normalize(hm), main = clust_name,
+  file = file.path(paths$folder_script, fn))
+```
+
+## Visualize UMAP + coordinates.
+
+Plot UMAP as above, but now add centroids + Cluster name.
+```{r umap_coordinates}
+## Plot UMAP again.
+df_img2 <- scuttle::makePerCellDF(
+  x = sce_sub,
+  assay.type = cur_assay,
+  features = rownames(sce_sub),
+  use.coldata = c("cell_type", "donor_type", "case_id", "image_id", clust_name),
+  use.dimred = TRUE
+)  |> as_tibble(rownames = "cell_id") |> 
+  dplyr::select(cell_id, cell_type, donor_type, image_id, case_id, starts_with("UMAP"), all_of(clust_name), all_of(features_oi)) |> 
+  filter(PhenoGraph != "40") # Remove cluster 40 (very low abundance)
+
+# Calculate centroids of each cluster
+centroids <- df_img2  |> 
+  select(dplyr::all_of(c(x = paste0(dimred_name, ".1"), y = paste0(dimred_name, ".2"))), all_of(clust_name)) |> 
+  group_by(PhenoGraph) |> 
+  summarise(x = mean(x), y = mean(y))
+
+p <- plot_dim_red(dat = df_img2, dimred = dimred_name, color_by = clust_name, palette = palettes$colors50)
+
+## Add Centroids
+p <- p + geom_text(data = centroids, aes(x = x, y = y, label = as.factor(PhenoGraph)), 
+                   color = "black", vjust = -1)
+if (do_print) print(p)
+fn <- paste0(paste(today, "Clusters", clust_name, dimred_name, sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+**Beta-cells:**
+- Cluster 24: IAPP-INS+ cells - non-inflamed.
+  - PCSK1- as well. 
+
+- Cluster 37 + 11: Acute Inflammation (MHC-I) with ADAR/MX1 (mixed alpha/beta).
+- Cluster 26 + 15: Non-acute Inflammation (MHC-I) without ADAR/MX1.
+
+Special clusters:
+- 27: CD9high
+- 7: MX1high.
+
+```{r cases-to-del}
+## To del: LD + REC with < 30 Beta-cells. 
+to_del <- df_img2 |> 
+  filter(cell_type == "Beta") |> 
+  dplyr::count(case_id) |> arrange(n) |> 
+  filter(n < 30) |> pull(case_id)
+print(to_del)
+```
+
+```{r}
+## Make boxplot with counts per case-id. 
+df_temp <- df_img2 |> 
+  filter(cell_type == "Beta") |> 
+  filter(!case_id %in% to_del) |>
+  filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset")) |>
+  mutate(case_id = factor(case_id, levels = unique(case_id))) |>
+  dplyr::count(PhenoGraph, case_id, donor_type) |> 
+  tidyr::complete(case_id, PhenoGraph, fill = list(n = 0))
+
+case_stages <- df_img2 |> 
+  distinct(case_id, donor_type)
+
+counts_all <- df_temp |> 
+  left_join(case_stages, by = "case_id") |>
+  select(case_id, PhenoGraph, donor_type = donor_type.y, n, case_id) 
+```
+
+Briefly test which clusters have association to stages.
+
+```{r association-to-stages}
+counts_all |> 
+  mutate(donor_type = factor(donor_type, levels = metadata(sce_sub)$stages[1:4])) |>
+  mutate(donor_type_num = as.numeric(donor_type)) |> 
+  ungroup() |> 
+  tidyr::nest(data = -PhenoGraph) |> 
+  mutate(test = purrr::map(data, ~ broom::tidy(lm(n ~ donor_type_num, data = .x)))) |>
+  tidyr::unnest(test) |> 
+  filter(term != "(Intercept)") |> 
+  arrange(p.value)
+```
+
+### Associated Results:
+**Lost:**
+- 4, 8: -> look like "healthy" beta-cells (very high hormone expression).
+- 6: Alpha-cells (very high alpha-cell hormones), but with faint IAPP/PCSK1?
+
+**Gained:**
+- 26, 15: 
+  - Non-acute Inflammation (MHC-I) without ADAR/MX1 
+    and with **very low IAPP**.
+  - typical for progression.
+- 33: stressed alpha-cell? -> can ignore. too rare.
+- 17: inflamed alpha-cells
+- 37: acute inflammation (MHC-I) with ADAR/MX1 (mixed).
+- 35: alpha-cell. Status unclear.
+- 24: IAPP-INS+ cells.
+
+```{r plot-clusters-per-case}
+clusters_oi <- c("4", "6", "8", "24", "26", "15", "33", "17", "37", "35",
+                 "5", "28")
+
+purrr::walk(clusters_oi, function(cl) {
+  p <- df_temp |> 
+    filter(PhenoGraph == cl) |> 
+    left_join(case_stages, by = "case_id") |> 
+    select(case_id, PhenoGraph, donor_type = donor_type.y, n, case_id)  |> 
+    mutate(donor_type = factor(donor_type, levels = metadata(sce_sub)$stages[1:4])) |>
+    ggplot(aes(x = donor_type, y = log10(n), fill = donor_type)) +
+    geom_boxplot(outliers = FALSE) +
+    geom_jitter(width = 0.1) + 
+    labs(x = "Donor Type", y = "log: Number of cells") +
+    mytheme$standard() +
+    scale_fill_manual(values = palettes$stages[1:4]) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  if (do_print) print(p)
+  fn <- paste0(paste(today, "BetaCells", "CountsPerCase", cl, sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param))
+})
+```
+
+
+# Subclustering with ER-stress markers. 
+
+
+Select Features. -> No ER-stress markers. 
+```{r select_features}
+features_oi <- c(# Beta:
+                 "INS", "ProINS", "Cpep", "IAPP", "PCSK1", "NKX6_1", "PDX1", 
+                 # Inflammation
+                 "ADAR", "HLA_ABC", "B2M", "MX1",
+                 # ER-stress + INflamm.
+                 "XBP1", "ERN1", "TXNIP", "WFS1", "NFkB", "ATPIF1", "CD155",
+                 # Delta:
+                 "CD9", "SST",
+                 # Alpha:
+                 "ARX", "CHGA", "GCG", "ProGCG", "PCSK2",
+                 # Islet-cell TFs
+                 "NKX2_2", "PAX6", "FoxA2")
+  
+## Select subset
+nb_cells <- 50000
+
+# Subset the SPE object (nb_cells (50.000 per case)
+set.seed(seed)
+cell_subset <- as_tibble(cbind(rn = rownames(colData(alpha_beta)),
+                               case_id = colData(alpha_beta)$case_id)) |> 
+  group_by(case_id) |>
+  sample_n(nb_cells, replace = TRUE) |>
+  pull(rn) |>
+  unique()
+
+# Keep the subset cell ids in SPE metadata
+metadata(alpha_beta)[["subset_ER"]] <- sort(as.vector(cell_subset))
+
+## Subset Alpha-beta cells. Note: now only take features. Run on full dataset.
+# sce_sub <- alpha_beta[features_oi, metadata(alpha_beta)[["subset"]]]
+sce_sub <- alpha_beta[features_oi, ]
+```
+
+
+## Dimensionality Reduction
+
+### UMAP
+Run UMAP of selected features using arcsinh-transformed assay.
+```{r umap-er}
+set.seed(222)
+cur_assay <- "exprs"
+dimred_name <- paste("UMAP", cur_assay, "beta_alpha_ER", sep = "_")
+
+cur_umap <- uwot::umap(t(assay(sce_sub, cur_assay)), n_neighbors = 15) # , n_threads = 4)
+colnames(cur_umap) <- c("UMAP1", "UMAP2")
+rownames(cur_umap) <- colnames(assay(sce_sub, cur_assay))
+reducedDim(sce_sub, dimred_name) <- cur_umap
+remove(cur_umap)
+```
+
+### Prepare data.
+
+Data is fetched from the SPE object and prepared for plotting.
+Scaled-assay is retrieved just for easier visualization. 
+
+```{r get_umap_dfs-er}
+cur_assay <- "scaled"
+df_img <- scuttle::makePerCellDF(
+  x = sce_sub,
+  assay.type = cur_assay,
+  features = features_oi,
+  use.coldata = c("cell_type", "donor_type", "case_id", "image_id"),
+  use.dimred = TRUE
+)  |> as_tibble(rownames = "cell_id") |> 
+  dplyr::select(cell_id, cell_type, donor_type, image_id, case_id, starts_with("UMAP"), all_of(features_oi))
+```
+
+### Plot UMAP
+Plot UMAP.
+Plot the UMAP of the selected features colored by cell type and donor type.
+
+-> Results: separation into 3 major clusters (Beta, Alpha + ICI, ALpha + IDI).
+Also multiple smaller clusters.
+
+```{r plot_umap}
+## pivot-longer.
+palette_ct <- palettes$colors[1:2]
+
+## Cell Type
+p <- plot_dim_red(dat = df_img, dimred = dimred_name, color_by = "cell_type", palette = palette_ct)
+fn <- paste(paste(today, "UMAP", "alpha_beta", "ER", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+## Donor Type
+q <- plot_dim_red(dat = df_img, dimred = dimred_name, color_by = "donor_type", palette = palettes$stages)
+fn <- paste(paste(today, "UMAP", "alpha_beta", "donor", "ER", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, q), plotsave_param))
+```
+
+### Plot Channels
+
+Plot channels on UMAP.
+
+-> Observe "Inflammation-Cluster" defined by strong HLA-ABC expression.
+Also: ARX, MX1, B2M upregulation. 
+
+
+```{r plot_dim_redchannels}
+df_img_long <- df_img |> 
+  tidyr::pivot_longer(cols = all_of(features_oi), names_to = "channel", values_to = cur_assay)
+
+p <- plot_dim_red_channels(dat = df_img_long, censor_val = 0.95, dimred = dimred_name, expr_values = cur_assay, channels = features_oi)
+fn <- paste(paste(today, "UMAP", "alpha_beta_channels", "ER", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+## Plot only specific markers on UMAP.
+umap_channels <- c("ProINS", "NKX6_1", "GCG", "PAX6",  
+                   "ARX", "HLA_ABC", "B2M", "MX1", "IAPP")
+
+p <- plot_dim_red_channels(dat = df_img_long, censor_val = 0.95, dimred = dimred_name, expr_values = cur_assay, channels = umap_channels)
+fn <- paste(paste(today, "UMAP", "alpha_beta_channels_reduced", "ER", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+
+# Subcluster alpha  & beta cells
+
+Use RPhenoGraph to subcluster the cells; using a **k** of 30. 
+
+```{r subclustering}
+set.seed(seed)
+k <- 30
+clust_name <- "PhenoGraph"
+
+cur_pheno_annoy <- Rphenoannoy::Rphenoannoy(t(assay(sce_sub, cur_assay)), k = k)
+
+cur_pheno <- DataFrame(cur_pheno_annoy[[2]]$membership)
+rownames(cur_pheno) <- colnames(assay(sce_sub, cur_assay))
+colData(sce_sub)[, clust_name] <- cur_pheno
+sce_sub[[clust_name]] <- factor(sce_sub[[clust_name]], levels = unique(sce_sub[[clust_name]]))
+```
+
+Plot abundances of each cluster.
+```{r plot_barplot_abundances}
+tib <- tibble(n = c(table(sce_sub[[clust_name]])), cluster = names(table(sce_sub[[clust_name]])))
+
+p <- tib |> 
+  # barplot
+  ggplot(aes(x = reorder(cluster, n), y = n)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(x = "Cluster", y = "Number of cells") +
+  mytheme$standard()
+
+if (do_print) print(p)
+fn <- paste0(paste(today, "Clusters", clust_name, "Barplot", "ER",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+## Plot Heatmap.
+Expression is plotted as a heatmap for the subclusters.
+```{r plot_heatmap}
+hm <- summarize_heatmap(sce_sub,
+                        expr_values = "exprs",
+                        cluster_by = clust_name)
+# Remove cluster 40 (very low abundance)
+hm <- hm[-c(48, 50, 54), ]
+# Display the heatmap
+fn <- paste0(paste(today, "Clusters", clust_name, "Heatmap", "ER",
+                   sep = "_"), ".html")
+heatmaply::heatmaply(
+  heatmaply::normalize(hm), main = clust_name,
+  file = file.path(paths$folder_script, fn))
+```
+
+
+## Plot UMAP with coordinates.
+
+Plot UMAP as above, but now add centroids + Cluster name.
+```{r umap_coordinates}
+## Plot UMAP again.
+df_img2 <- scuttle::makePerCellDF(
+  x = sce_sub,
+  assay.type = cur_assay,
+  features = rownames(sce_sub),
+  use.coldata = c("cell_type", "donor_type", "case_id", "image_id", clust_name),
+  use.dimred = TRUE
+)  |> as_tibble(rownames = "cell_id") |> 
+  dplyr::select(cell_id, cell_type, donor_type, image_id, case_id, starts_with("UMAP"), all_of(clust_name), all_of(features_oi)) |> 
+  filter(!PhenoGraph %in% c("48", "50", "54")) # Remove cluster 40 (very low abundance)
+
+# Calculate centroids of each cluster
+centroids <- df_img2  |> 
+  select(dplyr::all_of(c(x = paste0(dimred_name, ".1"), y = paste0(dimred_name, ".2"))), all_of(clust_name)) |> 
+  group_by(PhenoGraph) |> 
+  summarise(x = mean(x), y = mean(y))
+
+p <- plot_dim_red(dat = df_img2, dimred = dimred_name, color_by = clust_name, palette = palettes$colors50)
+
+## Add Centroids
+p <- p + geom_text(data = centroids, aes(x = x, y = y, label = as.factor(PhenoGraph)), 
+                   color = "black", vjust = -1)
+if (do_print) print(p)
+fn <- paste0(paste(today, "Clusters", clust_name, dimred_name, "ER", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+```{r}
+## Make boxplot with counts per case-id. 
+df_temp <- df_img2 |> 
+  filter(cell_type %in% c("Beta", "Alpha")) |> 
+  filter(!case_id %in% to_del) |>
+  filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset")) |>
+  mutate(case_id = factor(case_id, levels = unique(case_id))) |>
+  dplyr::count(PhenoGraph, case_id, donor_type, cell_type) |> 
+  tidyr::complete(case_id, PhenoGraph, cell_type, fill = list(n = 0))
+
+case_stages <- df_img2 |> 
+  distinct(case_id, donor_type)
+
+counts_all <- df_temp |> 
+  left_join(case_stages, by = "case_id") |>
+  select(case_id, cell_type, PhenoGraph, donor_type = donor_type.y, n, case_id) 
+```
+
+Briefly test which clusters have association to stages.
+
+```{r association-to-stages}
+counts_all |> 
+  mutate(donor_type = factor(donor_type, levels = metadata(sce_sub)$stages[1:4])) |>
+  mutate(donor_type_num = as.numeric(donor_type)) |> 
+  ungroup() |> 
+  tidyr::nest(data = -c(PhenoGraph, cell_type)) |> 
+  mutate(test = purrr::map(data, ~ broom::tidy(lm(n ~ donor_type_num, data = .x)))) |>
+  tidyr::unnest(test) |> 
+  filter(term != "(Intercept)") |> 
+  arrange(p.value)
+```
+Note: p-values are going down in comparison to above. 
+
+**Loss:**
+- 3: ALpha-cells, with pot. some beta-cells. Hormone-high + TXNIP/NFkB-high.
+- 7: Heatlhy beat-clels. High-levels of TXNIP, WFS1, 
+- 10: ATPIF1-high. Hormone-high.
+- 23: ARX/B2Mhigh; all hormones low. -> ???
+- 29: Non-inflamed alpha-cells.
+- 5: Highest ER-stress protein levels in beta-cells.
+- 24: Highest ER-stress protein levels in alpha-cells. (case biased).
+
+**Gain:**
+- 41: Alpha-cells inflamed.
+- 34: Beta-cells inflamed. INS+MHC-I+ & IAPP/XBP1/CD155/low
+- 42: Beta-cells inflamed (MHC-I) & IAPPlow. Mid stress markers.
+- 35: inflamed, likely alpha-cells.
+
+Of interest:
+
+- 51: Cells with ERN1high, XBPhigh, Inflammation-high!!
+  - unclear if beta-cells or alpha-cells.
+  - only in mAAb+ and Recent-Onset samples!
+
+```{r plot-clusters-per-case}
+clusters_oi <- c("3", "7", "10", "23", "29", "41", "27", "33", "34", "42", "35", "49", "51", "5", "24")
+
+purrr::walk(clusters_oi, function(cl) {
+  p <- df_temp |> 
+    filter(PhenoGraph == cl) |> 
+    left_join(case_stages, by = "case_id") |> 
+    select(case_id, PhenoGraph, cell_type, donor_type = donor_type.y, n, case_id)  |> 
+    mutate(donor_type = factor(donor_type, levels = metadata(sce_sub)$stages[1:4])) |>
+    ggplot(aes(x = donor_type, y = log10(n), fill = donor_type)) +
+    geom_boxplot(outliers = FALSE) +
+    geom_jitter(width = 0.1) + 
+    labs(x = "Donor Type", y = "log: Number of cells") +
+    mytheme$standard() +
+    scale_fill_manual(values = palettes$stages[1:4]) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+    facet_wrap(~ cell_type, ncol = 1)
+  
+  if (do_print) print(p)
+  fn <- paste0(paste(today, "BetaCells", "CountsPerCase_ER", cl, sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param))
+})
+```
+
+Show examples for cluster 51:
+```{r plot-cluster51}
+df_img2 |> 
+  filter(PhenoGraph == "51") |>
+  dplyr::count(image_id, case_id, cell_type) |>
+  arrange(desc(n)) |> filter(cell_type == "Beta")
+
+df_img2 |> 
+  filter(PhenoGraph == "51") |>
+  filter(case_id != "6534") |> 
+  dplyr::count(image_id, case_id, cell_type) |>
+  arrange(desc(n))
+```
+
+# Use only mAAb+ & RecentOnset
+
+-> We are especially interested in mAAb+ and RecentOnset samples.
+Therefore, reclustering only these samples.
+
+## Subclustering
+```{r mAAB_REC}
+## Select Subset & appropriate markers.
+maab_ro_only <- alpha_beta[, alpha_beta$donor_type %in% c("mAAb+", "RecentOnset")]
+
+features_oi <- c(# Beta:
+                 "INS", "ProINS", "Cpep", "IAPP", "PCSK1", "NKX6_1", "PDX1", 
+                 # Inflammation
+                 "ADAR", "HLA_ABC", "B2M", "MX1",
+                 # Delta:
+                 "CD9", "SST",
+                 # Alpha:
+                 "ARX", "CHGA", "GCG", "ProGCG", "PCSK2",
+                 # Islet-cell TFs
+                 "NKX2_2", "PAX6", "FoxA2")
+
+## Select subset
+nb_cells <- 5000
+
+# Subset the SPE object (nb_cells per case)
+set.seed(seed)
+cell_subset <- as_tibble(cbind(rn = rownames(colData(maab_ro_only)),
+                               case_id = colData(maab_ro_only)$case_id)) |> 
+  group_by(case_id) |>
+  sample_n(nb_cells, replace = TRUE) |>
+  pull(rn) |>
+  unique()
+
+# Keep the subset cell ids in SPE metadata
+metadata(maab_ro_only)[["subset"]] <- sort(as.vector(cell_subset))
+
+sce_sub <- maab_ro_only[features_oi, ]
+```
+
+## UMAP
+```{r umap}
+set.seed(222)
+cur_assay <- "exprs"
+dimred_name <- paste("UMAP", cur_assay, "beta_alpha_maab_ro", sep = "_")
+
+cur_umap <- uwot::umap(t(assay(sce_sub, cur_assay)), n_neighbors = 15) # , n_threads = 4)
+colnames(cur_umap) <- c("UMAP1", "UMAP2")
+rownames(cur_umap) <- colnames(assay(sce_sub, cur_assay))
+reducedDim(sce_sub, dimred_name) <- cur_umap
+remove(cur_umap)
+```
+
+### Prepare data.
+```{r get_umap_dfs}
+cur_assay <- "scaled"
+df_img <- scuttle::makePerCellDF(
+  x = sce_sub,
+  assay.type = cur_assay,
+  features = features_oi,
+  use.coldata = c("cell_type", "donor_type", "case_id", "image_id"),
+  use.dimred = TRUE
+)  |> as_tibble(rownames = "cell_id") |>
+  dplyr::select(cell_id, cell_type, donor_type, image_id, case_id, starts_with("UMAP"), all_of(features_oi))
+```
+
+### Plot UMAP
+Plot UMAP 
+```{r plot_umap}
+## pivot-longer.
+palette_ct <- palettes$colors[1:2]
+## Plot UMAP of the selected features colored by cell type and donor type.
+p <- plot_dim_red(dat = df_img, dimred = dimred_name, color_by = "cell_type", palette = palette_ct)
+q <- plot_dim_red(dat = df_img, dimred = dimred_name, color_by = "donor_type", palette = palettes$stages)
+fn <- paste(paste(today, "UMAP", "alpha_beta_maab_ro", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+fn <- paste(paste(today, "UMAP", "alpha_beta_maab_ro", "donor", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, q), plotsave_param))
+if(do_print) {
+  print(p)
+  print(q)
+}
+```
+
+```{r}
+## Would need islet-compo here.
+composition_ex <- FALSE
+if (composition_ex) {
+  composition <- metadata(sce_sub)$islet_compo
+  df_img <- df_img  |> left_join(as_tibble(composition), by = "image_id") |> 
+    mutate(islet_type = ifelse(CellNb_Beta == 0, "IDI", "ICI"))
+
+  r <- plot_dim_red(dat = df_img, dimred = dimred_name, color_by = "islet_type", palette = palettes$colors)
+  fn <- paste(paste(today, "UMAP", "alpha_beta_maab_ro", "islet_type", sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, r), plotsave_param))
+}
+```
+
+## Plot Channels
+
+```{r plot_dim_redchannels}
+df_img_long <- df_img |>
+  tidyr::pivot_longer(cols = all_of(features_oi), names_to = "channel", values_to = cur_assay)
+
+p <- plot_dim_red_channels(dat = df_img_long, censor_val = 0.95, dimred = dimred_name, expr_values = cur_assay, channels = features_oi)
+fn <- paste(paste(today, "UMAP", "alpha_beta_channels_maab_ro", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+## Plot only specific markers on UMAP.
+umap_channels <- c("ProINS", "NKX6_1", "GCG", "PAX6",  
+                   "ARX", "HLA_ABC", "B2M", "MX1", "IAPP")
+
+p <- plot_dim_red_channels(dat = df_img_long, censor_val = 0.95, dimred = dimred_name, expr_values = cur_assay, channels = umap_channels)
+fn <- paste(paste(today, "UMAP", "alpha_beta_channels_reduced_maab_ro", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+
+
+## Run the subclustering
+Run Sub-clustering with PhenoGraph with k = 30.
+```{r subclustering}
+set.seed(seed)
+k <- 30
+clust_name <- paste0("PhenoGraph_", k)
+
+cur_pheno_annoy <- Rphenoannoy::Rphenoannoy(t(assay(sce_sub, cur_assay)), k = k)
+
+cur_pheno <- DataFrame(cur_pheno_annoy[[2]]$membership)
+rownames(cur_pheno) <- colnames(assay(sce_sub, cur_assay))
+colData(sce_sub)[, clust_name] <- cur_pheno
+sce_sub[[clust_name]] <- factor(sce_sub[[clust_name]], levels = unique(sce_sub[[clust_name]]))
+```
+
+```{r umap_coordinates}
+## Plot UMAP again.
+df_img2 <- scuttle::makePerCellDF(
+  x = sce_sub,
+  assay.type = cur_assay,
+  features = rownames(sce_sub),
+  use.coldata = c("cell_type", "donor_type", "case_id", "image_id", clust_name),
+  use.dimred = TRUE
+)  |> as_tibble(rownames = "cell_id") |> 
+  dplyr::select(cell_id, cell_type, donor_type, image_id, case_id, starts_with("UMAP"), all_of(clust_name), all_of(features_oi))
+```
+
+## Plot Heatmap.
+```{r plot_heatmap}
+hm <- summarize_heatmap(sce_sub,
+                        expr_values = "exprs",
+                        cluster_by = clust_name)
+
+# Display the heatmap
+fn <- paste0(paste(today, "Clusters", clust_name, "Heatmap", "maab_ro",
+                   sep = "_"), ".html")
+heatmaply::heatmaply(
+  heatmaply::normalize(hm), main = clust_name,
+  file = file.path(paths$folder_script, fn))
+```
+
+## Plot UMAP with coordinates.
+```{r umap_coordinates}
+## Plot UMAP again.
+df_img2 <- scuttle::makePerCellDF(
+  x = sce_sub,
+  assay.type = cur_assay,
+  features = rownames(sce_sub),
+  use.coldata = c("cell_type", "donor_type", "case_id", "image_id", clust_name),
+  use.dimred = TRUE
+)  |> as_tibble(rownames = "cell_id") |> 
+  dplyr::select(cell_id, cell_type, donor_type, image_id, case_id, starts_with("UMAP"), all_of(clust_name), all_of(features_oi))
+
+# Calculate centroids of each cluster
+centroids <- df_img2  |> 
+  select(dplyr::all_of(c(x = paste0(dimred_name, ".1"), y = paste0(dimred_name, ".2"))), all_of(clust_name)) |> 
+  group_by(PhenoGraph_30) |> 
+  summarise(x = mean(x), y = mean(y))
+
+p <- plot_dim_red(dat = df_img2, dimred = dimred_name, color_by = clust_name, palette = palettes$colors50)
+
+## Add Centroids
+p <- p + geom_text(data = centroids, aes(x = x, y = y, label = as.factor(PhenoGraph_30)), 
+                   color = "black", vjust = -1)
+if (do_print) print(p)
+fn <- paste0(paste(today, "Clusters", clust_name, dimred_name, "mAAb_RO", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+
+## Plot specific cluster(s)
+
+When many clusters are present, they may not be easy fo visualize on reduced dimension maps. Here, a subset of clusters can be selected for plotting.
+
+### Select cluster(s) and assay to show
+
+```{r dimred-cluster-select}
+# beta:
+viz_clust <-  c(2, 3, 8:11, 14, 16, 29, 31, 32)
+# alpha:
+viz_clust <- c(1, 4:7, 12, 13, 15, 17:28, 30)
+
+# c(7, 19, 20)
+viz_method <- clust_name
+viz_assay <- "exprs"
+```
+
+```{r dimred-cluster-plot}
+if (!is.null(viz_clust)) {
+  # Prepare the data
+  clust_name <- paste(viz_method, sep = "_")
+  cur_dat <- scuttle::makePerCellDF(sce_sub, assay.type = viz_assay, 
+                                    features = features_oi,
+                                    use.coldata = c("cell_type", "donor_type", "case_id", "image_id", clust_name),
+    use.dimred = TRUE) |>
+    mutate(case_id = factor(case_id, levels = metadata(sce_sub)$cases),
+           donor_type = factor(donor_type, levels = metadata(sce_sub)$stages)) |>
+    arrange(case_id, donor_type)
+  
+  # Clusters and palette
+  clust_name <- paste(viz_method, sep = "_")
+  clust_nb <-  length(unique(cur_dat[[clust_name]]))
+  viz_pal <- palettes$colors[1:clust_nb]
+  names(viz_pal) <- 1:clust_nb
+  viz_pal[!names(viz_pal) %in% viz_clust] <- "lightgrey"
+  
+  # Plot
+  
+  dimred_name <- paste("UMAP", viz_assay, "beta_alpha", "maab_ro", sep = "_")
+    
+  p <- plot_dim_red(cur_dat, dimred_name, clust_name, palette = viz_pal,
+                    sample = TRUE, size = 0.1, alpha = 1)
+  if (do_print) if (do_print) print(p)
+    
+  fn <- paste0(
+      paste(today, paste0("Cluster", paste(viz_clust, collapse = "-")),
+             clust_name, "UMAP", sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param))
+}
+```
+
+
+## Plot specific cluster(s)
+
+Relabel Cells.
+HERE: To check. This doesnt apply anymore.
+
+### Phenograph x scaled counts
+
+```{r celltypes-pheno-scaled}
+clust_method <- "PhenoGraph_30"
+
+# Define which clusters correspond to which cell types
+clust_beta <- c(2, 3, 8:11, 14, 16, 29, 31, 32)
+clust_alpha <- c(1, 4:7, 12, 13, 15, 17:28, 30)
+
+all_clust <- sort(c(clust_alpha, clust_beta))
+
+if ((!length(unique(all_clust)) ==
+     length(unique(colData(sce_sub)[, clust_name]))) ||
+    any(duplicated(all_clust))) {
+  stop("Recheck cluster attribution")
+}
+
+# Add cell types to the SCE object
+colData(sce_sub)[colData(sce_sub)[, clust_name] %in% clust_alpha,
+                 paste("CellType", clust_name, sep = "_")] <- "Alpha"
+colData(sce_sub)[colData(sce_sub)[, clust_name] %in% clust_beta,
+                 paste("CellType", clust_name, sep = "_")] <- "Beta"
+```
+
+### Select cluster(s) and assay to show
+
+```{r dimred-cluster-select}
+# beta:
+viz_clust <-  c(2, 3, 8:11, 14, 16, 29, 31, 32)
+# alpha:
+viz_clust <- c(1, 4:7, 12, 13, 15, 17:28, 30)
+
+# c(7, 19, 20)
+viz_method <- clust_name
+viz_assay <- "exprs"
+```
+
+
+## Visualize attributed cell types
+
+### Plot cell types on reduced dimensions
+
+```{r palette$celltypes}
+palettes$celltype <- (c(
+  Alpha = palettes$colors[1], Beta = palettes$colors[2]))
+```
+
+
+```{r celltypes-dimred}
+# Prepare the data
+cur_dat <- scuttle::makePerCellDF(
+  sce_sub,
+  use_dimred = TRUE) |>
+  mutate(case_id = factor(case_id, levels = metadata(sce_sub)$cases),
+         donor_type = factor(donor_type, levels = metadata(sce_sub)$stages)) |>
+  arrange(case_id, donor_type)
+
+# Plot
+      # cur_assay <- assay_sel[2];  cur_method <- methods_sel[2]; cur_dimred <- dimred_sel[1]
+dimred_name <- "UMAP_exprs_beta_alpha_maab_ro"
+
+p <- plot_dim_red(cur_dat, dimred_name, paste("CellType", clust_name, sep = "_"),
+                palette = palettes$celltype,
+                sample = TRUE, size = 0.1, alpha = 1)
+if (do_print) if (do_print) print(p)
+
+fn <- paste0(paste(today, clust_name, "UMAP_ct",
+                  sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+```{r dimred-cluster-plot}
+if (!is.null(viz_clust)) {
+  # Prepare the data
+  clust_name <- paste(viz_method, sep = "_")
+  cur_dat <- scuttle::makePerCellDF(sce_sub, assay.type = viz_assay, 
+                                    features = features_oi,
+                                    use.coldata = c("cell_type", "donor_type", "case_id", "image_id", clust_name),
+    use.dimred = TRUE) |>
+    mutate(case_id = factor(case_id, levels = metadata(sce_sub)$cases),
+           donor_type = factor(donor_type, levels = metadata(sce_sub)$stages)) |>
+    arrange(case_id, donor_type)
+  
+  # Clusters and palette
+  clust_name <- paste(viz_method, sep = "_")
+  clust_nb <-  length(unique(cur_dat[[clust_name]]))
+  viz_pal <- palettes$colors[1:clust_nb]
+  names(viz_pal) <- 1:clust_nb
+  viz_pal[!names(viz_pal) %in% viz_clust] <- "lightgrey"
+  
+  # Plot
+  
+  dimred_name <- paste("UMAP", viz_assay, "beta_alpha", "maab_ro", sep = "_")
+    
+  p <- plot_dim_red(cur_dat, dimred_name, clust_name, palette = viz_pal,
+                    sample = TRUE, size = 0.1, alpha = 1)
+  if (do_print) if (do_print) print(p)
+    
+  fn <- paste0(
+      paste(today, paste0("Cluster", paste(viz_clust, collapse = "-")),
+             clust_name, "UMAP", sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param))
+}
+```
+
+# Islet-like cells:
+
+
+We have around ~10k islet-like cells, which have initially not classified as islet cells.
+
+```{r}
+islet_like <- spe[, spe$cell_type == "IsletLike"]
+features_oi <- c("INS", "ProINS", "Cpep", "IAPP", "PCSK1", "NKX6_1", "PDX1", 
+                 "ARX", "CHGA", "GCG", "ProGCG", "PCSK2",
+                 "SST", "PPY", "GHRL",
+                 "NKX2_2", "PAX6", "FoxA2",
+                 "SYP", "CD163", "CD3", "KRT19", "ECad", "CFTR", "AMY", 
+                 "CAV1", "VIM")
+islet_like <- islet_like[features_oi, ]
+islet_like
+```
+
+
+## UMAP
+```{r umap}
+set.seed(222)
+cur_assay <- "exprs"
+dimred_name <- paste("UMAP", cur_assay, "beta_alpha_isletlike", sep = "_")
+
+cur_umap <- uwot::umap(t(assay(islet_like, cur_assay)), n_neighbors = 15) # , n_threads = 4)
+colnames(cur_umap) <- c("UMAP1", "UMAP2")
+rownames(cur_umap) <- colnames(assay(islet_like, cur_assay))
+reducedDim(islet_like, dimred_name) <- cur_umap
+remove(cur_umap)
+```
+
+### Prepare data.
+```{r get_umap_dfs}
+cur_assay <- "scaled"
+df_img <- scuttle::makePerCellDF(
+  x = islet_like,
+  assay.type = cur_assay,
+  features = features_oi,
+  use.coldata = c("cell_type", "donor_type", "case_id", "image_id"),
+  use.dimred = TRUE
+)  |> as_tibble(rownames = "cell_id") |>
+  dplyr::select(cell_id, cell_type, donor_type, image_id, case_id, starts_with("UMAP"), all_of(features_oi))
+```
+
+### Plot UMAP
+Plot UMAP 
+```{r plot_umap}
+## pivot-longer.
+palette_ct <- palettes$colors[1:2]
+## Plot UMAP of the selected features colored by cell type and donor type.
+p <- plot_dim_red(dat = df_img, dimred = dimred_name, color_by = "cell_type", palette = palette_ct)
+q <- plot_dim_red(dat = df_img, dimred = dimred_name, color_by = "donor_type", palette = palettes$stages)
+fn <- paste(paste(today, "UMAP", "alpha_beta_maab_ro", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+fn <- paste(paste(today, "UMAP", "alpha_beta_maab_ro", "donor", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, q), plotsave_param))
+if(do_print) {
+  print(p)
+  print(q)
+}
+```
+
+## Plot Channels
+
+```{r plot_dim_redchannels}
+df_img_long <- df_img |>
+  tidyr::pivot_longer(cols = all_of(features_oi), names_to = "channel", values_to = cur_assay)
+
+p <- plot_dim_red_channels(dat = df_img_long, censor_val = 0.95, dimred = dimred_name, expr_values = cur_assay, channels = features_oi)
+fn <- paste(paste(today, "UMAP", "alpha_beta_channels_isletlike", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+## Plot only specific markers on UMAP.
+umap_channels <- c("ProINS", "NKX6_1", "GCG", "PAX6",  
+                   "ARX", "HLA_ABC", "B2M", "MX1", "IAPP")
+
+p <- plot_dim_red_channels(dat = df_img_long, censor_val = 0.95, dimred = dimred_name, expr_values = cur_assay, channels = umap_channels)
+fn <- paste(paste(today, "UMAP", "alpha_beta_channels_reduced_isletlike", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+
+
+## Run the subclustering
+Run Sub-clustering with PhenoGraph with k = 30.
+```{r subclustering}
+set.seed(seed)
+k <- 30
+clust_name <- paste0("PhenoGraph_", k)
+
+cur_pheno_annoy <- Rphenoannoy::Rphenoannoy(t(assay(islet_like, cur_assay)), k = k)
+
+cur_pheno <- DataFrame(cur_pheno_annoy[[2]]$membership)
+rownames(cur_pheno) <- colnames(assay(islet_like, cur_assay))
+colData(islet_like)[, clust_name] <- cur_pheno
+islet_like[[clust_name]] <- factor(islet_like[[clust_name]], levels = unique(islet_like[[clust_name]]))
+```
+
+```{r umap_coordinates}
+## Plot UMAP again.
+df_img2 <- scuttle::makePerCellDF(
+  x = islet_like,
+  assay.type = cur_assay,
+  features = rownames(islet_like),
+  use.coldata = c("cell_type", "donor_type", "case_id", "image_id", clust_name),
+  use.dimred = TRUE
+)  |> as_tibble(rownames = "cell_id") |> 
+  dplyr::select(cell_id, cell_type, donor_type, image_id, case_id, starts_with("UMAP"), all_of(clust_name), all_of(features_oi))
+```
+
+## Plot Heatmap.
+```{r plot_heatmap}
+hm <- summarize_heatmap(islet_like,
+                        expr_values = "exprs",
+                        cluster_by = clust_name)
+
+# Display the heatmap
+fn <- paste0(paste(today, "Clusters", clust_name, "Heatmap", "isletlike",
+                   sep = "_"), ".html")
+heatmaply::heatmaply(
+  heatmaply::normalize(hm), main = clust_name,
+  file = file.path(paths$folder_script, fn))
+```
+
+## Plot UMAP with coordinates.
+```{r umap_coordinates}
+## Plot UMAP again.
+df_img2 <- scuttle::makePerCellDF(
+  x = islet_like,
+  assay.type = cur_assay,
+  features = rownames(islet_like),
+  use.coldata = c("cell_type", "donor_type", "case_id", "image_id", clust_name),
+  use.dimred = TRUE
+)  |> as_tibble(rownames = "cell_id") |> 
+  dplyr::select(cell_id, cell_type, donor_type, image_id, case_id, starts_with("UMAP"), all_of(clust_name), all_of(features_oi))
+
+# Calculate centroids of each cluster
+centroids <- df_img2  |> 
+  select(dplyr::all_of(c(x = paste0(dimred_name, ".1"), y = paste0(dimred_name, ".2"))), all_of(clust_name)) |> 
+  group_by(PhenoGraph_30) |> 
+  summarise(x = mean(x), y = mean(y))
+
+p <- plot_dim_red(dat = df_img2, dimred = dimred_name, color_by = clust_name, palette = palettes$colors50)
+
+## Add Centroids
+p <- p + geom_text(data = centroids, aes(x = x, y = y, label = as.factor(PhenoGraph_30)), 
+                   color = "black", vjust = -1)
+if (do_print) print(p)
+fn <- paste0(paste(today, "Clusters", clust_name, dimred_name, "isletlike", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+Alpha: 10, 7, 6, 1
+Beta: 5, 13, 3
+Gamma: 8
+Delta: 9,4
+Epsilon: 2
+Others: 12, 11
+
+## Plot specific cluster(s)
+
+When many clusters are present, they may not be easy fo visualize on reduced dimension maps. Here, a subset of clusters can be selected for plotting.
+
+### Select cluster(s) and assay to show
+
+```{r dimred-cluster-select}
+# alpha:
+viz_clust <-  c(6, 7, 10, 1)
+# beta:
+viz_clust <- c(5, 13, 3)
+# gamma:
+viz_clust <- c(8)
+# delta:
+viz_clust <- c(4, 9)
+# epsilon:
+viz_clust <- c(2) 
+# others
+viz_clust <- c(11, 12)
+
+# c(7, 19, 20)
+viz_method <- clust_name
+viz_assay <- "exprs"
+```
+
+```{r dimred-cluster-plot}
+if (!is.null(viz_clust)) {
+  # Prepare the data
+  clust_name <- paste(viz_method, sep = "_")
+  cur_dat <- scuttle::makePerCellDF(islet_like, assay.type = viz_assay, 
+                                    features = features_oi,
+                                    use.coldata = c("cell_type", "donor_type", "case_id", "image_id", clust_name),
+    use.dimred = TRUE) |>
+    mutate(case_id = factor(case_id, levels = metadata(islet_like)$cases),
+           donor_type = factor(donor_type, levels = metadata(islet_like)$stages)) |>
+    arrange(case_id, donor_type)
+  
+  # Clusters and palette
+  clust_name <- paste(viz_method, sep = "_")
+  clust_nb <-  length(unique(cur_dat[[clust_name]]))
+  viz_pal <- palettes$colors[1:clust_nb]
+  names(viz_pal) <- 1:clust_nb
+  viz_pal[!names(viz_pal) %in% viz_clust] <- "lightgrey"
+  
+  # Plot
+  
+  dimred_name <- paste("UMAP", viz_assay, "beta_alpha", "isletlike", sep = "_")
+    
+  p <- plot_dim_red(cur_dat, dimred_name, clust_name, palette = viz_pal,
+                    sample = TRUE, size = 0.1, alpha = 1)
+  if (do_print) if (do_print) print(p)
+    
+  fn <- paste0(
+      paste(today, paste0("Cluster", paste(viz_clust, collapse = "-")),
+             clust_name, "UMAP", "islet_like", sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param))
+}
+```
+
+# **Finalize and save **
+
+## Add cell types to the main SCE
+
+Add cell types to the main SCE
+
+```{r add-celltypes-sce-2}
+# Make sure row order is preserved
+row_order <- rownames(colData(spe)[spe$cell_category != "immune", ])
+sce_exo <- sce_exo[, order(match(colnames(sce_exo), row_order))]
+
+# Add cell types and updated cell categories
+colData(spe)[row_order, ]$cell_category <- sce_exo$cell_category
+colData(spe)[row_order, ]$cell_type <- sce_exo$cell_type
+
+
+row_order <- rownames(colData(spe)[(spe$cell_type %in% c("Alpha", "Beta") & 
+                      spe$donor_type %in% c("mAAb+", "RecentOnset")), ])
+sce_sub <- sce_sub[, order(match(colnames(sce_sub), row_order))]
+
+colData(spe)[row_order, ]$cell_category <- "islet"
+colData(spe)[row_order, ]$cell_type <- sce_sub$CellType_PhenoGraph_30
+# FIXME!
+```
+
+## Save the updated SPE object
+
+```{r save-sce}
+print(spe)
+fn_spe <- file.path(paths$folder_script, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+saveRDS(spe, fn_spe)
+```
+
+
+### Plot Images with Cl 25, 27, 28, 29:
+```{r}
+df_img2 |> 
+  filter(PhenoGraph_30 %in% c(25, 27, 28, 29)) |>
+  dplyr::count(image_id, PhenoGraph_30) |> 
+  arrange(desc(n)) |> print(n = 30)
+
+## 32: 6534_Islet_006; 6534_Islet_021; 6534_Islet_021; 6534_Islet_059
+## 28: 6534_Islet_009; 6534_Islet_074; 6449_Islet_069; 6534_Islet_071; 6362_Islet_052
+```
+
+
+```{r}
+## 2D Density Plot in Beta-cells of ARX vs HLA-ABC
+## Plot UMAP again.
+df_img2 <- scuttle::makePerCellDF(
+  x = alpha_beta,
+  assay.type = "exprs",
+  features = features_oi,
+  use.coldata = c("cell_type", "donor_type", "case_id", "image_id"),
+  use.dimred = TRUE
+)  |> as_tibble(rownames = "cell_id") |> 
+  dplyr::select(cell_id, cell_type, donor_type, image_id, case_id, all_of(features_oi))
+
+p <- df_img2 |> 
+  filter(donor_type %in% c("NoDiabetes", "RecentOnset")) |>
+  group_by(image_id, cell_type, donor_type) |>
+  summarize(ARX = mean(ARX), HLA_ABC = mean(HLA_ABC), cell_type = first(cell_type)) |>
+  ggplot(aes(x = ARX, y = HLA_ABC, color = cell_type)) +
+  geom_point(alpha = 0.5, size = 1) +
+  geom_density_2d(color = "black", n = 50) +
+  mytheme$standard() + 
+  facet_wrap(~donor_type)
+
+if (do_print) print(p)
+fn <- paste0(paste(today, "Beta", "ARX_HLA_ABC", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, last_plot()), plotsave_param))
+
+r <- df_img2 |> 
+  filter(donor_type %in% c("RecentOnset")) |>
+  group_by(image_id, cell_type, case_id, donor_type) |> 
+  summarize(across(all_of(features_oi), mean)) |> 
+  ungroup()
+
+formula_test <- as.formula(paste("ARX ~", paste(paste(features_oi[features_oi!= "ARX"], sep = " + "), collapse = " + "), "+ (1 | case_id)"))
+
+# Stronlgy correlated to HLA-ABC. 
+# Also to FoxA2/PAX6 -> likely cell-type dependent effect.
+summary(lmerTest::lmer(formula_test, data = r  |> filter(cell_type == "Alpha")))
+summary(lmerTest::lmer(ARX ~ HLA_ABC + (1 | case_id), data = r  |> filter(cell_type == "Alpha")))
+summary(lmerTest::lmer(ARX ~ FoxA2 + (1 | case_id), data = r  |> filter(cell_type == "Alpha")))
+
+## Beta-cells
+summary(lmerTest::lmer(formula_test, data = r |> filter(cell_type == "Beta")))
+
+lmerTest::lmer(ARX ~ B2M + (1 | case_id), data = r  |> filter(cell_type == "Beta")) |> summary()
+lmerTest::lmer(ARX ~ HLA_ABC + (1 | case_id), data = r  |> filter(cell_type == "Beta")) |> summary(
+```
+
+

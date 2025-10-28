@@ -1,0 +1,1846 @@
+---
+title: "16_Neighborhood_cells_Immune"
+author: "Nathan Steenbuck, Nicolas Damond"
+date: "Created: 06 Sep, 2022; Compiled: `r format(Sys.time(), '%d %b, %Y')`"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+cur_user <- Sys.info()[["user"]]
+script_name <- "16_Neighborhood_cells_Immune.Rmd"
+
+if (cur_user == "ubuntu") {
+    source(file.path("/", "mnt", "central_nas", "projects", 
+    "type1_diabetes", "nathan", "T1D_Vol", "T1D_analysis", 
+    "analysis", "helpers.R"))  
+  #n_cores <- future::availableCores() - 1
+  n_cores <- 2
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  knitr::opts_knit$set(root_dir = paths$home_data)
+  do_print <- FALSE
+} else {
+  source(file.path("/", "home", "nsteen", "scripts", "T1D_analysis", "analysis", "helpers.R"))
+  n_cores <- 8
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  paths$folder_script <- paths$cluster_folder_script
+  paths$folder_in <- paths$cluster_folder_in
+  paths$folder_out <- paths$cluster_home 
+  knitr::opts_knit$set(root_dir = paths$cluster_home)
+  do_print <- TRUE
+}
+
+seed <- 123456
+set.seed(seed)
+options <- furrr::furrr_options(seed = seed)
+# paths$prev <- paste("08_ClustersImmuneII", paths$object_type, paths$panel_type, sep = "_") # old.
+paths$prev <- paste("08_CellTypesIslet", paths$object_type, paths$panel_type, sep = "_")
+knitr::opts_chunk$set(echo = TRUE)
+options(future.globals.maxSize = 60 * 1024 * 1024 * 1024)
+```
+
+
+# **A0: Goals**
+
+Perform neighborhood analyses. Specifically, run cellular neighborhood analysis as described in Schürch et al., Cell 2020.
+We select the best CN (k), and analyze enrichment of immune cell subtypes across stages.
+
+# **A1: Settings**  
+
+## A1.1: Load packages
+
+```{r packages, message=FALSE}
+suppressPackageStartupMessages(c(
+  library(dplyr),
+  library(tidyr),
+  library(SpatialExperiment),
+  library(imcRtools),
+  library(ggplot2),
+  library(parallel),
+  library(BiocParallel),
+  library(forcats),
+  library(bluster)
+))
+```
+
+## A1.2: Paths and settings
+
+```{r settings}
+# Paths
+if (!dir.exists(paths$folder_script)) dir.create(paths$folder_script)
+plotsave_param$path <- paths$folder_script
+plotsave_param_large$path <- paths$folder_script
+
+# Misc settings
+today <- gsub("-", "", Sys.Date())
+```
+
+##  A1.3: Read in the data
+
+Load the SpatialExperiment (SPE) object saved at the previous step.
+
+```{r load-data}
+fn_spe <- file.path(paths$folder_out, paths$prev, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+spe <- readRDS(fn_spe)
+print(spe)
+```
+
+## A1.4: Subset Image & Identify cells neighboring T cells
+
+```{r subset-spe}
+# Variables to plot
+plot_variables <- c("donor_type", "case_id")
+names(plot_variables) <- c("stages", "cases")
+```
+
+We remove cells far away from islets (>= 100 µm from islet border).
+```{r subset-spe2}
+spe_sub <- spe
+## Renive any remaining cells > 100 µm from Islet distance.
+spe_sub <- spe_sub[, spe_sub$distance_to_islet >= -100]
+```
+
+Additionally, remove any border cells + Pancreatitis samples + Images with less than 10 cells.
+```{r border_cells}
+spe_sub <- imcRtools::findBorderCells(spe_sub, img_id = "image_id",
+                                      coords = c("cell_x", "cell_y"), border_dist = 10)
+spe_sub <- spe_sub[, spe_sub$border_cells == FALSE]
+spe_sub <- spe_sub[, spe_sub$donor_type != "Pancreatitis"]
+
+table(table_cells <- table(spe_sub$image_id))
+
+if (length(table_cells[table_cells <= 10]) > 0) {
+  # remove these images.
+  spe_sub <- spe_sub[, !spe_sub$image_id %in% names(table_cells[table_cells <= 10])]
+}
+```
+
+Remove any unnecessary reducedDims and assays to save RAM.
+
+```{r save_sce_sub}
+assay(spe_sub, "fastMNN_case_id") <- NULL
+assay(spe_sub, "harmony_batch") <- NULL
+assay(spe_sub, "UMAP_harmony_batch") <- NULL
+```
+
+## A1.5: Create Graph 2 (k=10, max_dist=25)
+
+Graph Creation is highly computationally demanding. Takes around 2 days at our VM (120 GM RAM).
+
+```{r build_spatial_graph2}
+### k = 10; max_dist = 25
+k <- 10
+max_dist <- 25
+if (paste("kNN", k, sep = "_") %in% colnames(spe_sub$spatialGraph)) {
+  print("Graph already exists.")
+} else {
+  spe_sub <- imcRtools::buildSpatialGraph(spe_sub, 
+    img_id = "image_id", type = "knn", k = k, coords = c("cell_x", "cell_y"), 
+    max_dist = max_dist, name = paste("kNN", k, sep = "_"),
+    BPPARAM = BiocParallel::SerialParam(RNGseed = 222))
+}
+```
+
+## A1.6: Save SCE. 
+Save SCE.
+```{r save_spe}
+print(spe_sub)
+# fn <- file.path(paths$folder_script, "pancreasSCE.rds") # old results saved here.
+fn <- file.path(paths$folder_script, "pancreasSCE_2.rds")
+saveRDS(spe_sub, fn)
+# spe_sub <- readRDS(fn)
+```
+
+# Aggregate across neighboring cells.
+
+Next, we aggregate expression of neighboring cells using imcRtools::aggregateNeighbors. 
+Note: This is highly RAM-intensive as well!
+
+Note: we apply this to the neighborhood graph.
+This is a thresholded kNN graph. 
+--dmax is the maximum Euclidean distance between cells.
+--k is the number of neighbors to consider.
+--dmax = 15, k = 5. 
+Hence, we consider the 5 nearest neighbors within a distance of 15 pixels.
+
+## Neighourbood graph.
+Aggregate neighboring cell-types.
+Use **Subsetted** and **Border-cell removed** spe_isl.
+Again, neighboring cell types:
+- max 5 neighbors in 15 µm distance.
+- kNN_10: max 10 neighbors in 25 µm distance.
+
+```{r aggreate_celltypes}
+## Delete Ambiguous & other cells 
+delete_cells <- c("Ambiguous", "Other")
+
+reducedDim(spe_sub, "UMAP_harmony_batch") <- NULL
+reducedDim(spe_sub, "UMAP_fastMNN_case_id") <- NULL
+reducedDim(spe_sub, "harmony_batch") <- NULL
+reducedDim(spe_sub, "PCA") <- NULL
+assay(spe_sub, "counts") <- NULL 
+
+pancreasSCE <- spe_sub[, !spe_sub$cell_type %in% delete_cells]
+rm(spe_sub); gc()
+
+## Aggregate across kNN-Graphs.
+pancreasSCE <- imcRtools::aggregateNeighbors(pancreasSCE,
+                                             colPairName = "neighborhood",
+                                             aggregate_by = "metadata",
+                                             count_by = "cell_type",
+                                             proportions = FALSE,
+                                             name = "aggregatedNeighbors_k5")
+
+# Aggregate across k = 10 
+pancreasSCE <- imcRtools::aggregateNeighbors(pancreasSCE,
+                                             colPairName = "kNN_10",
+                                             aggregate_by = "metadata",
+                                             count_by = "cell_type",
+                                             proportions = FALSE,
+                                             name = "aggregatedNeighbors_k10")
+```
+
+# A2: Cellular Neighborhoods.
+
+## A2.1: Community detection
+
+As proposed by Schürch et al. 
+Nearest neighbor:
+- Extract fractions of neighboring cells.
+- Clustering (kMeans)
+
+Spatial Graphs:
+1) k = 5, dmax = 15 -> usually immediate neighbor. Very local.
+2) k = 10, dmax = 25 -> around 2 cells away.
+
+## A2.2: kMeans clustering - identify optimal parameters.
+
+Cluster Cellular Neighborhoods by kmeans.
+- Compute Silhouette score per kNN-CN combination.
+- Computing neighborhood purity is too expensive. 
+- Plot Silhouette score.
+
+```{r kmeans_clustering}
+fn <- file.path(paths$folder_script, "pancreasSCE_agg.rds")
+saveRDS(pancreasSCE, fn)
+## pancreasSCE <- readRDS(fn)
+
+gc()
+set.seed(222)
+
+## Different Neighbors and number of clusters.
+ks <- c("k5", "k10")
+centers <- c(20L, 30L, 40L, 50L, 60L, 70L, 80L, 90L, 100L) #80L
+
+## k-means clustering of aggregated Neighbors
+res <- purrr::map(ks, \(.x) {
+  purrr::map(centers, \(.y) {
+    gc()
+    message(.x, " - ", .y)
+    kmeans(pancreasSCE[[paste0("aggregatedNeighbors_", .x)]], centers = .y)
+  }) |> setNames(centers)
+})|> setNames(ks)
+
+fn1 <- file.path(paths$folder_script, "res_clusters.rds")
+saveRDS(res, fn1)
+## res <- readRDS(fn1)
+```
+
+## A2.3: Evaluate clustering results.
+
+Metric 2: WSS
+Compute + PLOT within-cluster sum of squares.
+```{r metrics-clustering}
+wss <- total_withinss <- purrr::map(ks, \(.x) {
+  message(.x)
+  purrr::map(paste(centers), \(.y) {
+  message(.y)
+    res[[.x]][[.y]]$tot.withinss
+  }) |> setNames(centers)
+}) |> setNames(ks)
+wss <- unlist(wss)
+
+## Plot wss:
+tibble(wss = wss, k = names(wss)) |> 
+  ggplot(aes(x = k, y = wss)) +
+  geom_point() +
+  geom_line() +
+  theme_classic(base_size = 15) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  xlab("Number of clusters") +
+  ylab("Total within-cluster sum of squares")
+```
+
+Metric 2: Silhouette
+Compute + Plot average Silhouette-score per cell.
+```{r silhouette_clustering}
+sils <- 
+purrr::map(paste(ks), \(.x) {
+  purrr::map(paste(centers), \(.y) {
+    set.seed(222)
+    ## Subsample
+    cell_ids <- sample(nrow(pancreasSCE[[paste0("aggregatedNeighbors_", .x)]]), size = 500000, replace = FALSE)
+    x <- pancreasSCE[[paste0("aggregatedNeighbors_", .x)]][cell_ids, ]
+    clusters <- res[[.x]][[.y]]$cluster[cell_ids]
+    mean(bluster::approxSilhouette(x, clusters)$width)
+  }) |> setNames(centers)
+}) |> setNames(ks)
+
+sils <- unlist(sils)
+## Print Silhouette scores.
+p <- ggplot(data.frame(method = names(sils),
+                       sil = sils)) +
+    geom_point(aes(method, sil)) +
+    theme_classic(base_size = 15) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+    xlab("Cluster parameter combination") +
+    ylab("Average Silhouette Width")
+
+fn <- paste0(paste(today, "Silhouette", "Cluster", "byStage", sep = "_"), '.png')
+do.call(ggsave, c(list(fn, p), plotsave_param))
+print(p)
+```
+
+## A2.4: CN evaluation - association to STAGE
+Test Association to Stage. 
+This helps to identify relevant CNs.
+
+First: For each calculate k/center combination eval. the number and fraction of CN per case.
+
+```{r CN_to_stage}
+## 1st: Write all clusters to the metadata.
+purrr::walk(paste(ks), \(.x) {
+  purrr::walk(paste(centers), \(.y) {
+    pancreasSCE[[paste0("cn_", .x, .y)]] <<- as.factor(res[[.x]][[.y]]$cluster)
+  })
+})
+
+## 2nd: Get DF.
+df <- colData(pancreasSCE) |> 
+  as_tibble() |> 
+  filter(donor_type != "Pancreatitis") |> 
+  select(donor_type, case_id, image_id, cell_type, starts_with("cn_")) |> 
+  mutate(donor_type = forcats::fct_drop(donor_type)) |> 
+  mutate(case_id = forcats::fct_drop(case_id))
+
+## 3rd: Counts and Fractions for each CN. 
+df_counts <- 
+purrr::map(ks, \(.x){
+  purrr::map(centers, \(.y) {
+    name_center <- paste0("cn_", .x, .y)
+    plot_df <- df |> 
+      mutate(cn_celltypes = factor(!!sym(name_center)))
+
+  ## Counts + Fraction of CN per CASE.
+  res <- plot_df  |> 
+    add_count(case_id, name = "case_n") |>
+    ungroup() |> 
+    dplyr::count(case_id, donor_type, cn_celltypes, case_n, name = "cn_case") |> 
+    ## Set 0 for missing CNs.
+    tidyr::complete(case_id, cn_celltypes, fill = list(cn_case = 0), explicit = TRUE) |> 
+    dplyr::mutate(fraction = ifelse(cn_case == 0, 0, cn_case / case_n)) |> 
+    group_by(case_id) |> 
+    ## Set donor_type & case_n for missing CNs.
+    mutate(donor_type = dplyr::first(donor_type, na_rm = TRUE), case_n = dplyr::first(case_n, na_rm = TRUE)) |> 
+    ungroup() |> 
+    dplyr::mutate(method = name_center)
+  })
+}) |> bind_rows()
+
+df_counts <- df_counts |> 
+  mutate(donor_type = factor(donor_type, levels = metadata(pancreasSCE)$stages[1:5])) |>
+  mutate(case_id = factor(case_id, levels = unique(pancreasSCE[["case_id"]]))) |>
+  mutate(donor_type_num = as.numeric(donor_type))
+```
+
+Identify association of clusters to stage.
+
+```{r community_detection2}
+## Identify clusters which occurence is associated to stage. 
+lm_res <- df_counts |> 
+  tidyr::nest(data = -c(cn_celltypes, method)) |>
+  dplyr::mutate(test = purrr::map(data, ~lm(data = ., log1p(fraction) ~ poly(donor_type_num, 3)) |> broom::glance())) |>
+  tidyr::unnest(test) |> 
+  dplyr::mutate(p.adj = p.adjust(p.value, method = "fdr")) |>
+  select(cn_celltypes, method, data, adj.r.squared, p.value, p.adj) |> 
+  arrange(method, cn_celltypes)
+
+# Average r.squared and p.adj per method.
+p <- lm_res |> 
+  group_by(method) |> 
+  summarise(m_adj = mean(adj.r.squared), mean(p.adj)) |> 
+  ggplot(aes(x = method, y = m_adj)) +
+  geom_point() +
+  theme_classic(base_size = 15) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  xlab("Cluster parameter combination") +
+  ylab("Average adjusted r.squared")
+
+fn <- paste0(paste(today, "R2", "Cluster", "byStage", sep = "_"), '.png')
+do.call(ggsave, c(list(fn, p), plotsave_param))
+print(p)
+```
+
+# **A3: Analyse CN**
+
+- Select Neighborhood Community based on Silhouette Score and association to Stage.
+
+```{r select_CN_method}
+## Retain only clusters with significant association to stage.
+signif_level <- 0.05
+method <- "cn_k1070"
+
+cn_oi <- lm_res  |> 
+  filter(p.adj < signif_level, method == !!method) |> dplyr::pull(cn_celltypes)
+```
+
+## A3.1: CNs fraction across stages.
+
+Plot Log-fraction on y-axis.
+```{r viz-cns-log}
+## 
+q <- df_counts |> 
+  filter(method == !!method) |>
+  mutate(log_fraction = log10(fraction + 1)) |>
+  ggplot(aes(x = cn_celltypes, y = log_fraction, fill = donor_type)) +
+  geom_boxplot(position = "dodge", outlier.size = 0.1) +
+  labs(title = "Clusters across stages") +
+  scale_fill_manual(values = palettes$stages) + 
+  # rotate the x-axis labels
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+fn <- paste0(paste(today, "Boxplot", "CN", "byStage", "FULL", sep = "_"), '.png')
+do.call(ggsave, c(list(fn, q), plotsave_param_large))
+print(q)
+```
+
+Plot Associated CNs + Selected CNs.
+```{r viz-cns-selected}
+## Plot full fraction.
+t <- df_counts |> 
+  filter(method == !!method) |>
+  filter(cn_celltypes %in% cn_oi) |>
+  ggplot(aes(x = cn_celltypes, y = fraction, fill = donor_type)) +
+  geom_boxplot(position = "dodge", outlier.size = 0.1) +
+  labs(title = "Clusters across stages") +
+  scale_fill_manual(values = palettes$stages) + 
+  # rotate the x-axis labels
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+fn <- paste0(paste(today, "Boxplot", "CN", "byStage", "cn_oi", sep = "_"), '.png')
+do.call(ggsave, c(list(fn, t), plotsave_param_large))
+print(t)
+```
+
+Selected CNs only.
+```{r}
+## Print only selected CNs.
+cns_plot <- c("7", "24", "27", "11")
+
+t <- df_counts |> 
+  filter(method == !!method) |>
+  filter(cn_celltypes %in% cns_plot) |>
+  mutate(log_fraction = log10(fraction + 1)) |>
+  mutate(cn_celltypes = ifelse(cn_celltypes == "11", "B-cell", cn_celltypes)) |>
+  mutate(cn_celltypes = ifelse(cn_celltypes == "7", "T-cell 3", cn_celltypes)) |>
+  mutate(cn_celltypes = ifelse(cn_celltypes == "24", "T-cell 2", cn_celltypes)) |>
+  mutate(cn_celltypes = ifelse(cn_celltypes == "27", "T-cell 1", cn_celltypes)) |>
+  mutate(cn_celltypes = factor(cn_celltypes, levels = c("T-cell 1", "T-cell 2", "T-cell 3", "B-cell"))) |>
+  ggplot(aes(x = cn_celltypes, y = log_fraction, fill = donor_type)) +
+  geom_boxplot(position = "dodge", outlier.size = 0.1) +
+  geom_point(position = position_jitterdodge(), size = 1) +
+  labs(title = "Clusters across stages") +
+  scale_fill_manual(values = palettes$stages, name = "Stage") + 
+  # rotate the x-axis labels
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  # increase x-axis tick labels
+  theme(axis.text.x = element_text(size = 15)) + 
+  mytheme$standard_new() + 
+  labs(x = "", y = "Log: Fraction Cells", title = "")
+
+fn <- paste0(paste(today, "Boxplot", "CN", "byStage", "cn_oi_selected", sep = "_"), '.png')
+do.call(ggsave, c(list(fn, t), plotsave_param))
+print(t)
+```
+
+# A3.2: Plot Summary Tables
+### A3.2.1: Plot celltype numbers.
+```{r community_detection3}
+## Plot the significant clusters.
+for_plot <- table(as.character(pancreasSCE[[method]]), 
+                               pancreasSCE$cell_type)
+for_plot2 <- for_plot[rownames(for_plot) %in% cn_oi, ]
+```
+
+### A3.2.2: Plot fractions.
+```{r community_detection4}
+for_plot <- prop.table(table(as.character(pancreasSCE[[method]]), 
+  pancreasSCE$cell_type), margin = 2)
+# for_plot <- for_plot[-which.max(rowSums(for_plot)), ]
+for_plot2 <- for_plot[rownames(for_plot) %in% cn_oi, ]
+```
+
+### A3.3.3: Plot by relative cell type abundance.
+```{r community_detection5}
+fn <- paste0(paste(today, "Heatmap_comp", "CN_complete", sep = "_"), '.png')
+path_fn <- file.path(plotsave_param$path, fn)
+png(path_fn, width = 1200, height = 800)
+ComplexHeatmap::pheatmap(for_plot, 
+         color = colorRampPalette(c("dark blue", "white", "dark red"))(100), 
+         scale = "column")
+dev.off()
+
+fn <- paste0(paste(today, "Heatmap_comp", "CN_sub", sep = "_"), '.png')
+path_fn <- file.path(plotsave_param$path, fn)
+png(path_fn, width = 800, height = 600)
+heatmap <- ComplexHeatmap::pheatmap(for_plot2, 
+         color = colorRampPalette(c("dark blue", "white", "dark red"))(100), 
+         scale = "column", 
+         cluster_rows = TRUE,
+         cluster_cols = TRUE)
+# Draw the heatmap
+heatmap_drawn <- ComplexHeatmap::draw(heatmap)
+# Extract the row order
+dev.off()
+row_order <- ComplexHeatmap::row_order(heatmap_drawn)
+```
+
+## A3.4: Annotate CNs
+
+## Analyze CN presence
+
+Check for enrichment and biases across age, duration, case_id, and distance to islet.
+
+```{r analyze_cns_enrichment}
+df_cn <- colData(pancreasSCE) |> 
+  as_tibble() |> 
+  # filter(donor_type != "Pancreatitis") |> 
+  select(donor_type, case_id, image_id, cell_type, distance_to_islet, cell_cluster_scaled, cell_id, starts_with("cn_"), age, diabetes_duration, starts_with("CN")) |> 
+  mutate(donor_type = forcats::fct_drop(donor_type)) |> 
+  mutate(case_id = forcats::fct_drop(case_id))
+
+## Test which are especially for young donors.
+df_cn |> 
+  group_by(cn_k1070) |> 
+  summarise(mean_age = mean(age, na.rm = TRUE), mean_diabetes_duration = mean(diabetes_duration, na.rm = TRUE)) |> 
+  arrange(mean_age)
+# As expected: B-cell rich CNs.
+
+## Distance to Islet.
+df_cn |> 
+  group_by(cn_k1070) |> 
+  summarise(mean_distance = mean(distance_to_islet, na.rm = TRUE)) |> 
+  arrange(desc(mean_distance))
+```
+
+
+```{r annotate_CNs}
+old_annot <- FALSE
+if (old_annot) {
+  ## Annotations:
+  exocrine_normal <- c(21, 43, 30, 34)
+  nerves <- c(47, 41, 5)
+  smooth_muscle <- c(3, 25, 55)
+  cd303_vim <- c(60)
+  stroma <- c(56, 48, 32, 29)
+
+  # Islet CNs.
+  beta <- c(57, 15, 14, 23)
+  alpha <- c(28, 58, 39)
+  mixed_islet <- c(17, 45, 8, 36)
+  delta <- c(12, 20)
+  islet_endothelial <- c(40)
+
+  # Immune:
+  bcell_rich <- c(11)
+  neutrophil <- c(22)
+  # tcell_rich <- c(27, 24, 7)
+  tcell_rich_1 <- c(27)
+  tcell_rich_2 <- c(24)
+  tcell_rich_3 <- c(7)
+  mixed_inf <- c(26)
+
+  # Islet-edge/Inflamm.
+  islet_rim <- c(54, 6, 13, 52, 16)
+  islet_rim_maab <- c(35)
+  endothelial <- c(1,2,44,50)
+  exocrine_inflammation <- c(31, 37, 51)
+  myeloid_inflamm <- c(4,49, 9,46,38,59,18,53)
+  # Other:
+  ductal <- c(10,33,42)
+  ambiguous <- c(19)
+
+  # All clusts.
+  all_clust <- sort(c(exocrine_normal, nerves, smooth_muscle, cd303_vim,stroma,
+                    beta, alpha, mixed_islet, delta, islet_endothelial, 
+                    neutrophil, bcell_rich, tcell_rich_1, tcell_rich_2, tcell_rich_3, mixed_inf, 
+                    islet_rim, islet_rim_maab,exocrine_inflammation, myeloid_inflamm, endothelial,
+                    ductal, ambiguous))
+
+  if ((!length(unique(all_clust)) ==
+      length(unique(colData(pancreasSCE)[, method]))) ||
+      any(duplicated(all_clust))) {
+    stop("Recheck cluster attribution")
+  }
+}
+```
+
+```{r}
+new_annot <- TRUE
+if (new_annot) {
+  ## Annotations:
+  exocrine_normal <- c(5, 51, 54, 60)
+  ductal <- c(10, 43, 62)
+  nerves <- c(19)
+  smooth_muscle <- c(6, 14, 30, 34, 36, 64)
+  cd303_vim <- c(4, 16)
+  stroma_other <- c(3, 21, 32)
+  stroma_control <- c(27, 29, 52)
+  endothelial <- c(37, 48)
+  ambiguous <- c(22, 31)
+
+  # Islet CNs.
+  beta <- c(11, 13, 63, 47, 28)
+  alpha <- c(9, 18, 58, 68)
+  delta <- c(12, 20, 23, 24)
+  mixed_islet <- c(50, 56)
+  islet_other <- c(7, 40, 49, 67, 55)
+  islet_endothelial <- c(45)
+  
+  # Islet-Edge CNs.
+  islet_edge_control <- c(39, 70)
+  islet_edge_maab <- c(8)
+  islet_edge_rec <- c(2)
+
+  # Immune:
+  bcell_rich <- c(53)
+  tcell_rich_1 <- c(25)
+  tcell_rich_2 <- c(61, 65)
+  tcell_rich_3 <- c(42)
+  mixed_inf <- c(69)
+  mixed_inf_maab <- c(17)
+
+  # Innate/Exo Inflamm.
+  neutrophil <- c(33)
+  exocrine_inflammation <- c(41, 46)
+  myeloid_inflamm_maab <- c(1, 15, 35, 38, 66)
+  myeloid_inflamm_rec <- c(26, 44, 57, 59)
+
+  # All clusts.
+  all_clust <- sort(c(exocrine_normal, ductal, nerves, smooth_muscle, cd303_vim, 
+                    stroma_other, stroma_control, ambiguous, endothelial,
+                    beta, alpha, delta, mixed_islet, islet_endothelial,
+                    islet_edge_control, islet_edge_maab, islet_edge_rec, islet_other, 
+                    bcell_rich, tcell_rich_1, tcell_rich_2, tcell_rich_3, mixed_inf, mixed_inf_maab,
+                    neutrophil, exocrine_inflammation, myeloid_inflamm_maab, myeloid_inflamm_rec
+                    ))
+
+  if ((!length(unique(all_clust)) ==
+      length(unique(colData(pancreasSCE)[, method]))) ||
+      any(duplicated(all_clust))) {
+    stop("Recheck cluster attribution")
+  }
+}
+```
+
+Add to SCE.
+```{r annotate_CNs2}
+if (old_annot){
+  # Add cell types to the SCE object
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% exocrine_normal,
+    paste("CN", method, sep = "_")] <- "Exocrine CTRL"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% nerves,
+    paste("CN", method, sep = "_")] <- "Nerves"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% smooth_muscle,
+    paste("CN", method, sep = "_")] <- "Smooth-Muscle"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% cd303_vim,
+    paste("CN", method, sep = "_")] <- "CD303_VIM"  
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% stroma,
+    paste("CN", method, sep = "_")] <- "Stroma"
+
+  # Islet CNs.
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% beta,
+    paste("CN", method, sep = "_")] <- "Beta"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% alpha,
+    paste("CN", method, sep = "_")] <- "Alpha"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% delta,
+    paste("CN", method, sep = "_")] <- "Delta"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% mixed_islet,
+    paste("CN", method, sep = "_")] <- "Mixed-Islet"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% islet_endothelial,
+    paste("CN", method, sep = "_")] <- "Islet-Endothelial"
+
+  # Immune:
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% bcell_rich,
+    paste("CN", method, sep = "_")] <- "B-cell"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% tcell_rich_1,
+    paste("CN", method, sep = "_")] <- "T-cell 1"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% tcell_rich_2,
+    paste("CN", method, sep = "_")] <- "T-cell 2"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% tcell_rich_3,
+    paste("CN", method, sep = "_")] <- "T-cell 3"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% mixed_inf,
+    paste("CN", method, sep = "_")] <- "Mixed Inf"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% mixed_inf_maab,
+    paste("CN", method, sep = "_")] <- "Mixed Inf mAAB+"
+
+  # Innate/Exo Inflamm.
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% neutrophil,
+    paste("CN", method, sep = "_")] <- "Neutrophil"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% exocrine_inflammation,
+    paste("CN", method, sep = "_")] <- "Exocrine Inf"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% myeloid_inflamm_maab,
+    paste("CN", method, sep = "_")] <- "Myeloid Inf mAAB+"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% myeloid_inflamm_rec,
+    paste("CN", method, sep = "_")] <- "Myeloid Inf Onset"
+}
+```
+
+
+```{r annotate_CNs2}
+if (new_annot){
+  # Add cell types to the SCE object
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% exocrine_normal,
+    paste("CN", method, sep = "_")] <- "Exocrine CTRL"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% ductal,
+    paste("CN", method, sep = "_")] <- "Ductal"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% nerves,
+    paste("CN", method, sep = "_")] <- "Nerves"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% smooth_muscle,
+    paste("CN", method, sep = "_")] <- "Smooth-Muscle"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% cd303_vim,
+    paste("CN", method, sep = "_")] <- "CD303_VIM"  
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% stroma_other,
+    paste("CN", method, sep = "_")] <- "Stroma"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% stroma_control,
+    paste("CN", method, sep = "_")] <- "Stroma CTRL"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% endothelial,
+    paste("CN", method, sep = "_")] <- "Endothelial"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% ambiguous,
+    paste("CN", method, sep = "_")] <- "Ambiguous"
+
+  # Islet CNs.
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% beta,
+    paste("CN", method, sep = "_")] <- "Beta"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% alpha,
+    paste("CN", method, sep = "_")] <- "Alpha"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% mixed_islet,
+    paste("CN", method, sep = "_")] <- "Mixed-Islet"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% delta,
+    paste("CN", method, sep = "_")] <- "Delta"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% islet_endothelial,
+    paste("CN", method, sep = "_")] <- "Islet-Endothelial"
+  
+  # Islet-Edge CNs.
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% islet_edge_control,
+    paste("CN", method, sep = "_")] <- "Islet-Edge CTRL"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% islet_edge_maab,
+    paste("CN", method, sep = "_")] <- "Islet-Edge mAAB+"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% islet_edge_rec,
+    paste("CN", method, sep = "_")] <- "Islet-Edge Onset"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% islet_other,
+    paste("CN", method, sep = "_")] <- "Islet-Other"
+
+  # Immune:
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% bcell_rich,
+    paste("CN", method, sep = "_")] <- "B-cell"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% tcell_rich_1,
+    paste("CN", method, sep = "_")] <- "T-cell 1"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% tcell_rich_2,
+    paste("CN", method, sep = "_")] <- "T-cell 2"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% tcell_rich_3,
+    paste("CN", method, sep = "_")] <- "T-cell 3"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% mixed_inf,
+    paste("CN", method, sep = "_")] <- "Mixed Inf"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% mixed_inf_maab,
+    paste("CN", method, sep = "_")] <- "Mixed Inf mAAB+"
+
+  # Innate/Exo Inflamm.
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% neutrophil,
+    paste("CN", method, sep = "_")] <- "Neutrophil"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% exocrine_inflammation,
+    paste("CN", method, sep = "_")] <- "Exocrine Inf"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% myeloid_inflamm_maab,
+    paste("CN", method, sep = "_")] <- "Myeloid Inf mAAB+"
+  colData(pancreasSCE)[colData(pancreasSCE)[
+    , method] %in% myeloid_inflamm_rec,
+    paste("CN", method, sep = "_")] <- "Myeloid Inf Onset"
+}
+```
+
+```{r}
+# save pancreasSCE
+fn <- file.path(paths$folder_script, "pancreasSCE_aggII.rds")
+saveRDS(pancreasSCE, fn)
+# pancreasSCE <- readRDS(fn)
+# method <- "cn_k1070"
+```
+
+```{r}
+# join with other cell_cluster_scaled data
+# 
+if (old_annot){
+  temp_df <- readRDS(file.path(paths$folder_script, "temp_df.rds"))
+  temp_df <- temp_df |> 
+    select(cell_id, immune_cl = cell_cluster_scaled)
+
+  test <- colData(pancreasSCE) |> 
+    tibble::as_tibble(rownames = "id") |>
+    left_join(temp_df, by = "cell_id")
+
+  temp_t <- test |> 
+    mutate(cell_cluster_scaled = immune_cl) |>
+    as.data.frame()
+
+  rownames(temp_t) <- temp_t$id
+  colData(pancreasSCE) <- DataFrame(temp_t)
+}
+```
+
+## A3.5 Plot by relative cell type abundance
+
+Fractions of CNs.
+```{r community_detection4}
+df_cn <- colData(pancreasSCE) |> 
+  as_tibble() |> 
+  # filter(donor_type != "Pancreatitis") |> 
+  select(donor_type, case_id, image_id, cell_type, distance_to_islet, cell_cluster_scaled, cell_id, starts_with("cn_"), age, diabetes_duration, starts_with("CN")) |> 
+  mutate(donor_type = forcats::fct_drop(donor_type)) |> 
+  mutate(case_id = forcats::fct_drop(case_id))
+
+# Replace the rownames with the annotations
+annots <-colData(pancreasSCE) |> 
+  as_tibble() |> 
+  select(tidyselect::starts_with("CN", ignore.case = FALSE), !!method) |> 
+  distinct(CN_cn_k1070, cn_k1070) |> 
+  arrange(cn_k1070) |> 
+  tidyr::unite("CN_cn_k1070", CN_cn_k1070, cn_k1070, sep = "_")
+
+for_plot <- prop.table(table(as.character(pancreasSCE[[paste("CN", method, sep = "_")]]), 
+  pancreasSCE$cell_type), margin = 1)
+```
+
+Plot the presence of cell types in CNs.
+```{r plot_supp_fig}
+# Display the heatmap
+for_plot_scaled <- scale(for_plot)
+for_plot_scaled <- for_plot_scaled[rownames(for_plot_scaled) != "Ambiguous", ]
+
+# Counts
+ct_anno <- as.data.frame(table(pancreasSCE[[paste("CN", method, sep = "_")]]))
+rownames(ct_anno) <- ct_anno$Var1
+cell_type_counts <- ct_anno$Freq
+names(cell_type_counts) <- ct_anno$Var1
+cell_type_counts <- cell_type_counts[names(cell_type_counts) != "Ambiguous"]
+
+fn <- file.path(paths$folder_script, paste0(paste(today, "Heatmap_comp", "CN_complete_2", sep = "_"), '.png'))
+
+# Create row annotation for cell type counts
+row_anno <- ComplexHeatmap::rowAnnotation(
+  Counts = ComplexHeatmap::anno_barplot(cell_type_counts, 
+                         gp = grid::gpar(fill = "skyblue", col = "black"),
+                         border = TRUE,
+                         width = grid::unit(4, "cm"),
+      axis_param = list(gp = grid::gpar(fontsize = 25)),
+),       show_annotation_name = FALSE
+)
+
+saveRDS(cell_type_counts, file.path(paths$home_git, "figures", "extfig7a_anno.rds"))
+saveRDS(for_plot_scaled, file.path(paths$home_git, "figures", "extfig7a_CH.rds"))
+
+png(fn, width = 1200, height = 1000)
+p <- ComplexHeatmap::Heatmap(for_plot_scaled, name = "Scaled fraction", 
+                              #col= colorRampPalette(c("blue", "white", "red"))(100),
+                              show_row_names = TRUE, show_column_names = TRUE,
+                              cluster_rows = TRUE, cluster_columns = TRUE,
+                              row_names_gp = grid::gpar(fontsize = 25, fontfamily = "Arial"),
+                              column_names_gp = grid::gpar(fontsize = 25, fontfamily = "Arial"), 
+                              heatmap_legend_param = list(legend_direction = "horizontal",
+                                                          title_position = "topcenter",
+                                                          title_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"),
+                                                          labels_gp = grid::gpar(fontsize = 30, fontfamily = "Arial")),                             
+                            row_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for rows
+                            column_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for columns
+                            row_names_side = "left",
+                            row_dend_side = "right") + 
+      row_anno
+
+
+ComplexHeatmap::draw(p, heatmap_legend_side = "top", 
+                      padding = unit(c(20, 35, 2, 2), "mm"))   # right and bottom padding
+dev.off()
+```
+
+# A4: Enrichment in CNs
+
+## A4.1. Myeloid: Full; all CNs.
+
+First, plot scaled enrichment of myeloid subtypes in CNs.
+Maybe change here also to Chisq.
+
+```{r myeloid_CNs_all}
+## Make Heatmap with x = cell_cluster_scaled, y = cn_k1060, fill = fraction
+## Normalize by columns, i.e. by Subcluster.
+# method <- "cn_k1060"
+myeloid_df <- df_cn |> 
+  dplyr::select(donor_type, case_id, image_id, cell_cluster_scaled, starts_with("CN"), cell_type, all_of(method)) |>
+  dplyr::rename(method = !!method) |>
+  filter(cell_type %in% c("Myeloid")) |> 
+  filter(cell_cluster_scaled != "Myeloid_Other")
+
+myeloid_fraction <- myeloid_df |> 
+  add_count(method, name = "n") |> # total Myeloid in that cluster
+  dplyr::count(method, cell_cluster_scaled, n, name = "nn") |> 
+  tidyr::complete(cell_cluster_scaled, method) |> 
+  mutate(fraction = nn/n) |> 
+  replace_na(list(fraction = 0, n = 0, nn = 0))
+
+myeloid_scaled <- myeloid_fraction |> 
+  ## z-scale the fractions by cell_cluster_scaled
+  group_by(cell_cluster_scaled) |>
+  mutate(fraction_scale = scale(fraction)) |> 
+  ungroup() |> 
+  select(cell_cluster_scaled, method, fraction_scale) |> 
+  mutate(cell_cluster_scaled = factor(cell_cluster_scaled, levels = unique(myeloid_fraction$cell_cluster_scaled))) |> 
+  mutate(method = factor(method, levels = unique(myeloid_fraction$method))) |>
+  as.data.frame()
+
+# Reshape the data frame to a matrix
+df_wide <- myeloid_scaled %>%
+  tidyr::spread(key = method, value = fraction_scale)
+
+# Convert to matrix
+df_matrix <- as.matrix(df_wide[,-1])
+rownames(df_matrix) <- df_wide$cell_cluster
+colnames(df_matrix) <- annots$CN_cn_k1070
+
+
+## Fractions - Scaled
+fn <- file.path(paths$folder_script, paste0(paste(today, "Heatmap", "CN_Cluster_CellType_Myeloid", sep = "_"), ".png"))
+png(fn, width = 1500, height = 800)
+p <- ComplexHeatmap::Heatmap(df_matrix, name = "Scaled", 
+                             # col= colorRampPalette(c("blue", "white", "red"))(100),
+                             show_row_names = TRUE, show_column_names = TRUE,
+                             cluster_rows = TRUE, cluster_columns = TRUE,
+                             row_names_gp = grid::gpar(fontsize = 20, fontfamily = "Arial"),
+                             column_names_gp = grid::gpar(fontsize = 20, fontfamily = "Arial"), 
+                             heatmap_legend_param = list(#legend_direction = "vertical",
+                             #                           #  title_position = "topcenter",
+                                                          title_gp = grid::gpar(fontsize = 20, fontfamily = "Arial"),
+                                                          labels_gp = grid::gpar(fontsize = 15, fontfamily = "Arial")),                             
+                            row_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for rows
+                            column_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for columns
+                            row_names_side = "right",
+                            row_dend_side = "left")
+
+ComplexHeatmap::draw(p, heatmap_legend_side = "right", 
+                      padding = unit(c(10, 10, 5, 15), "mm"))   # right and bottom padding
+
+dev.off()
+```
+
+## A4.2. Myeloid: Collapsed CNs.
+Repeat plot, but now with collapsed CNs.
+```{r myeloid_cns_collapsed}
+## Normalize by columns, i.e. by Subcluster.
+myeloid_df <- df_cn |> 
+  dplyr::select(donor_type, case_id, image_id, cell_cluster_scaled, starts_with("CN"), cell_type, all_of(method)) |>
+  dplyr::rename(method = !!method) |>
+  filter(cell_type %in% c("Myeloid"))  |> 
+  filter(cell_cluster_scaled != "Myeloid_Other")
+
+myeloid_fraction <- myeloid_df|> 
+  add_count(CN_cn_k1070, name = "n") |> # total Myeloid in that cluster
+  dplyr::count(CN_cn_k1070, cell_cluster_scaled, n, name = "nn") |> 
+  tidyr::complete(cell_cluster_scaled, CN_cn_k1070) |> 
+  mutate(fraction = nn/n) |> 
+  replace_na(list(fraction = 0, n = 0, nn = 0))
+
+myeloid_scaled <- myeloid_fraction |> 
+  ## z-scale the fractions by cell_cluster_scaled
+  group_by(cell_cluster_scaled) |>
+  mutate(fraction_scale = scale(fraction)) |> 
+  ungroup() |> 
+  select(cell_cluster_scaled, CN_cn_k1070, fraction_scale) |> 
+  mutate(cell_cluster_scaled = factor(cell_cluster_scaled, levels = unique(myeloid_fraction$cell_cluster_scaled))) |> 
+  mutate(CN_cn_k1070 = factor(CN_cn_k1070, levels = unique(myeloid_fraction$CN_cn_k1070))) |>
+  as.data.frame()
+
+# Reshape the data frame to a matrix
+df_wide <- myeloid_scaled %>%
+  tidyr::spread(key = CN_cn_k1070, value = fraction_scale)
+
+# Convert to matrix
+df_matrix <- as.matrix(df_wide[,-1])
+rownames(df_matrix) <- df_wide$cell_cluster
+rownames(df_matrix) <- ifelse(rownames(df_matrix) == "Myeloid_3", "Activated M1/M2", rownames(df_matrix))
+rownames(df_matrix) <- ifelse(rownames(df_matrix) == "Myeloid_4", "cDC", rownames(df_matrix))
+
+## Fractions - Scaled
+fn <- file.path(paths$folder_script, paste0(paste(today, "Heatmap", "CN_Cluster_CellType_Myeloid_Annots", sep = "_"), ".png"))
+png(fn, width = 1500, height = 800)
+p <- ComplexHeatmap::Heatmap(df_matrix, name = "Scaled", 
+                             # col= colorRampPalette(c("blue", "white", "red"))(100),
+                             show_row_names = TRUE, show_column_names = TRUE,
+                             cluster_rows = TRUE, cluster_columns = TRUE,
+                             row_names_gp = grid::gpar(fontsize = 20, fontfamily = "Arial"),
+                             column_names_gp = grid::gpar(fontsize = 20, fontfamily = "Arial"), 
+                             heatmap_legend_param = list(#legend_direction = "vertical",
+                             #                           #  title_position = "topcenter",
+                                                          title_gp = grid::gpar(fontsize = 20, fontfamily = "Arial"),
+                                                          labels_gp = grid::gpar(fontsize = 15, fontfamily = "Arial")),                             
+                            row_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for rows
+                            column_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for columns
+                            row_names_side = "right",
+                            row_dend_side = "left")
+
+ComplexHeatmap::draw(p, heatmap_legend_side = "right", 
+                      padding = unit(c(10, 10, 5, 15), "mm"))   # right and bottom padding
+
+dev.off()
+```
+
+## A4.3: Myeloid (collapsed CNs): Chi-squared test
+
+Perform a chi-squared test to identify significant associations between CNs and cell types.
+
+```{r myeloid_chisq}
+## Make this a chi-squared test.
+tt <- myeloid_df |> select(cell_cluster_scaled, CN_cn_k1070) |> 
+  filter(cell_cluster_scaled != "Myeloid_Other")
+
+set.seed(222)
+chisq <- chisq.test(tt$CN_cn_k1070, tt$cell_cluster_scaled)
+
+# Remove for visualization.
+to_delete_rows <- c("Stroma CTRL", "Stroma", "Nerves", "CD303_VIM", 
+                    "Smooth-Muscle", "Ambiguous", "Ductal", "Neutrophil",
+                    "Islet-Other", 
+                    "Mixed Inf", "Mixed Islet", "Myeloid Inf mAAB+")
+
+chisq$residuals <- chisq$residuals[!(rownames(chisq$residuals) %in% to_delete_rows), ]
+
+# change Islet-Rim to Islet-Edge
+rownames(chisq$residuals) <- ifelse(rownames(chisq$residuals) == "Islet-Rim mAAB+", "Islet-Edge mAAb+", rownames(chisq$residuals))
+
+saveRDS(chisq, file.path(paths$home_git, "figures", "chisq_fig5g.rds"))
+
+fn <- file.path(paths$folder_script, paste0(paste(today, "ChiSq", "CN_Cluster_CellType_Myeloid_selected", sep = "_"), ".png"))
+png(fn, units = "mm", width = 450, height = 300, res = 300)
+
+p <- ComplexHeatmap::Heatmap(chisq$residuals,  
+                             name = "Chi-squared residuals", 
+                             cluster_columns = TRUE, cluster_rows = TRUE,
+                             # Increase font size
+                              row_names_gp = grid::gpar(fontsize = 20, fontfamily = "Arial"),
+                              column_names_gp = grid::gpar(fontsize = 20, fontfamily = "Arial"),
+                                     heatmap_legend_param = list(
+        legend_height = unit(20, "cm"), # Adjust this to the height of x-axis ticks
+        legend_width = unit(1, "cm"), # Adjust the width if needed
+        title = NULL))
+
+ComplexHeatmap::draw(p, heatmap_legend_side = "right", 
+                      padding = unit(c(10, 15, 5, 15), "mm"))   # right and bottom padding
+# save:
+dev.off()
+```
+
+P-values:
+```{r myeloid_chisq}
+# Extract the standardized residuals
+std_residuals <- chisq$stdres
+
+p_values <- 2 * pnorm(-abs(std_residuals))
+p_adj <- matrix(p.adjust(p_values, method = "fdr"), 
+                            nrow = nrow(p_values), 
+                            dimnames = dimnames(p_values))
+p_adj |> as_tibble(row.names = "id")
+
+print("Adjusted P-values:")
+print(sort(p_adj[, "Myeloid_3"]))
+print(sort(p_adj[, "Myeloid_4"]))
+print(sort(p_adj[, "Myeloid_5"]))
+
+print(sort(p_adj["T-cell 1", ]))
+print(sort(p_adj["T-cell 2", ]))
+print(sort(p_adj["T-cell 3", ]))
+print(sort(p_adj["B-cell", ]))
+```
+
+## A4.4 T_CD4_full.
+```{r tcd4_CNs}
+## Make Heatmap with x = cell_cluster_scaled, y = cn_k1070, fill = fraction
+## Normalize by columns, i.e. by Subcluster.
+t_cd4_df <- df_cn |> 
+  dplyr::select(donor_type, case_id, image_id, cell_cluster_scaled, cell_type, 
+                all_of(method), CN_cn_k1070) |>
+  dplyr::rename(method = !!method) |>
+  filter(cell_type %in% c("T_CD4")) |> 
+  filter(!cell_cluster_scaled %in% c("T_CD4_Other"))
+                                                        
+tcd4_fraction <- t_cd4_df |> 
+  add_count(method, name = "n") |> # total Myeloid in that cluster
+  dplyr::count(method, cell_cluster_scaled, n, name = "nn") |> 
+  tidyr::complete(cell_cluster_scaled, method) |> 
+  mutate(fraction = nn/n) |> 
+  replace_na(list(fraction = 0, n = 0, nn = 0))
+
+tcd4_fraction_scaled <- tcd4_fraction |> 
+  ## z-scale the fractions by cell_cluster_scaled
+  group_by(cell_cluster_scaled) |>
+  mutate(fraction_scale = scale(fraction)) |> 
+  ungroup() |> 
+  select(cell_cluster_scaled, method, fraction_scale) |> 
+  mutate(cell_cluster_scaled = factor(cell_cluster_scaled, levels = unique(tcd4_fraction$cell_cluster_scaled))) |> 
+  mutate(method = factor(method, levels = unique(tcd4_fraction$method))) |>
+  as.data.frame()
+
+# Reshape the data frame to a matrix
+df_wide <- tcd4_fraction_scaled %>%
+  tidyr::spread(key = method, value = fraction_scale)
+
+# Convert to matrix
+df_matrix <- as.matrix(df_wide[,-1])
+rownames(df_matrix) <- df_wide$cell_cluster
+colnames(df_matrix) <- annots$CN_cn_k1070
+
+## Fractions - Scaled
+fn <- file.path(paths$folder_script, 
+  paste0(paste(today, "Heatmap", "CN_Cluster_CellType_TCD4", sep = "_"), ".png"))
+png(fn, units = "mm", width = 300, height = 200, res = 300)
+ComplexHeatmap::Heatmap(df_matrix, name = "Fraction Scale",
+        row_title = "Cell Cluster",
+        column_title = "Method", 
+        cluster_columns = TRUE, cluster_rows = TRUE)
+dev.off()
+```
+
+## A4.5: T-CD4 Collapsed:
+```{r tcd4_cns_collapsed}
+## Normalize by columns, i.e. by Subcluster.
+tcd4_df <- df_cn |> 
+  dplyr::select(donor_type, case_id, image_id, cell_cluster_scaled, 
+        starts_with("CN"), cell_type, all_of(method)) |>
+  dplyr::rename(method = !!method) |>
+  filter(cell_type %in% c("T_CD4")) |> 
+  filter(!cell_cluster_scaled %in% c("T_CD4_Other"))
+
+t_cd4_fraction <- tcd4_df|> 
+  add_count(CN_cn_k1070, name = "n") |> # total Myeloid in that cluster
+  dplyr::count(CN_cn_k1070, cell_cluster_scaled, n, name = "nn") |> 
+  tidyr::complete(cell_cluster_scaled, CN_cn_k1070) |> 
+  mutate(fraction = nn/n) |> 
+  replace_na(list(fraction = 0, n = 0, nn = 0))
+
+t_cd4_scaled <- t_cd4_fraction |> 
+  ## z-scale the fractions by cell_cluster_scaled
+  group_by(cell_cluster_scaled) |>
+  mutate(fraction_scale = scale(fraction)) |> 
+  ungroup() |> 
+  select(cell_cluster_scaled, CN_cn_k1070, fraction_scale) |> 
+  mutate(cell_cluster_scaled = factor(cell_cluster_scaled, levels = unique(t_cd4_fraction$cell_cluster_scaled))) |> 
+  mutate(CN_cn_k1070 = factor(CN_cn_k1070, levels = unique(t_cd4_fraction$CN_cn_k1070))) |>
+  as.data.frame()
+
+# Reshape the data frame to a matrix
+df_wide <- t_cd4_scaled %>%
+  tidyr::spread(key = CN_cn_k1070, value = fraction_scale)
+
+# Convert to matrix
+df_matrix <- as.matrix(df_wide[,-1])
+rownames(df_matrix) <- df_wide$cell_cluster
+
+## Fractions - Scaled
+fn <- file.path(paths$folder_script, paste0(paste(today, "Heatmap", "CN_Cluster_CellType_T_CD4_Annots", sep = "_"), ".png"))
+png(fn, units = "mm", width = 300, height = 200, res = 300)
+ComplexHeatmap::Heatmap(df_matrix, name = "Fraction Scale",
+        row_title = "Cell Cluster",
+        column_title = "Method", 
+        cluster_columns = TRUE, cluster_rows = TRUE)
+dev.off()
+## 
+```
+
+## A4.6: Chi-squared Test: T-CD4 - Selected
+```{r chisq_tcd4}
+tt <- t_cd4_df |> select(cell_cluster_scaled, CN_cn_k1070) |> 
+  filter(!cell_cluster_scaled %in% c("T_CD4_Other"))
+
+set.seed(222)
+
+chisq <- chisq.test(tt$CN_cn_k1070, tt$cell_cluster_scaled)
+
+# Remove for visualization.
+# New rows: Mixed Inf mAAb+ (Myeloid-5), Islet-Other Beta-, Islet-Edge Onset, 
+# Mixed Inf, Islet-Other Beta+, Islet-Edge Onset (+mAAB+/CTRL), 
+# Delta? 
+# Myeloid Inf Onset (Myeloid-5), Myeloid Inf mAAB+ (?)
+
+
+chisq$residuals <- chisq$residuals[!(rownames(chisq$residuals) %in% to_delete_rows), ]
+# change Islet-Rim to Islet-Edge
+rownames(chisq$residuals) <- ifelse(rownames(chisq$residuals) == "Islet-Rim mAAB+", "Islet-Edge mAAb+", rownames(chisq$residuals))
+
+saveRDS(chisq, file.path(paths$home_git, "figures", "chisq_extfig7b.rds"))
+
+fn <- file.path(paths$folder_script, paste0(paste(today, "ChiSq", "CN_Cluster_CellType_TCD4_selected", sep = "_"), ".png"))
+png(fn, units = "mm", width = 450, height = 300, res = 300)
+
+p <- ComplexHeatmap::Heatmap(chisq$residuals,  
+                             name = "Chi-squared residuals", 
+                             cluster_columns = TRUE, cluster_rows = TRUE,
+                             # Increase font size
+                              row_names_gp = grid::gpar(fontsize = 20, fontfamily = "Arial"),
+                              column_names_gp = grid::gpar(fontsize = 20, fontfamily = "Arial"),
+                                     heatmap_legend_param = list(
+        legend_height = unit(20, "cm"), # Adjust this to the height of x-axis ticks
+        legend_width = unit(1, "cm"), # Adjust the width if needed
+        title = NULL))
+ComplexHeatmap::draw(p, heatmap_legend_side = "right", 
+                      padding = unit(c(10, 15, 5, 15), "mm"))   # right and bottom padding
+# save:
+dev.off()
+```
+
+Chisquared p-values.
+T-CD4-5: Potentially beta-cell specific
+T-CD4-10: T-regs? Beta-cell CN enrichment.
+T-CD4-7: Potentially part of pathogenic T-cell infiltrate.
+
+```{r t-cd4-chisq}
+# Extract the standardized residuals
+std_residuals <- chisq$stdres
+
+p_values <- 2 * pnorm(-abs(std_residuals))
+p_adj <- matrix(p.adjust(p_values, method = "fdr"), 
+                            nrow = nrow(p_values), 
+                            dimnames = dimnames(p_values))
+p_adj |> as_tibble(row.names = "id")
+
+print("Adjusted P-values:")
+print(sort(p_adj[, "T_CD4_5"]))
+print(sort(p_adj[, "T_CD4_7"]))
+print(sort(p_adj[, "T_CD4_10"]))
+print(sort(p_adj[, "T_CD4_9"]))
+```
+
+## A4.7: T-CD8
+
+```{r tcd8_CNs}
+t_cd8_df <- df_cn |> 
+  dplyr::select(donor_type, case_id, image_id, cell_cluster_scaled, cell_type, all_of(method), starts_with("CN")) |>
+  dplyr::rename(method = !!method) |>
+  filter(cell_type %in% c("T_CD8"))
+
+tcd8_fraction <- t_cd8_df |> 
+  add_count(method, name = "n") |> # total cells in that cluster
+  dplyr::count(method, cell_cluster_scaled, n, name = "nn") |> 
+  tidyr::complete(cell_cluster_scaled, method) |> 
+  mutate(fraction = nn/n) |> 
+  replace_na(list(fraction = 0, n = 0, nn = 0))
+
+tcd8_fraction_scaled <- tcd8_fraction |> 
+  ## z-scale the fractions by cell_cluster_scaled
+  group_by(cell_cluster_scaled) |>
+  mutate(fraction_scale = scale(fraction)) |> 
+  ungroup() |> 
+  select(cell_cluster_scaled, method, fraction_scale) |> 
+  mutate(cell_cluster_scaled = factor(cell_cluster_scaled, levels = unique(tcd8_fraction$cell_cluster_scaled))) |> 
+  mutate(method = factor(method, levels = unique(tcd4_fraction$method))) |>
+  as.data.frame()
+
+# Reshape the data frame to a matrix
+df_wide <- tcd8_fraction_scaled %>%
+  tidyr::spread(key = method, value = fraction_scale)
+
+# Convert to matrix
+df_matrix <- as.matrix(df_wide[,-1])
+rownames(df_matrix) <- df_wide$cell_cluster
+colnames(df_matrix) <- annots$CN_cn_k1070
+
+## Fractions - Scaled
+fn <- file.path(paths$folder_script, 
+  paste0(paste(today, "Heatmap", "CN_Cluster_CellType_TCD8", sep = "_"), ".png"))
+png(fn, units = "mm", width = 300, height = 200, res = 300)
+ComplexHeatmap::Heatmap(df_matrix, name = "Fraction Scale",
+        row_title = "Cell Cluster",
+        column_title = "Method", 
+        cluster_columns = TRUE, cluster_rows = TRUE)
+dev.off()
+```
+
+Collapsed versions.
+
+```{r}
+tcd8_df <- df_cn |> 
+  dplyr::select(donor_type, case_id, image_id, cell_cluster_scaled, starts_with("CN"), cell_type, all_of(method)) |>
+  dplyr::rename(method = !!method) |>
+  filter(cell_type %in% c("T_CD8"))
+
+tcd8_fraction <- tcd8_df|> 
+  add_count(CN_cn_k1070, name = "n") |> # total Myeloid in that cluster
+  dplyr::count(CN_cn_k1070, cell_cluster_scaled, n, name = "nn") |> 
+  tidyr::complete(cell_cluster_scaled, CN_cn_k1070) |> 
+  mutate(fraction = nn/n) |> 
+  replace_na(list(fraction = 0, n = 0, nn = 0))
+
+tcd8_scaled <- tcd8_fraction |> 
+  ## z-scale the fractions by cell_cluster_scaled
+  group_by(cell_cluster_scaled) |>
+  mutate(fraction_scale = scale(fraction)) |> 
+  ungroup() |> 
+  select(cell_cluster_scaled, CN_cn_k1070, fraction_scale) |> 
+  mutate(cell_cluster_scaled = factor(cell_cluster_scaled, levels = unique(tcd8_fraction$cell_cluster_scaled))) |> 
+  mutate(CN_cn_k1070 = factor(CN_cn_k1070, levels = unique(tcd8_fraction$CN_cn_k1070))) |>
+  as.data.frame()
+
+# Reshape the data frame to a matrix
+df_wide <- tcd8_scaled %>%
+  tidyr::spread(key = CN_cn_k1070, value = fraction_scale)
+
+# Convert to matrix
+df_matrix <- as.matrix(df_wide[,-1])
+rownames(df_matrix) <- df_wide$cell_cluster
+
+## Fractions - Scaled
+fn <- file.path(paths$folder_script, paste0(paste(today, "Heatmap", "CN_Cluster_CellType_TCD8_Annots", sep = "_"), ".png"))
+png(fn, units = "mm", width = 300, height = 200, res = 300)
+ComplexHeatmap::Heatmap(df_matrix, name = "Fraction Scale",
+        row_title = "Cell Cluster",
+        column_title = "Method", 
+        cluster_columns = TRUE, cluster_rows = TRUE)
+dev.off()
+```
+
+### Chi-squared Test: T-CD8 - Selected
+```{r chi-sq-selected}
+tt <- t_cd8_df |> select(cell_cluster_scaled, CN_cn_k1070)
+set.seed(222)
+chisq <- chisq.test(tt$CN_cn_k1070, tt$cell_cluster_scaled)
+
+# Remove for visualization.
+chisq$residuals <- chisq$residuals[!(rownames(chisq$residuals) %in% to_delete_rows), ]
+# change Islet-Rim to Islet-Edge
+rownames(chisq$residuals) <- ifelse(rownames(chisq$residuals) == "Islet-Rim mAAB+", "Islet-Edge mAAb+", rownames(chisq$residuals))
+
+saveRDS(chisq, file.path(paths$home_git, "figures", "chisq_extfig7c.rds"))
+
+fn <- file.path(paths$folder_script, paste0(paste(today, "ChiSq", "CN_Cluster_CellType_TCD8_selected", sep = "_"), ".png"))
+png(fn, units = "mm", width = 450, height = 300, res = 300)
+
+p <- ComplexHeatmap::Heatmap(chisq$residuals,  
+                             name = "Chi-squared residuals", 
+                             cluster_columns = TRUE, cluster_rows = TRUE,
+                             # Increase font size
+                              row_names_gp = grid::gpar(fontsize = 20, fontfamily = "Arial"),
+                              column_names_gp = grid::gpar(fontsize = 20, fontfamily = "Arial"),
+                                     heatmap_legend_param = list(
+        legend_height = unit(20, "cm"), # Adjust this to the height of x-axis ticks
+        legend_width = unit(1, "cm"), # Adjust the width if needed
+        title = NULL))
+
+ComplexHeatmap::draw(p, heatmap_legend_side = "right", 
+                      padding = unit(c(10, 15, 5, 15), "mm"))   # right and bottom padding
+# save:
+dev.off()
+```
+
+P-values:
+Calculate FDR-adjusted p-values for the chi-squared test for the CD8+ T-cell enrichment.
+```{r fdr-adjust}
+# Extract the standardized residuals
+std_residuals <- chisq$stdres
+
+p_values <- 2 * pnorm(-abs(std_residuals))
+p_adj <- matrix(p.adjust(p_values, method = "fdr"), 
+                            nrow = nrow(p_values), 
+                            dimnames = dimnames(p_values))
+p_adj |> as_tibble(row.names = "id")
+
+print("Adjusted P-values:")
+print(sort(p_adj[, "T_CD8_7"]))
+
+print(sort(p_adj[, "T-naive"]))
+print(sort(p_adj[, "T_CD8_1"]))
+print(sort(p_adj[, "T_CD8_3"]))
+print(sort(p_adj[, "T_CD8_2"]))
+print(sort(p_adj[, "T_CD8_6"]))
+print(sort(p_adj[, "T_CD8_4"]))
+```
+
+```{r}
+tt <- t_cd8_df |> select(cell_cluster_scaled, CN_cn_k1060) |> 
+  filter(CN_cn_k1060 != "B-cell") |> 
+  mutate(CN_cn_k1060 = ifelse(CN_cn_k1060 %in% c("T-cell 1", "T-cell 2", "T-cell 3"), CN_cn_k1060, "Other"))
+
+set.seed(222)
+chisq <- chisq.test(tt$CN_cn_k1060, tt$cell_cluster_scaled)
+
+fn <- file.path(paths$folder_script, paste0(paste(today, "ChiSq", "CN_Cluster_CellType_TCD8_selected_reduced", sep = "_"), ".png"))
+png(fn, units = "mm", width = 450, height = 175, res = 300)
+
+p <- ComplexHeatmap::Heatmap(chisq$residuals,  
+                             name = "Chi-squared residuals", 
+                             cluster_columns = TRUE, cluster_rows = TRUE,
+                             # Increase font size
+                              row_names_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"),
+                              column_names_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"),
+                                     heatmap_legend_param = list(
+        legend_height = unit(8, "cm"), # Adjust this to the height of x-axis ticks
+        legend_width = unit(2, "cm"), # Adjust the width if needed
+        title = expression(Chi^2 ~ "Residuals"),        
+        title_gp = grid::gpar(fontsize = 32), # Legend title size
+        legend_gp = grid::gpar(fontsize = 28, fontfamily = "Arial"),
+        labels_gp = grid::gpar(fontsize = 28, fontfamily = "Arial")))
+
+ComplexHeatmap::draw(p, heatmap_legend_side = "right", 
+                      padding = unit(c(10, 15, 5, 15), "mm"))   # right and bottom padding
+dev.off()
+```
+
+Test enrichment in beta-cell CNs vs other ISLET CNs.
+```{r t-cd8-lineplot}
+# Get enrichment of subtypes within CNs.
+# CN ~ counts (subtypes) + ((donor_type|case_id)) 
+# cbind(n_success, n_failure) ~ stage + (1 + stage | patient_id)
+tt <- t_cd8_df |> select(cell_cluster_scaled, donor_type, CN_cn_k1060, image_id, case_id) |> 
+  filter(CN_cn_k1060 %in% c("Beta", "Alpha", "Delta", "Mixed-Islet", "Islet-Edge CTRL", "Islet-Edge mAAb+")) |> 
+  mutate(CN_cn_k1060 = ifelse(CN_cn_k1060 == "Beta", "Beta", "Other")) |> 
+  mutate(islet_type = ifelse(image_id %in% icis, "ICI", "IDI")) |>
+  filter(islet_type == "ICI")
+
+# NoDiabetes
+tt_nd  <- tt  |> filter(donor_type == "NoDiabetes")
+tt_saab <- tt |> filter(donor_type == "sAAb+")
+tt_maab <- tt |> filter(donor_type == "mAAb+")
+tt_rec <- tt |> filter(donor_type == "RecentOnset")
+
+# 
+set.seed(222)
+chisq_nd <- chisq.test(tt_nd$CN_cn_k1060, tt_nd$cell_cluster_scaled)
+std_residuals <- chisq_nd$residuals
+
+p_values <- 2 * pnorm(-abs(std_residuals))
+p_adj_nd <- matrix(p.adjust(p_values, method = "BH"), 
+                            nrow = nrow(p_values), 
+                            dimnames = dimnames(p_values))
+
+# sAAb+:
+chisq_saab <- chisq.test(tt_saab$CN_cn_k1060, tt_saab$cell_cluster_scaled)
+std_residuals <- chisq_saab$residuals
+p_values <- 2 * pnorm(-abs(std_residuals))
+p_adj_saab <- matrix(p.adjust(p_values, method = "BH"), 
+                            nrow = nrow(p_values), 
+                            dimnames = dimnames(p_values))
+
+# mAAb+: 
+chisq_maab <- chisq.test(tt_maab$CN_cn_k1060, tt_maab$cell_cluster_scaled)
+std_residuals <- chisq_maab$residuals
+p_values <- 2 * pnorm(-abs(std_residuals))
+p_adj_maab <- matrix(p.adjust(p_values, method = "BH"), 
+                              nrow = nrow(p_values), 
+                              dimnames = dimnames(p_values))
+
+# REC:
+chisq_rec <- chisq.test(tt_rec$CN_cn_k1060, tt_rec$cell_cluster_scaled)
+std_residuals <- chisq_rec$residuals
+p_values <- 2 * pnorm(-abs(std_residuals))
+p_adj_rec <- matrix(p.adjust(p_values, method = "BH"), 
+                            nrow = nrow(p_values), 
+                            dimnames = dimnames(p_values))
+
+# Combine p-vals
+p_adj_all <- cbind(p_adj_nd["Beta", ], p_adj_saab["Beta", ], 
+                    p_adj_maab["Beta", ], p_adj_rec["Beta", ]) |> tibble::as_tibble(rownames = "cell_cluster_scaled")
+colnames(p_adj_all) <- c("cell_cluster_scaled", "NoDiabetes", "sAAb+", "mAAb+", "RecentOnset")
+p_adj_all 
+
+# Plot that as a graph
+p <- p_adj_all |> 
+  pivot_longer(cols = -cell_cluster_scaled, names_to = "donor_type", values_to = "p_adj") |>
+  mutate(logpadj = -log10(p_adj)) |> 
+  mutate(logpadj = ifelse(logpadj > 16, 16, logpadj)) |>
+  mutate(donor_type = factor(donor_type, levels = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"))) |>
+  ggplot(aes(x = donor_type, y = logpadj, group = cell_cluster_scaled, color = cell_cluster_scaled)) +
+  geom_line() +  # Connect points with lines
+  geom_point() +  # Add points for each value
+  labs(
+    x = "Stage",
+    y = base::expression("log(p-adj):" ~ beta ~ "-CN enrichment")
+  ) +
+  mytheme$standard_new() + 
+  # rotate
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_color_manual(values = palettes$colors[1:9], name = "T-CD8 Cluster") + 
+  geom_hline(yintercept = 1.3, linetype = "dashed", color = "black")
+
+fn <- paste0(paste(today, "LinePlot", "CN_Cluster_CellType_TCD8_Beta", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+# A5: CN density.
+
+Analyze density of CNs, to track their changes across disease stages.
+
+## A5.1: CN density calculation
+Calculate Density of relevant CNs.
+
+```{r calculate-image-stats}
+spe_imm <- pancreasSCE[, pancreasSCE$cell_category == "immune"]
+image_ids <- unique(colData(pancreasSCE)$image_id)
+
+# Total number of cells per image
+total_cells <- as_tibble(colData(pancreasSCE)) |>
+  filter(image_id %in% image_ids) |>
+  dplyr::add_count(image_id, name = "CellsPerImage") |>
+  select(c("image_id", "CellsPerImage")) |>
+  distinct()
+
+# Number of immune cells per image
+total_immune_cells <- as_tibble(colData(spe_imm)) |>
+  dplyr::add_count(image_id, name = "ImmuneCellsPerImage") |>
+  select(c("image_id", "ImmuneCellsPerImage")) |>
+  distinct()
+
+# Image area (note: every image contains immune cells, so this works.)
+image_area <- colData(spe_imm) |>
+  as_tibble() |>
+  select(c("image_id", "width_px", "height_px")) |>
+  distinct() |>
+  mutate(image_area = (width_px * height_px) / 1e6) |>
+  select(c("image_id", "image_area"))
+
+image_stats <- inner_join(total_cells, total_immune_cells, by = "image_id") |>
+  inner_join(image_area, by = "image_id")
+```
+
+```{r composition-celltype}
+plot_variables <- c("donor_type", "case_id", "age", "diabetes_duration")
+
+# Number of cells of each cell type
+image_compo_ct <- as_tibble(colData(pancreasSCE)) |>
+  group_by(image_id, CN_cn_k1070) |>
+  dplyr::count(name = "CellNb") |>
+  ungroup() |>
+  complete(image_id, CN_cn_k1070,
+           fill = list(CellNb = 0))
+
+# Merge with image stats and calculate fractions and densities
+image_compo_ct <- image_compo_ct |>
+  inner_join(image_stats, by = "image_id") |>
+  mutate(fraction_total = CellNb / CellsPerImage,
+         fraction_immune = CellNb / ImmuneCellsPerImage,
+         density = CellNb / image_area)
+
+# Import relevant metadata (e.g., disease stage and patient ids)
+cn_keep <- c("image_id", plot_variables)
+
+image_compo_ct <- as_tibble(colData(spe_imm))[, cn_keep] |>
+  distinct() |>
+  inner_join(image_compo_ct, by = "image_id") |>
+  arrange(image_id)
+
+# Reorder the dataset by CD4 T cell fraction (for plotting)
+image_compo_ct_wide <- image_compo_ct |>
+  pivot_wider(
+    id_cols = image_id,
+    values_from = c(CellNb, fraction_total, fraction_immune, density),
+    names_from = c(CN_cn_k1070))
+# 
+cns <- unique(colData(pancreasSCE)[, "CN_cn_k1070"])
+ordcols <- c(paste0("fraction_total_", cns))
+image_compo_ct <- image_compo_ct_wide |>
+  select(all_of(c("image_id", ordcols))) |>
+  inner_join(image_compo_ct, by = "image_id") |>
+  select(-all_of(ordcols)) |>
+  mutate(ord = nrow(image_compo_ct):1)
+
+image_compo_ct_wide <- DataFrame(image_compo_ct_wide)
+```
+
+## A5.2: CN density changes with age.
+
+```{r}
+mfig_celltypes <- c("Exocrine CTRL", "T-cell 1", "T-cell 3", "Mixed Inf mAAB+")
+
+# Data by ROI.
+data <- image_compo_ct |> 
+  filter(CN_cn_k1070 %in% mfig_celltypes) |> 
+  # first 4 letters are caseid
+  mutate(case_id = stringr::str_sub(image_id, 1, 4)) |> 
+  mutate(age_groups2 = ifelse(age < 13, "< 13", ">= 13")) |> 
+    mutate(CN_cn_k1070 = case_when(
+    CN_cn_k1070 == "Exocrine CTRL" ~ "Exocrine Control",
+    CN_cn_k1070 == "T-cell 1" ~ "T-CD8 > T-CD4",
+    CN_cn_k1070 == "T-cell 3" ~ "T-CD4 > T-CD8",
+    CN_cn_k1070 == "Mixed Inf mAAB+" ~ "Innate inflammation mAAb+",
+    TRUE ~ as.character(CN_cn_k1070)))
+
+# Data by Case. 
+data_plot <- data |> 
+  group_by(CN_cn_k1070, case_id, donor_type, age_groups2) |> 
+  summarise(density = mean(density, na.rm = TRUE)) |> 
+  ungroup() |> 
+  filter(donor_type != "LongDuration") |> 
+  mutate(donor_type = factor(donor_type, levels = metadata(pancreasSCE)$stages[1:4])) |> 
+  mutate(age_groups2 = factor(age_groups2, levels = c("< 13", ">= 13")))
+
+
+# Calculate LLM: Density ~ age + donor_type + (1|case_id) -> get p-values for age.
+p_vals <- data |> 
+  filter(donor_type != "LongDuration") |> 
+  mutate(donor_type = factor(donor_type, levels = metadata(pancreasSCE)$stages[1:4])) |>
+  tidyr::nest(data = -c(CN_cn_k1070)) |>  
+  dplyr::mutate(test = purrr::map(data, 
+    ~broom.mixed::tidy(lmerTest::lmer(data = ., log1p(density) ~ donor_type + age_groups2 + (1|case_id))))) |>
+  tidyr::unnest(test) |> 
+  filter(effect == "fixed", term != "(Intercept)") |> 
+  mutate(donor_type = stringr::str_remove(term, "donor_type")) |> 
+  mutate(term = stringr::str_remove(term, "age_groups2")) |> 
+  filter(term == ">= 13")
+
+p_vals |> arrange(p.value) |> filter(p.value < 0.05) |> print(n = "all")
+```
+
+```{r}
+# Already performed P-val adjusted above.
+p_vals <- p_vals |> 
+    mutate(.y. = "density",
+          group1 = "< 13", group2 = ">= 13",
+          p = p.value,
+          p.adj = p.adjust(p, method = "fdr"),
+           p.signif = cut(p.adj, breaks = c(-Inf, 0.001, 0.01, 0.05, 0.1, Inf), labels = c("***", "**", "*", "•", ""))
+          ) |> 
+  select(.y., group1, group2,
+          statistic, p, p.adj, p.signif, estimate, CN_cn_k1070)
+
+# get max-y-value PER cell type.
+p_vals_max <- data_plot  |> 
+  group_by(CN_cn_k1070) |>
+  summarise(max = max(density), .groups = "drop")
+
+# Perform for layout. 
+cur_formula2 <- formula(paste("density ~ age_groups2"))
+library(rstatix); library(ggpubr)
+stat.test <- data_plot |> 
+  group_by(CN_cn_k1070) |>
+  t_test(cur_formula2, ref.group = "< 13") |> 
+  adjust_pvalue()  |> 
+  add_significance("p.adj") |> 
+  add_xy_position(x = "age_groups2") |> 
+  select(-c(statistic, p, p.adj))
+stat.test
+
+# Combine formatting + P-value dataframe.
+stat.test.test <- p_vals |> 
+    left_join(stat.test, by = c("CN_cn_k1070", ".y.", "group1", "group2"))  |> 
+    left_join(p_vals_max, by = c("CN_cn_k1070")) |>
+    mutate(y.position = log1p(max) * 1.15) 
+stat.test.test
+
+# Plot violin.
+p <- ggviolin(data_plot |> mutate(density = log1p(density)), x = "age_groups2", y = "density", fill = "age_groups2",
+              palette = palettes$stages, facet.by = "CN_cn_k1070", 
+              draw_quantiles = c(0.25, 0.5, 0.75)) + 
+    geom_jitter(width = 0.2, size = 2, alpha = 0.8, aes(color = donor_type)) +
+    scale_fill_manual("Age Groups",
+                      values = palettes$colors50[c(9, 12)])  + 
+    scale_color_manual("Stage",
+                     values = palettes$stages) +
+    facet_wrap(~CN_cn_k1070, scales = "free_y") +
+    scale_color_manual(name = "Stage", 
+                     values = palettes$stages[1:4], 
+                     breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"),
+                     labels = c("Control", "sAAb+", "mAAb+", "Onset")) +
+    labs(x = "Age Groups (years)", y = "Cell Density (cells / mm^2)") + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+    guides(fill = "none") + 
+    stat_pvalue_manual(stat.test.test, label = "p.signif", tip.length = 0.1,
+                    size = 10, label.size = 10) + 
+    mytheme$standard_new()
+
+print(p)
+
+fn <-  paste0(paste(today, "Density", "byAge", "CN", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+saveRDS(p, file.path(paths$home_git, "figures", "extfig10c.rds"))
+```
+
+## A5.3: Density across stages (PLOT)
+
+Plot density of CNs across stages. Could calculate stats theoretically also with edgeR.
+```{r figcns-density}
+cur_celltypes <- c("Exocrine Control", "T-CD8 > T-CD4", "T-CD4 > T-CD8", "Innate inflammation mAAb+")
+
+data <- image_compo_ct |> 
+  filter(CN_cn_k1070 %in% c(mfig_celltypes)) |> 
+  # first 4 letters are caseid
+  mutate(case_id = stringr::str_sub(image_id, 1, 4)) |> 
+  # mutate(density = log(density)) |> 
+  mutate(age_groups2 = ifelse(age < 13, "< 13", ">= 13")) |> 
+  mutate(CN_cn_k1070 = case_when(
+    CN_cn_k1070 == "Exocrine CTRL" ~ "Exocrine Control",
+    CN_cn_k1070 == "T-cell 1" ~ "T-CD8 > T-CD4",
+    CN_cn_k1070 == "T-cell 3" ~ "T-CD4 > T-CD8",
+    CN_cn_k1070 == "Mixed Inf mAAB+" ~ "Innate inflammation mAAb+",
+    TRUE ~ as.character(CN_cn_k1070))) |> 
+  dplyr::mutate(donor_type = ordered(donor_type, levels = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration"))) |> 
+  group_by(CN_cn_k1070, case_id, donor_type, age_groups2, image_id) |>
+  summarise(density = mean(density, na.rm = TRUE)) |> 
+  ungroup()
+
+case_stages <- as_tibble(colData(pancreasSCE)) |> 
+  distinct(case_id, age, ICU_time_days.y) |> 
+  dplyr::rename("ICU_time_days" = ICU_time_days.y)
+
+data <- data |> 
+  left_join(case_stages, by = c("case_id"))
+
+data_plot <- data |> 
+  group_by(CN_cn_k1070, case_id, donor_type, age_groups2) |>
+  summarise(density = log1p(mean(density, na.rm = TRUE)))
+
+## Calcualte LMM between ND and other stages.
+p_vals <- data |> 
+  tidyr::nest(data = -c(CN_cn_k1070)) |>
+  dplyr::mutate(test = purrr::map(data, \(.x){
+      # LMM
+      test <- lmerTest::lmer(data = .x, log1p(density) ~ donor_type + age_groups2 + ICU_time_days + (1 | case_id))
+      # Linear test:
+      m.emm <- emmeans::emmeans(test, ~ donor_type, pbkrtest.limit = 10000)
+      pairwise <- m.emm |> 
+        emmeans::contrast("pairwise", adjust = "none") |> 
+        as_tibble() |> 
+        filter(contrast != "(sAAb+) - RecentOnset") |> 
+        filter(contrast != "(mAAb+) - LongDuration") |>
+        filter(contrast != "(sAAb+) - LongDuration")
+    })) |> 
+    tidyr::unnest(test) |> 
+    mutate(p.adj = p.adjust(p.value, method = "fdr"))
+
+  p_vals <- p_vals |> 
+    mutate(group1 = contrast, group2 = contrast) |>  
+    mutate(group1 = stringr::str_replace(group1, "\\s.*", "")) |> 
+    mutate(group2 = stringr::str_replace(group2, "^(?:\\S+\\s+\\S+\\s+)", "")) |> 
+    mutate(group1 = stringr::str_remove(group1, "\\(")) |>
+    mutate(group2 = stringr::str_remove(group2, "\\(")) |> 
+    mutate(group1 = stringr::str_remove(group1, "\\)")) |> 
+    mutate(group2 = stringr::str_remove(group2, "\\)")) |> 
+    mutate(.y. = "density",
+        p = p.value,
+        p.adj = p.adjust(p, method = "fdr"),
+           p.signif = cut(p.adj, breaks = c(-Inf, 0.001, 0.01, 0.05, 0.1, Inf), labels = c("***", "**", "*", "•", ""))
+        ) |> 
+  select(.y., group1, group2,
+        p, p.adj, p.signif, CN_cn_k1070)
+  
+  p_vals <- data_plot |> 
+      group_by(CN_cn_k1070) |> 
+      summarise(max = max(density), .groups = "drop") |>
+      mutate(pos_pvals = max*1.05) |> 
+      dplyr::right_join(p_vals, by = c("CN_cn_k1070"))
+
+  # ggpubr: only for right formatting.
+  stat.test <- data_plot |> 
+    group_by(CN_cn_k1070) |> 
+    tukey_hsd(density ~ donor_type)  |> 
+    filter(!(group1 == "sAAb+" & group2 == "RecentOnset")) |> 
+    select(CN_cn_k1070, group1, group2) |> 
+    add_xy_position(x = "donor_type", step.increase = 0.07, dodge = 0.8) |> 
+    distinct()
+  
+
+  stat.test.test <- p_vals |> 
+   left_join(stat.test, by = c("CN_cn_k1070", "group1", "group2")) |> 
+    mutate(y.position = max * 1.3)  |> 
+    filter(p.adj < 0.1) |> 
+    group_by(CN_cn_k1070) %>%
+    mutate(y.position = dplyr::first(y.position) * (1 + (0.07) * (row_number() - 1))) %>%
+    ungroup()
+    
+bxp <- ggboxplot(data_plot, x = "donor_type", y = "density", facet.by = "CN_cn_k1070", scales = "free_y",
+                fill = "donor_type", add = "jitter",
+                add.params = list(size = 3, width = 0.2),
+                palette = palettes$stages, alpha = 1) + 
+      labs(x = "Stage", y = "CN density (cells / mm^2)")
+
+p <- bxp + 
+  stat_pvalue_manual(stat.test.test, label = "p.signif", tip.length = 0.02,
+                    size = 10, label.size = 10, 
+                    step.increase = 0) + 
+  mytheme$large_new() +
+  theme(legend.position = "none") +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45)) + 
+  scale_fill_manual(values = palettes$stages) + 
+  scale_y_continuous(expand = expansion(mult = c(0.01))) + 
+  facet_wrap(~ CN_cn_k1070, scales = "free_y", nrow = 3)
+  # scale_y_log10(labels = scales::label_number())
+
+print(p)
+fn <- paste0(paste(today, "Density", "byCase", "CN", 
+                  sep = "_"), ".png")
+plotsave_param_large2 <- plotsave_param_large
+plotsave_param_large2$height <- 500
+do.call(ggsave, c(list(fn, p), plotsave_param_large2))
+
+extfig10d <- p
+saveRDS(extfig10d, file.path(paths$home_git, "figures", "extfig10d.rds"))
+```
+
+------------------------------------------------------------------------------
+
+Everything below is UNUSED.
+
+------------------------------------------------------------------------------
+

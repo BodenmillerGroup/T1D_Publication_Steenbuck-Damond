@@ -1,0 +1,681 @@
+---
+title: "08_CellTypesIslet_cells_Immune"
+author: "Nicolas Damond, Nathan Steenbuck"
+date: "Created: 01 Sep, 2022; Compiled: `r format(Sys.time(), '%d %b, %Y')`"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+if (rstudioapi::isAvailable()) {
+  script_name <- basename(rstudioapi::getSourceEditorContext()$path)
+} else {
+  script_name <- knitr::current_input()
+}
+
+cur_user <- Sys.info()[["user"]]
+script_name <- "08_CellTypesIslet_cells_Immune.Rmd"
+
+if (cur_user == "ubuntu") {
+  source(file.path("/", "mnt", "central_nas", "projects", 
+    "type1_diabetes", "nathan", "T1D_Vol", "T1D_analysis", 
+    "analysis", "helpers.R"))  #n_cores <- future::availableCores() - 1
+  n_cores <- 4
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  knitr::opts_knit$set(root_dir = paths$home_data)
+} else {
+  source(file.path("/", "home", "nsteen", "scripts", "T1D_analysis", "analysis", "helpers.R"))
+  n_cores <- 8
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  paths$folder_script <- paths$cluster_folder_script
+  paths$folder_in <- paths$cluster_folder_in
+  paths$folder_out <- paths$cluster_home 
+  knitr::opts_knit$set(root_dir = paths$cluster_home)
+}
+
+seed <- 123456
+set.seed(seed)
+options <- furrr::furrr_options(seed = seed)
+paths$prev <- paste("08_ClustersImmuneII", paths$object_type, paths$panel_type, sep = "_")
+knitr::opts_chunk$set(echo = TRUE)
+do_print <- TRUE
+```
+
+Rscript -e "rmarkdown::render('T1D_analysis/analysis/08_CellTypesIslet_cells_Immune.Rmd')"
+
+
+# **Goal**
+
+In scripts 05 to 08, cell types are attributed to all cells in the dataset
+in an iterative way:
+
+- `05_CellCategories_cells_Immune`: Attribution of main cell categories 
+(immune, islet, exocrine, ...).
+- `06_CellTypesImmune_cells_Immune`: Attribution of main cell 
+types to immune cells (Lymphocyte, Myeloid, Neutrophil).
+- `07_ClustersImmune_cells_Immune`: Further separation of immune cell types 
+into clusters.
+- `08_CellTypesNonImmune_cells_Immune`: Attribution of cell types
+to non-immune cells (Beta, Alpha, Exocrine, ...).
+- `08_CellTypesIslet_cells_Immune` (this script): Re-attribution of islet cells
+to cell types based on clustering results from the previous step.
+- `08_CellTypesIslet_cells_ImmuneII`: Attribution of rare & specific immune cell clusters
+like T-reg and T-EMRAs.
+
+Specifically, the goal of the current script is to attribute cell types 
+to non-immune cells in the dataset. These cells were identified in script 06
+as main cell categories (`islet`, `exocrine`, ...), but were not further 
+clustered.
+
+Cell type attribution is performed in a similar way as in previous scripts.
+
+1. Unsupervised clustering using two approaches (i) PhenoGraph and (ii) Shared-
+nearest neighbors (SNN) + Leiden community detection on two different count 
+transformations (`exprs` and `scaled`). Only immune cell markers are used for
+clustering.
+
+2. For each of the four clustering results (two approaches X two count 
+transformations), clusters are manually merged into cell categories based on
+marker expression.
+
+3. Consensus cell categories are attributed by majority vote: if the cell 
+type is the same for three or more of the four approaches, this category is 
+attributed to the cell. If not, the cell is categorized as `ambiguous`.
+
+As an immune panel was used to stain the sections, the number of markers 
+available to precisely identify non-immune cells is limited. The cell type 
+resolution is therefore limited. Yet, markers of important cell types, such as 
+beta cells, have been included, allowing to reliably identify them.
+
+
+
+# **Settings**  
+
+## Load packages
+
+```{r packages, results='hide'}
+suppressPackageStartupMessages(c(
+  library(data.table),
+  library(dplyr),
+  library(SpatialExperiment),
+  library(parallel)
+))
+```
+
+## Paths and settings
+
+```{r settings}
+# Paths
+if (!dir.exists(paths$folder_script)) dir.create(paths$folder_script)
+plotsave_param$path <- paths$folder_script
+plotsave_param_large$path <- paths$folder_script
+
+# Misc settings
+today <- gsub("-", "", Sys.Date())
+```
+
+##  Read in the data
+
+Load the SpatialExperiment (SPE) object saved at the previous step.
+
+```{r load-data}
+fn_spe <- file.path(paths$folder_out, paths$prev, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+spe <- readRDS(fn_spe)
+print(spe)
+```
+
+### Channels and assays
+
+Select channels (`channels_clust`), assays (`assay_sel`) and clustering methods (`methods_sel`) to use.
+
+```{r select-methods-assays}
+methods_sel <- c("Pheno_Islet")
+
+assay_sel <- c("scaled")
+names(assay_sel) <- c("scaled")
+writeLines(c("Assays:", assay_sel[assay_sel %in% assayNames(spe)]))
+
+dimred_sel <- c("UMAP") # , "tSNE")
+writeLines(c("\nReduced dimensions:", dimred_sel))
+
+channels <- rownames(spe)[!(grepl("DNA|H3", rownames(spe)))]
+cat(c("\nChannels:", channels[channels %in% rownames(spe)]))
+cat(c("\nNumber of channels:", length(channels)))
+```
+
+### Select the channels for clustering
+
+Exclusive immune cell markers are not used for clustering.
+
+```{r select-channels-clustering}
+# Consider de-selecting: CS, CD57, CD56, CD54, ATP5A, CD73, LDHA, TMEM173, HK1
+clust_islet <- c("SST", "INS", "GCG", "PDX1", "NKX6_1", "SYP", "CAV1")
+
+cat(c("\nChannels used for unsupervised clustering:",
+      clust_islet[clust_islet %in% rownames(spe)]))
+```
+
+Do a quick one with RPhenoannoy.
+```{r}
+# Load the RPhenograph package
+suppressPackageStartupMessages(library(Rphenoannoy))
+```
+
+```{r}
+spe_isl <- spe[clust_islet, spe$cell_category == "islet"]
+spe_isl <- spe_isl[, spe_isl$cell_type != "Other"]
+table(spe_isl$cell_type)
+table(spe_isl$distance_to_islet < 0)
+```
+
+
+# **Unsupervised clustering**
+
+## PhenoGraph
+
+## **Clustering: PhenoGraph**
+
+Unsupervised clustering is performed with the [PhenoGraph](https://doi.org/10.1016/j.cell.2015.05.047) algorithm. This method works by generating a nearest-neighbor (kNN) graph of phenotpyic similarities followed by Louvain community dectection. For speed, we run PhenoGraph using the [Rphenoannoy implementation](https://github.com/stuchly/Rphenoannoy).
+
+```{r phenograph-run}
+# Set the random seed for reproducibility
+seed <- 123456
+set.seed(seed)
+
+clust_method <- c("PhenoIslet")
+cur_assay <- "scaled"
+
+# Number of nearest-neighbors
+k <- 30
+
+clust_name <- paste(clust_method, cur_assay, sep = "_")
+writeLines(c("\n", clust_name))
+# colData(spe_isl)[, clust_name] <- NULL
+
+# Run Phenograph
+if (!clust_name %in% colnames(colData(spe_isl))) {
+  set.seed(seed)
+  cur_pheno <- Rphenoannoy::Rphenoannoy(t(assay(spe_isl, cur_assay)), k = k)
+
+  cur_pheno <- DataFrame(cur_pheno[[2]]$membership)
+  colnames(cur_pheno) <- clust_name
+  rownames(cur_pheno) <- colnames(assay(spe_isl, cur_assay))
+
+  # Add Phenograph clusters to the colData of the SCE object
+  colData(spe_isl)[, clust_name] <- cur_pheno
+  remove(cur_pheno)
+}
+```
+
+```{r}
+table(colData(spe_isl)[[clust_name]])
+```
+
+## Visualize clusters on reduced dimensions
+
+### Plot marker expression
+
+```{r plot-dimred-channels, fig.height=10, fig.width=15}
+cur_dimred <- "UMAP"
+dimred_name <- paste(cur_dimred, cur_assay, sep = "_")
+
+# Prepare the data
+cur_dat <- scuttle::makePerCellDF(spe_isl,
+                                  features = clust_islet,
+                                  exprs_values = cur_assay) |>
+      select(c(all_of(clust_islet),
+               paste0(dimred_name, ".1"), paste0(dimred_name, ".2")))
+
+cur_dat <- cur_dat |>
+  tidyr::pivot_longer(cols = all_of(clust_islet),
+                      names_to = "channel",
+                      values_to = cur_assay)
+
+# Plot marker expression
+p <- plot_dim_red_channels(cur_dat, dimred_name, cur_assay,
+                          clust_islet, force_points = TRUE)
+
+fn <- paste0(paste(today, dimred_name, "Channels", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+
+
+
+### Plot clusters
+
+```{r dimred-clusters}
+cur_dat <- scuttle::makePerCellDF(spe_isl, use.coldata = TRUE, use_dimred = TRUE) |> 
+  as_tibble() |> 
+  mutate(localization = case_when(
+    distance_to_islet >= 0 ~ "Islet",
+    distance_to_islet < 0 & distance_to_islet >= -20 ~ "Islet border",
+    distance_to_islet < -20 ~ "Exocrine"
+  ))
+
+cur_method <- clust_method
+
+dimred_name <- paste(cur_dimred, cur_assay, sep = "_")
+clust_name <- paste(cur_method, cur_assay, sep = "_")
+      
+# Plot Cell Types:
+p <- plot_dim_red(cur_dat, dimred_name, "cell_type",
+                  sample = TRUE, size = 0.1, alpha = 1)
+
+if (do_print) print(p)
+      
+fn <- paste0(paste(today, "Clusters", "cell_type", cur_dimred,
+                         sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+
+# Plot Clusters:
+p <- plot_dim_red(cur_dat, dimred_name, clust_name,
+                  sample = TRUE, size = 0.1, alpha = 1)
+
+if (do_print) print(p)
+      
+fn <- paste0(paste(today, "Clusters", clust_name, cur_dimred,
+                         sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+# remove(cur_dat, p)
+
+# Plot Clusters:
+p <- plot_dim_red(cur_dat, dimred_name, "localization",
+                  sample = TRUE, size = 0.1, alpha = 1)
+
+if (do_print) print(p)
+      
+fn <- paste0(paste(today, "Clusters", "localization", cur_dimred,
+                         sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+## Heatmap of marker expression by cluster
+
+```{r heatmap-clusters-markers}
+hmlist <- list()
+n <- 1
+
+clust_name <- paste(cur_method, cur_assay, sep = "_")
+    
+# Summarize the data
+hm <- summarize_heatmap(spe_isl,
+                        expr_values = cur_assay,
+                        cluster_by = clust_name,
+                        channels = clust_islet)
+
+ct_anno <- as.data.frame(table(spe_isl[[clust_name]]))
+rownames(ct_anno) <- ct_anno$Var1
+# sort as in the heatmap
+ct_anno <- ct_anno[rownames(hm), ]
+cell_type_counts <- ct_anno$Freq
+names(cell_type_counts) <- ct_anno$Var1
+
+breaks <- c(0, 0.5, 0.7, 1) 
+colors <- viridis::viridis(4) 
+col_fun <- circlize::colorRamp2(breaks, colors)
+
+# Create row annotation for cell type counts
+row_anno <- ComplexHeatmap::rowAnnotation(
+  "Cell Counts" = ComplexHeatmap::anno_barplot(cell_type_counts, 
+                         gp = grid::gpar(fill = "skyblue", col = "black"),
+                         border = TRUE,
+                         width = grid::unit(4, "cm"),
+      axis_param = list(gp = grid::gpar(fontsize = 25)),
+),       
+  show_annotation_name = TRUE,
+  annotation_name_gp = grid::gpar(fontsize = 30),
+  annotation_name_side = "top",
+  annotation_name_rot = 0,
+  annotation_name_offset = unit(c(0.5, 0.5), "cm")
+    # Adjust title size here
+)
+
+# Display the heatmap
+fn <- file.path(paths$folder_script, paste0(paste(today, "Clusters", clust_name, cur_assay,
+                "Heatmap", sep = "_"), ".png"))
+
+# plotsave_param
+png(fn, width = 1200, height = 800)
+p <- ComplexHeatmap::Heatmap(hm, name = "Scaled expression", 
+                              col= col_fun,
+                              show_row_names = TRUE, show_column_names = TRUE,
+                              cluster_rows = TRUE, cluster_columns = TRUE,
+                              row_names_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"),
+                              column_names_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"), 
+                              heatmap_legend_param = list(legend_direction = "horizontal",
+                                                          title_position = "topcenter",
+                                                          title_gp = grid::gpar(fontsize = 40, fontfamily = "Arial"),
+                                                          labels_gp = grid::gpar(fontsize = 40, fontfamily = "Arial")),                             
+                            row_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for rows
+                            column_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for columns
+                            row_names_side = "left",
+                            row_dend_side = "right") + 
+      row_anno
+
+ComplexHeatmap::draw(p, heatmap_legend_side = "top", 
+                      padding = unit(c(12, 12, 2, 12), "mm"))  # right and bottom padding
+dev.off()
+```
+
+
+Beta-cells:
+New:   34, 33, 4, 15, 11, 7,  8, 1, 2, 
+Old:   34, 33, 1, 30,  2, 32, 5, 7, 12, 
+
+Delta-cells:
+- New: 23, 9, 19
+- Old:  8, 19, 15 (partly ductal)
+
+Other: 
+New: 25, 12, 10
+Old: 11
+
+Unclear: 
+
+Alpha: 
+New:  26, 16, 24, 27, 28, 29, 18,  3, 25, 30, 20, 21, 17, 5,  31,
+Old:  22, 23, 10, 29, 24,  4, 21, 25, 17, 20,  6, 13, 14, 28, 27, 
+      26, 3, 18
+
+Islet-other or Mixed: 
+New: 32, 13, 14, 6, 22
+Old: 9, 31, 16?
+
+
+## Plot specific cluster(s)
+
+When many clusters are present, they may not be easy fo visualize on reduced dimension maps. Here, a subset of clusters can be selected for plotting.
+
+### Select cluster(s) and assay to show
+
+```{r dimred-cluster-select}
+#viz_clust <- c(34, 33, 4, 15, 11, 7, 8, 1, 2) # beta
+#viz_clust <- c(26, 16, 24, 27, 28, 29, 18,  3, 25, 30, 20, 21, 17, 5,  31) # alpha
+#viz_clust <- c(23, 9, 19) # delta
+#viz_clust <- c(32, 13, 14, 6, 22) # islet-other
+#viz_clust <- c(12, 25, 10) # other
+viz_clust <- NULL
+viz_method <- "PhenoIslet"
+viz_assay <- "scaled"
+```
+
+```{r dimred-cluster-plot}
+if (!is.null(viz_clust)) {
+  # Prepare the data
+  cur_dat <- scuttle::makePerCellDF(
+    spe_isl, use.coldata = TRUE,
+    use.dimred = TRUE)
+
+  # Clusters and palette
+  clust_name <- paste(viz_method, viz_assay, sep = "_")
+  clust_nb <-  length(unique(cur_dat[[clust_name]]))
+  viz_pal <- palettes$colors[1:clust_nb]
+  names(viz_pal) <- 1:clust_nb
+  viz_pal[!names(viz_pal) %in% viz_clust] <- "lightgrey"
+  
+  # Plot
+  dimred_name <- paste(cur_dimred, viz_assay, sep = "_")
+  
+  p <- plot_dim_red(cur_dat, dimred_name, clust_name, palette = viz_pal,
+                    sample = TRUE, size = 0.1, alpha = 1)
+  if (do_print) print(p)
+  
+  fn <- paste0(
+      paste(today, paste0("Cluster", paste(viz_clust, collapse = "-")),
+            clust_name, cur_dimred, sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param))
+}
+```
+
+
+```{r annotation-clusters}
+clust_methods <- c("PhenoIslet")
+clust_assay <- c("scaled")
+
+if (!clust_assay %in% assay_sel)
+  stop("The selected assay is not in the assays selected for clustering")
+if (length(clust_assay) != 1)
+  stop("Select only one assay")
+
+clust_name <- paste(clust_methods, clust_assay, sep = "_")
+print(clust_name)
+
+# Define which clusters correspond to which cell types
+clust_beta <- c(34, 33, 4, 15, 11, 7:8, 1, 2)
+clust_alpha <- c(26, 16, 24, 27, 28, 29, 18,  3, 25, 30, 20, 21, 17, 5,  31)
+clust_delta <- c(23, 9, 19)
+clust_islet_other <- c(32, 13:14, 6, 22)
+clust_other <- c(12, 10)
+
+# beta: viz_clust <- c(34, 33, 1, 30, 2, 32, 5, 7, 12)
+# other: viz_clust <- c(11)
+# islet-other: viz_clust <- c(9, 31, 16)
+# delta: viz_clust <- c(8, 19, 15)
+# alpha: viz_clust <- c(22, 23, 10, 29, 24, 4, 21, 25, 17, 20, 6, 13, 14, 28, 27, 26, 3, 18)
+
+all_clust <- sort(c(clust_beta, clust_alpha, clust_delta, clust_islet_other, clust_other))
+
+if ((!length(unique(all_clust)) ==
+     length(unique(colData(spe_isl)[, clust_name]))) ||
+    any(duplicated(all_clust))) {
+  stop("Recheck cluster attribution")
+}
+
+# Add cell types to the SCE object
+colData(spe_isl)[colData(spe_isl)[, clust_name] %in% clust_beta,
+             paste("CellType", clust_name, sep = "_")] <- "Beta"
+colData(spe_isl)[colData(spe_isl)[, clust_name] %in% clust_alpha,
+             paste("CellType", clust_name, sep = "_")] <- "Alpha"
+colData(spe_isl)[colData(spe_isl)[, clust_name] %in% clust_delta,
+             paste("CellType", clust_name, sep = "_")] <- "Delta"
+colData(spe_isl)[colData(spe_isl)[, clust_name] %in% clust_islet_other,
+             paste("CellType", clust_name, sep = "_")] <- "IsletOther"
+colData(spe_isl)[colData(spe_isl)[, clust_name] %in% clust_other,
+             paste("CellType", clust_name, sep = "_")] <- "Other"
+```
+
+
+
+## Visualize attributed cell types
+
+### Plot cell types on reduced dimensions
+
+```{r palette.celltypes}
+palettes$celltype <- (c(
+  Beta = palettes$colors[1], Alpha = palettes$colors[2],
+  Delta = palettes$colors[3], IsletOther = palettes$colors[4],
+  Other = "lightgrey")
+)
+```
+
+
+```{r celltypes-dimred}
+# Prepare the data
+cur_dat <- scuttle::makePerCellDF(
+  spe_isl,
+  use_dimred = TRUE)
+
+# Plot
+cur_dimred
+cur_assay
+cur_method
+
+dimred_name <- paste(cur_dimred, cur_assay, sep = "_")
+clust_name <- paste("CellType", cur_method, cur_assay, sep = "_")
+
+p <- plot_dim_red(cur_dat, dimred_name, clust_name,
+                  palette = palettes$celltype,
+                  sample = TRUE, size = 0.1, alpha = 1)
+if (do_print) print(p)
+
+fn <- paste0(paste(today, clust_name, cur_dimred,
+                    sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+
+```{r complex-heatmap-celltypes}
+hmlist <- list()
+n <- 1
+    
+# Summarize the data
+hm <- summarize_heatmap(spe_isl,
+                        expr_values = cur_assay,
+                        cluster_by = clust_name,
+                        channels = clust_islet)
+
+ct_anno <- as.data.frame(table(spe_isl[[clust_name]]))
+rownames(ct_anno) <- ct_anno$Var1
+# sort as in the heatmap
+ct_anno <- ct_anno[rownames(hm), ]
+cell_type_counts <- ct_anno$Freq
+names(cell_type_counts) <- ct_anno$Var1
+
+breaks <- c(0, 0.5, 0.7, 1) 
+colors <- viridis::viridis(4) 
+col_fun <- circlize::colorRamp2(breaks, colors)
+
+# Create row annotation for cell type counts
+row_anno <- ComplexHeatmap::rowAnnotation(
+  "Cell Counts" = ComplexHeatmap::anno_barplot(cell_type_counts, 
+                         gp = grid::gpar(fill = "skyblue", col = "black"),
+                         border = TRUE,
+                         width = grid::unit(4, "cm"),
+      axis_param = list(gp = grid::gpar(fontsize = 25)),
+),       
+  show_annotation_name = TRUE,
+  annotation_name_gp = grid::gpar(fontsize = 30),
+  annotation_name_side = "top",
+  annotation_name_rot = 0,
+  annotation_name_offset = unit(c(0.5, 0.5), "cm")
+    # Adjust title size here
+)
+
+# Display the heatmap
+fn <- file.path(paths$folder_script, paste0(paste(today, "CellType", clust_name, cur_assay,
+                "Heatmap", sep = "_"), ".png"))
+
+# plotsave_param
+png(fn, width = 1200, height = 800)
+p <- ComplexHeatmap::Heatmap(hm, name = "Scaled expression", 
+                              col= col_fun,
+                              show_row_names = TRUE, show_column_names = TRUE,
+                              cluster_rows = TRUE, cluster_columns = TRUE,
+                              row_names_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"),
+                              column_names_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"), 
+                              heatmap_legend_param = list(legend_direction = "horizontal",
+                                                          title_position = "topcenter",
+                                                          title_gp = grid::gpar(fontsize = 40, fontfamily = "Arial"),
+                                                          labels_gp = grid::gpar(fontsize = 40, fontfamily = "Arial")),                             
+                            row_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for rows
+                            column_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for columns
+                            row_names_side = "left",
+                            row_dend_side = "right") + 
+      row_anno
+
+ComplexHeatmap::draw(p, heatmap_legend_side = "top", 
+                      padding = unit(c(12, 12, 2, 12), "mm"))  # right and bottom padding
+dev.off()
+```
+
+
+
+
+### Visualize celltypes with cytomapper
+
+Load the masks
+
+```{r viz-celltype-load}
+nb_images <- 14
+image_extension <- ".tiff"
+
+set.seed(seed)
+image_sub <- sort(c("6228_Immune_ROI_034.tiff", "6228_Immune_ROI_073.tiff", sample(
+  unique(spe_isl$image_fullname),
+  min(length(unique(spe_isl$image_fullname)), nb_images))
+))
+
+# Subset the SCE to subsampled images
+sce_viz <- spe_isl[, spe_isl$image_fullname %in% image_sub]
+sce_viz$ImageName <- gsub(image_extension, "", sce_viz$image_fullname)
+
+# Folders
+folder_images <- file.path(paths$folder_in, "img", paths$panel_type)
+folder_masks <- file.path(paths$folder_in, "masks_cells",
+                          paths$panel_type, "whole-cell")
+
+# Load masks
+masks <- yoloader(
+  x = sce_viz,
+  image_dir = folder_masks,
+  image_names = image_sub,
+  as.is = TRUE,
+  type = "masks"
+)
+```
+
+Plot the images
+
+```{r viz-celltype-plot}
+celltype_viz <- paste("CellType", cur_method, cur_assay,
+                      sep = "_")
+
+colour_key <- list(celltype_viz = palettes$celltype)
+
+fn <- list(filename = file.path(plotsave_param$path,
+  paste0(paste(today, "Cytomapper", celltype_viz, sep = "_"), ".png")))
+
+cytomapper::plotCells(masks, object = sce_viz, 
+                      cell_id = "cell_number", img_id = "ImageName",
+                      colour_by = celltype_viz, colour = colour_key, 
+                      save_plot = fn)
+```
+
+
+
+
+# **Finalize and save **
+
+## Add cell types to the main SCE
+
+Add cell types to the non-immune SCE object
+
+```{r add-celltypes-sce-1}
+cur_dat <- cur_dat |> 
+  select(cell_type, cell_id, PhenoIslet_scaled, CellType_PhenoIslet_scaled)
+
+cell_types <- cur_dat[order(match(cur_dat$cell_id, colnames(spe_isl))), ] 
+colData(spe_isl)$cell_type <- cell_types$CellType_PhenoIslet_scaled
+```
+
+Make sure that cell categories are aligned with cell types
+
+```{r update-cell-categories}
+spe_isl[, spe_isl$cell_type %in% c("Beta", "Alpha", "Delta", "IsletOther")]$cell_category <- "islet"
+spe_isl[, spe_isl$cell_type %in% c("Other")]$cell_category <- "other"
+```
+
+Add cell types to the main SCE
+
+```{r add-celltypes-sce-2}
+# Make sure row order is preserved
+row_order <- rownames(colData(spe)[(spe$cell_category == "islet" & spe$cell_type != "Other"), ])
+spe_isl <- spe_isl[, order(match(colnames(spe_isl), row_order))]
+
+# Add cell types and updated cell categories
+colData(spe)[row_order, ]$cell_category <- spe_isl$cell_category
+colData(spe)[row_order, ]$cell_type <- spe_isl$cell_type
+```
+
+
+## Save the updated SPE
+
+```{r save-spe}
+print(spe)
+fn_spe <- file.path(paths$folder_script, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+saveRDS(spe, fn_spe)
+```

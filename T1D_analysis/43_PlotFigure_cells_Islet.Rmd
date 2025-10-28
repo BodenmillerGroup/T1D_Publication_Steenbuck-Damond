@@ -1,0 +1,2310 @@
+```{r setup, include=FALSE}
+if (rstudioapi::isAvailable()) {
+  script_name <- basename(rstudioapi::getSourceEditorContext()$path)
+} else {
+  script_name <- knitr::current_input()
+}
+
+cur_user <- Sys.info()[["user"]]
+script_name <- "43_PlotFigure_cells_Islet.Rmd"
+
+if (cur_user == "ubuntu") {
+  source(file.path("/", "mnt", "central_nas", "projects", "type1_diabetes", "nathan", 
+                   "T1D_Vol", "T1D_analysis", "analysis", "helpers.R"))
+  #n_cores <- future::availableCores() - 1
+  n_cores <- 4
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  knitr::opts_knit$set(root_dir = paths$home_data)
+  do_print <- FALSE
+} else {
+  source(file.path("/", "home", "nsteen", "scripts", "T1D_analysis", "analysis", "helpers.R"))
+  n_cores <- 8
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  paths$folder_script <- paths$cluster_folder_script
+  paths$folder_in <- paths$cluster_folder_in
+  paths$folder_out <- paths$cluster_home 
+  knitr::opts_knit$set(root_dir = paths$cluster_home)
+  do_print <- TRUE
+}
+
+seed <- 123456
+set.seed(seed)
+options <- furrr::furrr_options(seed = seed)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Paths and settings
+
+```{r settings}
+# Paths
+if (!dir.exists(paths$folder_script)) dir.create(paths$folder_script)
+plotsave_param$path <- file.path(paths$home_git, "figures")
+plotsave_param_large$path <- file.path(paths$home_git, "figures")
+
+# Misc settings
+today <- gsub("-", "", Sys.Date())
+```
+
+```{r}
+# Load libraries
+library(ggplot2)
+library(gridExtra)
+library(grid)
+library(cowplot)
+library(patchwork)
+```
+
+
+# Islet panel Results
+
+## Figure 1: 
+Load data .rds files.
+```{r}
+# Fig 1A,B,C: Images.
+fig1a <- empty_plot
+fig1b <- empty_plot
+fig1c <- empty_plot
+
+# Fig 1D: UMAP. 09_Islet.
+fig1d <- readRDS(file.path(paths$home_git, "figures", "fig1d.rds"))
+fn <- "fig1d.png"
+do.call(ggsave, c(list(fn, fig1d), plotsave_param))
+
+## Fig 1E: 09_Islet.
+## Beta-cell loss.
+fig1e <- readRDS(file.path(paths$home_git, "figures", "fig1e.rds"))
+fig1e <- fig1e + scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration"), 
+                   labels = c("Control", "sAAb+", "mAAb+", "Onset", "LD")) + 
+          theme(axis.text.x = element_text(angle = 0, hjust = 0.3)) + 
+         # expand y-axis
+          scale_y_continuous(breaks = c(0, 0.25, 0.5, 0.75, 1), labels = c(0, 0.25, 0.5, 0.75, 1)) + 
+          coord_cartesian(ylim = c(0.04, 1.15))
+
+plotsave_param2 <- plotsave_param
+plotsave_param2$width <- 200
+fn <- "fig1e.png"
+do.call(ggsave, c(list(fn, fig1e), plotsave_param2))
+
+## Fig 1F:
+## IAPP,HLA-ABC,E-CAD,ProINS STAGES
+fig1f <- readRDS(file.path(paths$home_git, "figures", "fig1f.rds"))
+fig1f <- fig1f + 
+  facet_wrap(~ channel, axes = "all", scales = "free_y") + 
+  ylab(expression(beta ~ "-cell normalized counts")) + 
+  # 
+  scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"), 
+                   labels = c("Control", "sAAb+", "mAAb+", "Onset")) + 
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) + 
+theme(panel.spacing = unit(1, "cm"))  # Adjust the value as needed
+
+plotsave_param_large2 <- plotsave_param_large
+plotsave_param_large2$width <- 500
+fig1f$data |> as_tibble() |> 
+  dplyr::distinct(case_id, donor_type) |> 
+  dplyr::count(donor_type)
+
+fn <- "fig1f.png"
+do.call(ggsave, c(list(fn, fig1f), plotsave_param_large2))
+
+## Fig 1G:
+## Pseudotime single-cell donors; colored by stage.
+fig1g <- readRDS(file.path(paths$home_git, "figures", "fig1g.rds"))
+fig1g <- fig1g + scale_color_manual(
+  values = palettes$stages[1:4],
+  breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"),
+  labels = c("Control", "sAAb+", "mAAb+", "Onset")
+) + theme(axis.ticks = element_blank(),
+          axis.text = element_blank())
+# + scale_x_continuous(labels = "")
+
+fn <- "fig1g.png"
+plotsave_param2 <- plotsave_param
+plotsave_param2$width <- 250
+do.call(ggsave, c(list(fn, fig1g), plotsave_param2))
+
+## Fig 1H:
+## Aggregated Pseudotime across Donors.
+fig1h <- readRDS(file.path(paths$home_git, "figures", "fig1h.rds"))
+fig1h <- fig1h + scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"), 
+                   labels = c("Control", "sAAb+", "mAAb+", "Onset")) +
+         theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) +
+         scale_y_continuous(breaks = c(0, 0.25, 0.5, 0.75, 1), labels = c(0, 0.25, 0.5, 0.75, 1)) +
+    coord_cartesian(ylim = c(0.04, 1.2))
+
+plotsave_param2 <- plotsave_param
+plotsave_param2$width <- 200
+
+fig1h$data |> as_tibble() |> 
+  dplyr::distinct(case_id, donor_type) |> 
+  dplyr::count(donor_type)
+
+fn <- "fig1h.png"
+do.call(ggsave, c(list(fn, fig1h), plotsave_param2))
+
+# Fig 1I: #Pseudotime.
+fig1i <- readRDS(file.path(paths$home_git, "figures", "fig1i.rds"))
+fig1i_anno <- readRDS(file.path(paths$home_git, "figures", "fig1i_anno.rds"))
+
+fn <- file.path(paths$folder_script, paste0(paste(today, "Beta_Pseudotime_Heatmap",
+                   sep = "_"), '.png'))
+png(fn, width = 300, height = 300, units = "mm", res = 300)
+p <- ComplexHeatmap::Heatmap(
+  fig1i, name = "Scaled Counts",
+  col = circlize::colorRamp2(c(0, 0.5, 0.99), c("blue", "white", "red")), 
+  show_row_names = TRUE, show_column_names = FALSE,
+  cluster_rows = TRUE, cluster_columns = FALSE,
+  top_annotation = fig1i_anno,
+  heatmap_legend_param = list(
+    legend_direction = "horizontal",
+    title_position = "topcenter",
+    title_gp = grid::gpar(fontsize = 22),
+    labels_gp = grid::gpar(fontsize = 22)
+  ),
+  row_names_gp = grid::gpar(fontsize = 22),
+  column_title = "Pseudotime",
+  column_title_gp = grid::gpar(fontsize = 30, fontface = "bold"), # Increase title size
+  column_title_side = "bottom",  # Ensure the title appears on the left
+  row_title_rot = 90,       # Rotate title (default is 90°)
+#  row_title_gap = unit(5, "mm") # Add spacing to make sure it’s visible
+)
+
+# Combine the legends into one area)
+ComplexHeatmap::draw(p, heatmap_legend_side = "top",  # Place the heatmap legend at the bottom
+  annotation_legend_side = "top",  # Place the annotation legend at the bottom
+  merge_legends = FALSE)
+dev.off()
+# Fig 1J: Multiplexed images.
+```
+
+## Extended Data Fig. 3:
+
+```{r}
+# Ext Fig 3A: ComplexHeatmap saving (09_Islet)
+hm <- readRDS(file.path(paths$home_git, "figures", "extfig3a_ch.rds"))
+cell_type_counts <- readRDS(file.path(paths$home_git, "figures", "extfig3a_rowanno.rds"))
+
+# Create row annotation for cell type counts
+row_anno <- ComplexHeatmap::rowAnnotation(
+  "Cell counts" = ComplexHeatmap::anno_barplot(cell_type_counts, 
+                         gp = grid::gpar(fill = "skyblue", col = "black"),
+                         border = TRUE,
+                         width = grid::unit(4, "cm"),
+      axis_param = list(gp = grid::gpar(fontsize = 25)),
+),       
+  show_annotation_name = TRUE,
+  annotation_name_gp = grid::gpar(fontsize = 30),
+  annotation_name_side = "top",
+  annotation_name_rot = 0,
+  annotation_name_offset = unit(c(0.5, 0.5), "cm")
+    # Adjust title size here
+)
+
+# Display the heatmap
+fn <- file.path(paths$home_git, "figures", "extfig3a.png")
+
+# plotsave_param
+png(fn, width = 1200, height = 800)
+p <- ComplexHeatmap::Heatmap(heatmaply::normalize(hm), name = "Scaled counts", 
+                              col= col_fun,
+                              show_row_names = TRUE, show_column_names = TRUE,
+                              cluster_rows = TRUE, cluster_columns = TRUE,
+                              row_names_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"),
+                              column_names_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"), 
+                              heatmap_legend_param = list(legend_direction = "horizontal",
+                                                          title_position = "topcenter",
+                                                          title_gp = grid::gpar(fontsize = 40, fontfamily = "Arial"),
+                                                          labels_gp = grid::gpar(fontsize = 40, fontfamily = "Arial")),                             
+                            row_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for rows
+                            column_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for columns
+                            row_names_side = "left",
+                            row_dend_side = "right") + 
+      row_anno
+
+ComplexHeatmap::draw(p, heatmap_legend_side = "top", 
+                      padding = unit(c(12, 12, 2, 12), "mm"))   # right and bottom padding
+dev.off()
+```
+
+```{r}
+# Ext Fig 3B: 09_Islet.
+# Comparison Islet-cell types:
+extfig3b <- readRDS(file.path(paths$home_git, "figures", "extfig3b.rds"))
+extfig3b <- extfig3b +  scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration"), 
+                     labels = c("Control", "sAAb+", "mAAb+", "Onset", "LD")) + 
+      facet_wrap(~ cell_type, axes = "all", scale = "free_y") + 
+      theme(panel.spacing = unit(1, "cm")) + # Adjust the value as needed
+      mytheme$large_new()
+
+extfig3b$data |> as_tibble() |> 
+  dplyr::distinct(case_id, donor_type) |> 
+  dplyr::count(donor_type)
+
+fn <- "extfig3b.png"
+do.call(ggsave, c(list(fn, extfig3b), plotsave_param_large))
+
+# Ext Fig 3C: 13_Islet.
+# Lineage Markers
+extfig3c <- readRDS(file.path(paths$home_git, "figures", "extfig3c.rds"))
+extfig3c <- extfig3c + 
+  scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration"), 
+                   labels = c("Control", "sAAb+", "mAAb+", "Onset", "LD")) +  
+      ylab(expression(beta ~ "-cell normalized counts")) + 
+      facet_wrap(~ channel, axes = "all", scale = "free_y") + 
+      theme(panel.spacing = unit(1, "cm"))  # Adjust the value as needed
+
+extfig3c$data |> as_tibble() |> 
+  dplyr::distinct(case_id, donor_type) |> 
+  dplyr::count(donor_type)
+
+plotsaver_param_large2 <- plotsave_param_large
+plotsaver_param_large2$height <- 500
+fn <- "extfig3c.png"
+do.call(ggsave, c(list(fn, extfig3c), plotsaver_param_large2))
+
+# Ext Fig 3D: 13_Islet.
+# Functional Markers:
+extfig3d <- readRDS(file.path(paths$home_git, "figures", "extfig3d.rds"))
+extfig3d <- extfig3d + scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration"), 
+                     labels = c("Control", "sAAb+", "mAAb+", "Onset", "LD")) + 
+
+      ylab(expression(beta ~ "-cell normalized counts")) + 
+      facet_wrap(~ channel, axes = "all", scale = "free_y") + 
+      theme(panel.spacing = unit(1, "cm"))  # Adjust the value as needed
+
+extfig3d$data |> as_tibble() |> 
+  dplyr::distinct(case_id, donor_type) |> 
+  dplyr::count(donor_type)
+
+fn <- "extfig3d.png"
+plotsaver_param_large2 <- plotsave_param_large
+plotsaver_param_large2$height <- 500
+do.call(ggsave, c(list(fn, extfig3d), plotsave_param_large))
+
+# Ext Fig 3E:
+# Comparison age beta-cells:
+extfig3e <- readRDS(file.path(paths$home_git, "figures", "extfig3e.rds"))
+extfig3e <- extfig3e + 
+    scale_fill_manual("Age groups (years)", values = palettes$colors50[c(9, 12)],
+    labels = c("< 13", ">= 13")) + 
+    theme(
+      legend.position = "top",                 # Move legend above the plot
+      legend.justification = "center",         # Center the legend
+      legend.box = "horizontal",
+      legend.spacing.x = unit(0.5, "cm"),      # Increase space between title and labels
+    )+ 
+    theme(panel.spacing = unit(1, "cm"))  # Adjust the value as needed
+
+fn <- "extfig3e.png"
+do.call(ggsave, c(list(fn, extfig3e), plotsave_param))
+
+# Supp Fig 3F:
+# Pseudotime single-cells.
+extfig3f <- readRDS(file.path(paths$home_git, "figures", "extfig3f.rds"))
+library(viridis)
+
+extfig3f <- extfig3f + 
+  scale_color_viridis_c(name = "Pseudotime", breaks = c(0, 0.5, 1), labels = c(0, 0.5, 1)) +
+  theme(
+    legend.position = "top",                 # Move legend above the plot
+    legend.justification = "center",         # Center the legend
+    legend.box = "horizontal",
+    legend.spacing.x = unit(0.5, "cm"),      # Increase space between title and labels
+    legend.title = element_text(margin = margin(r = 10)) # Add right margin to separate title from labels
+  ) + 
+  theme(plot.margin = margin(5, 20, 5, 5))  # Reduce whitespace around the plot
+
+fn <- "extfig3f.png"
+do.call(ggsave, c(list(fn, extfig3f), plotsave_param))
+```
+
+```{r}
+## Pseudotime-Stage case-id (somehow wrong way - turn around in og. script)
+extfig3g <- readRDS(file.path(paths$home_git, "figures", "extfig3g.rds"))
+extfig3g <- extfig3g + scale_color_manual(values = palettes$stages, name = "Stage")
+fn <- "extfig3g.png"
+do.call(ggsave, c(list(fn, extfig3g), plotsave_param))
+
+## insulitis:
+extfig3h <- readRDS(file.path(paths$home_git, "figures", "extfig3h.rds"))
+extfig3h <- extfig3h + scale_color_manual(values = palettes$insulitic, name = "Insulitic")
+fn <- "extfig3h.png"
+do.call(ggsave, c(list(fn, extfig3h), plotsave_param))
+
+# Supp Fig 4H:
+# Pseudotime single-donors.
+extfig3i <- readRDS(file.path(paths$home_git, "figures", "extfig3i.rds"))
+extfig3i <- extfig3i + 
+  scale_color_manual(values = palettes$stages[1:4], name = "Stage",
+    labels = c("Control", "sAAb+", "mAAb+", "Onset"),
+  ) + 
+    theme(    # Adjust the legend text font size
+    legend.position = "top",                 # Move legend above the plot
+    legend.justification = "center",         # Center the legend
+    legend.box = "horizontal" 
+  ) + 
+  facet_wrap(~ channel, axes = "all", scales = "free_y")
+
+fn <- "extfig3i.png"
+do.call(ggsave, c(list(fn, extfig3i), plotsave_param_large))
+```
+
+
+# Figure 2
+
+```{r}
+## HLA-ABC expression by Cell Type.
+fig2a <- readRDS(file.path(paths$home_git, "figures", "fig2a.rds"))
+fn <- "fig2a.png"
+
+fig2a <- fig2a + 
+  facet_wrap(~ cell_type, axes = "all", scales = "free_y") + 
+  scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration"), 
+                   labels = c("Control", "sAAb+", "mAAb+", "Onset", "LD")) + 
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.3)) + 
+  ylab("HLA-ABC normalized counts") + 
+  theme(panel.spacing = unit(1, "cm"))  # Adjust the value as needed
+
+fig2a$data |> as_tibble() |> 
+  dplyr::distinct(case_id, donor_type) |> 
+  dplyr::count(donor_type)
+
+do.call(ggsave, c(list(fn, fig2a), plotsave_param_large))
+```
+
+```{r}
+## HLA-DR expression.
+fig2b <- readRDS(file.path(paths$home_git, "figures", "fig2b.rds"))
+fig2b <- fig2b + 
+    facet_wrap(~ cell_type, axes = "all", scales = "free_y") + 
+    scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration"), 
+                     labels = c("Control", "sAAb+", "mAAb+", "Onset", "LD")) + 
+      theme(axis.text.x = element_text(angle = 0, hjust = 0.3)) +
+  ylab("HLA-DR normalized counts") + 
+  theme(panel.spacing = unit(1, "cm"))  # Adjust the value as needed
+
+fig2b$data |> as_tibble() |> 
+  dplyr::distinct(case_id, donor_type) |> 
+  dplyr::count(donor_type)
+
+fn <- "fig2b.png"
+do.call(ggsave, c(list(fn, fig2b), plotsave_param_large))
+
+# 
+fig2c <- empty_plot
+
+# HLA-DR vs HLA-ABC expression.
+fig2d <- readRDS(file.path(paths$home_git, "figures", "fig2d.rds"))
+fig2d <- fig2d + ylab(expression(beta ~ "-cell scaled counts")) +  
+    theme(    # Adjust the legend text font size
+    legend.position = "top",                 # Move legend above the plot
+    legend.justification = "center",         # Center the legend
+    legend.box = "horizontal" ,
+    plot.margin = margin(0, 20, 0, 0)
+  ) +
+  guides(fill = guide_legend(nrow = 1),  # Force legend items into a single row
+         color = guide_legend(nrow = 1)) + 
+  scale_color_manual(name = "Channel",
+     values = c("HLA_ABC" = "#1965B0",
+       "HLA_DR" = "#FF7F00"))
+
+fn <- "fig2d.png"
+plotsave_param2 <- plotsave_param
+plotsave_param2$width <- 250
+do.call(ggsave, c(list(fn, fig2d), plotsave_param2))
+
+fig2e <- readRDS(file.path(paths$home_git, "figures", "fig2e.rds"))
+fig2e <- fig2e + ylab(expression(beta ~ "-cell HLA-DR scaled counts")) + 
+  theme(    # Adjust the legend text font size
+    legend.position = "top",                 # Move legend above the plot
+    legend.justification = "center",         # Center the legend
+    legend.box = "horizontal" ,
+    plot.margin = margin(0, 20, 0, 0)
+  ) +
+  scale_color_manual(name = "Insulitis", values = palettes$insulitic) + 
+  guides(fill = guide_legend(nrow = 1),  # Force legend items into a single row
+         color = guide_legend(nrow = 1)) # If using color aesthetics
+fn <- "fig2e.png"
+do.call(ggsave, c(list(fn, fig2e), plotsave_param2))
+
+# Insulitic ROIs: other markers.
+fig2f <- readRDS(file.path(paths$home_git, "figures", "fig2f.rds"))
+fn <- "fig2f.png"
+fig2f <- fig2f + 
+  ylab(expression(beta ~ "-cell normalized counts")) + 
+  facet_wrap(~ channel, scales = "free_y", axes = "all") + 
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) + 
+  scale_fill_manual(values = palettes$insulitic, name = "Insulitis")
+
+fig2f$data |> as_tibble() |> 
+  dplyr::distinct(case_id, donor_type) |> 
+  dplyr::count(donor_type)
+
+do.call(ggsave, c(list(fn, fig2f), plotsave_param2))
+```
+
+## Extended Data Fig. 4:
+
+```{r}
+stage_labels <- c("NoDiabetes" = "Control",
+  "sAAb+" = "sAAb+", 
+  "mAAb+" = "mAAb+", 
+  "RecentOnset" = "Onset")
+
+# Ext Fig 4B.
+# HLA-ABC cell types correlations.
+extfig4a <- readRDS(file.path(paths$home_git, "figures", "extfig4a.rds"))
+extfig4a <- extfig4a + scale_color_manual(
+  values = palettes$stages[1:4],
+  breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"),
+  labels = c("Control", "sAAb+", "mAAb+", "Onset")) + 
+  facet_wrap(~ cell_type, scales = "free_y", axes = "all") + 
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) +
+  ylab("HLA-ABC normalized counts") + 
+  xlab(expression(beta ~ "-cell HLA-ABC normalized counts")) + 
+  theme(panel.spacing = unit(1, "cm"))  # Adjust the value as needed
+
+fn <- "extfig4a.png"
+do.call(ggsave, c(list(fn, extfig4a), plotsave_param_large))
+
+# Ext Fig 4B:
+# HLA-DR cell types correlations.
+extfig4b <- readRDS(file.path(paths$home_git, "figures", "extfig4b.rds"))
+extfig4b <- extfig4b + scale_color_manual(
+  values = palettes$stages[1:4],
+  breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"),
+  labels = c("Control", "sAAb+", "mAAb+", "Onset")) + 
+  labs(y = "HLA-DR normalized counts",
+       x = expression(beta ~ "-cell HLA-DR normalized counts")) + 
+  theme(
+    axis.text.x = element_text(angle = 0, hjust = 0.5),
+    legend.position = "top",                 # Move legend above the plot
+    legend.justification = "center",         # Center the legend
+    legend.box = "horizontal" 
+  ) +
+  scale_color_manual(
+    values = palettes$stages[1:4],
+    breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"),
+    labels = c("Control", "sAAb+", "mAAb+", "Onset")) + 
+  facet_wrap(~ cell_type, scales = "free_y", axes = "all") + 
+    theme(panel.spacing = unit(1, "cm"))  # Adjust the value as needed
+
+fn <- "extfig4b.png"
+do.call(ggsave, c(list(fn, extfig4b), plotsave_param_large))
+
+# HLA-ABC vs HLA-DR
+# Ext 4c: 28_Pseudotime.
+extfig4c <- readRDS(file.path(paths$home_git, "figures", "extfig4c.rds"))
+#suppfig7c <- suppfig7c + ylab(expression(beta ~ "-cell HLA-ABC normalized counts")) + 
+#  theme(axis.text.x = element_text(angle = 0, hjust = 0.5))
+extfig4c <- extfig4c + 
+  mytheme$large_new() + 
+  xlab(expression(beta ~ "-cell HLA-ABC normalized counts")) +
+  ylab(expression(beta ~ "-cell HLA-DR normalized counts")) +
+    theme(
+    legend.position = "top",                 # Move legend above the plot
+    legend.justification = "center",         # Center the legend
+    legend.box = "horizontal" 
+  ) +
+scale_color_manual(
+  values = palettes$stages[1:4],
+  name = "Stage",
+  breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"),
+  labels = c("Control", "sAAb+", "mAAb+", "Onset")) + 
+  facet_wrap(~ donor_type, scales = "free_y", axes = "all",
+             labeller = as_labeller(stage_labels)) + 
+  theme(panel.spacing = unit(1, "cm"))  # Adjust the value as needed
+
+fn <- "extfig4c.png"
+do.call(ggsave, c(list(fn, extfig4c), plotsave_param_large))
+
+# Infiltration Score vs HLA-DR expression
+extfig4d <- readRDS(file.path(paths$home_git, "figures", "extfig4d.rds"))
+extfig4d <- extfig4d + labs(y = "log: Infiltration score", x = expression(beta ~ "-cell HLA-DR normalized counts")) + 
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) + 
+  theme(
+    legend.position = "top",                 # Move legend above the plot
+    legend.justification = "center",         # Center the legend
+    legend.box = "horizontal" 
+  ) +
+scale_color_manual(
+  values = palettes$stages[1:4],
+  breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"),
+  labels = c("Control", "sAAb+", "mAAb+", "Onset")) + 
+  facet_wrap(~ cell_type, scales = "free_y", axes = "all") + 
+  facet_wrap(~ cell_type, scales = "free_y", axes = "all",
+             labeller = as_labeller(immune_labels)) + 
+    theme(panel.spacing = unit(1, "cm"))  # Adjust the value as needed
+
+fn <- "extfig4d.png"
+do.call(ggsave, c(list(fn, extfig4d), plotsave_param_large))
+
+# Ext Fig 4E:
+# Pseudotime: HLA-ABC expression.
+extfig4e <- readRDS(file.path(paths$home_git, "figures", "extfig4e.rds"))
+extfig4e <- extfig4e + 
+  scale_color_manual(values = palettes$insulitic, name = "Insulitis")
+fn <- "extfig4e.png"
+do.call(ggsave, c(list(fn, extfig4e), plotsave_param))
+
+# Extended Fig 4f
+# Islet cells: IFN-signatures.
+extfig4f <- readRDS(file.path(paths$home_git, "figures", "extfig4f.rds"))
+extfig4f <- extfig4f + ylab("Islet-cell normalized counts") +
+  facet_wrap(~ channel, scales = "free_y", nrow = 2, axes = "all") + 
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) + 
+  scale_fill_manual(values = palettes$insulitic, name = "Insulitis") + 
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) + 
+  theme(legend.direction = "horizontal", legend.position = "top") + 
+  theme(panel.spacing = unit(1, "cm"))  # Adjust the value as needed
+
+extfig4f$data |> as_tibble() |> 
+  dplyr::distinct(case_id, donor_type) |> 
+  dplyr::count(donor_type)
+
+fn <- "extfig4f.png"
+plotsave_param3 <- plotsave_param
+plotsave_param3$width <- 330
+do.call(ggsave, c(list(fn, extfig4f), plotsave_param3))
+
+# Extfig4g:
+# Expression Insulitic beta.
+extfig4g <- readRDS(file.path(paths$home_git, "figures", "extfig4g.rds"))
+extfig4g <- extfig4g + ylab(expression(beta ~ "-cell normalized counts")) +
+ facet_wrap(~ channel, scales = "free_y", nrow = 2, axes = "all") +
+ scale_fill_manual(values = palettes$insulitic, name = "Insulitis") + 
+ theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) + 
+ theme(panel.spacing = unit(1, "cm"))  # Adjust the value as needed
+
+fn <- "extfig4g.png"
+do.call(ggsave, c(list(fn, extfig4g), plotsave_param))
+
+# Ext Fig 4H:
+# beta-cell Insulitic (Immune panel).
+extfig4h <- readRDS(file.path(paths$home_git, "figures", "extfig4h.rds"))
+extfig4h <- extfig4h + ylab(expression(beta ~ "-cell normalized counts")) +
+ facet_wrap(~ channel, scales = "free_y", nrow = 2, axes = "all") +
+ scale_fill_manual(values = palettes$insulitic, name = "Insulitis") + 
+ theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) + 
+ theme(panel.spacing = unit(1, "cm"))  # Adjust the value as needed
+
+extfig4h$data |> as_tibble() |> 
+  dplyr::distinct(case_id, donor_type) |> 
+  dplyr::count(donor_type)
+
+fn <- "extfig4h.png"
+plotsave_param3 <- plotsave_param
+plotsave_param3$width <- 330
+do.call(ggsave, c(list(fn, extfig4h), plotsave_param3))
+
+# Ext Fig 4i:
+# beta-cell Insulitic (Immune panel).
+extfig4i <- readRDS(file.path(paths$home_git, "figures", "extfig4i.rds"))
+extfig4i <- extfig4i + 
+ facet_wrap(~ channel, scales = "free_y", nrow = 2, axes = "all")
+
+extfig4i$data |> as_tibble() |> 
+  dplyr::distinct(case_id, donor_type) |> 
+  dplyr::count(donor_type)
+
+fn <- "extfig4i.png"
+plotsave_param2 <- plotsave_param
+plotsave_param2$width <- 360
+do.call(ggsave, c(list(fn, extfig4i), plotsave_param2))
+```
+
+# Figure 3:
+
+Subplots:
+A) Empty 
+B) UMAP 
+C) Differential Abundance
+D) X2 Test Localization
+E) Empty. (Infiltration Score sketch)
+F) Infiltraiton Score Cell Types 
+G) Pseudotime Infiltration Score.
+H) Infiltraiton T-cells
+I) HLA-ABC/Cells -> Multiplexed Images (Microfilm)
+J) SpicyR Tests
+
+# Immune Panel:
+## Figure 3: 
+Load data from 
+```{r load_fig3}
+palettes$celltype2 <- (c(
+  T_CD4 = palettes$colors[1], T_CD8 = palettes$colors[2],
+  B = palettes$colors[3], NK = palettes$colors[4],
+  Neutrophil = palettes$colors[5], Myeloid = palettes$colors[6],
+  T_DN = palettes$colors[7], CD303_VIM = palettes$colors[8]
+))
+
+# Fig 3A: Image.
+fig3a <- empty_plot
+
+# Fig 3B: UMAP
+fig3b <- readRDS(file.path(paths$home_git, "figures", "fig3b.rds"))
+
+fig3b <- fig3b + scale_color_manual(values = palettes$celltype2,
+                                    labels = immune_labels)
+
+fn <- "fig3b.png"
+do.call(ggsave, c(list(fn, fig3b), plotsave_param))
+
+# Fig 3C: Differential Abundance.
+fig3c <- readRDS(file.path(paths$home_git, "figures", "fig3c.rds"))
+relevel_cell <- function(d) {
+  d$cell_type <- factor(d$cell_type, levels = c("T_CD4", "T_CD8", "Neutrophil", "Myeloid"))
+  d
+}
+fig3c$data  <- relevel_cell(fig3c$data)
+fig3c$layers <- lapply(fig3c$layers, \(ly) { ly$data <- relevel_cell(ly$data); ly })
+
+fig3c <- fig3c + 
+  facet_wrap(~ cell_type, axes = "all", scales = "free_y", label = as_labeller(major_labels)) + 
+  scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration"), 
+                   labels = c("Control", "sAAb+", "mAAb+", "Onset", "LD")) + 
+  scale_fill_manual(values = palettes$stages, name = "Stage",
+    breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration"),
+    labels = c("Control", "sAAb+", "mAAb+", "Onset", "LD")) +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) + 
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.05))) + 
+  theme(panel.spacing = unit(1, "cm")) + 
+  theme(legend.position = "none") # Adjust the value as needed
+
+fig3c$data |> as_tibble() |> 
+  dplyr::distinct(case_id, donor_type) |> 
+  dplyr::count(donor_type)
+
+fn <- "fig3c.png"
+do.call(ggsave, c(list(fn, fig3c), plotsave_param_large))
+
+
+# Fig3D: Empty. (Infiltration Score Plot)
+fig3d <- empty_plot
+
+# Fig3E: Infiltration Score Cell Types
+fig3e <- readRDS(file.path(paths$home_git, "figures", "fig3e.rds"))
+
+fig3e$data$immune_cluster <- factor(
+  fig3e$data$immune_cluster,
+  levels = c("T_CD4", "T_CD8", "Neutrophil", "Myeloid")  # <- replace with your desired order
+)
+
+fig3e <- fig3e + 
+  facet_wrap(~ immune_cluster, axes = "all", scales = "free_y",
+  label = as_labeller(major_labels)) + 
+  # 
+  scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration"), 
+                   labels = c("Control", "sAAb+", "mAAb+", "Onset", "LD")) + 
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) + 
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.05)),
+  ylab("log1p: Infiltration score")) + 
+  theme(panel.spacing = unit(1, "cm"))  # Adjust the value as needed
+
+fig3e$data |> as_tibble() |> 
+  dplyr::distinct(case_id, donor_type) |> 
+  dplyr::count(donor_type)
+
+fn <- "fig3e.png"
+do.call(ggsave, c(list(fn, fig3e), plotsave_param_large))
+```
+
+Fig3F- chisq:
+
+```{r}
+chisq <- readRDS(file.path(paths$home_git, "figures", "chisq_fig3f.rds"))
+
+std_residuals <- chisq$stdres
+rownames(std_residuals) <- immune_labels[rownames(std_residuals)]
+
+# Reorder rows based on clustering
+row_dist <- dist(std_residuals) 
+row_hclust <- hclust(row_dist, method = "ward.D2")
+ordered_rows <- std_residuals[row_hclust$order, ]
+# ordered_rows <- scale(ordered_rows)
+ordered_rows2 <- data.frame(cell_type = rownames(ordered_rows), ordered_rows)
+
+## Plot with complex heatmap corrplot
+fn <- file.path(file.path(paths$home_git, "figures", "fig3f.png"))
+png(fn, units = "mm", width = 230, height = 300, res = 300)
+
+ggplot(ordered_rows2, aes(x = `test.infiltration`, y = cell_type, 
+                           color = Freq,
+                           size = abs(Freq))) +
+  geom_point() +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  scale_size_continuous(range = c(3, 27)) +  # Keep large dots in plot
+  guides(size = "none",
+         color = guide_colorbar(title.position = "top", title.hjust = 0.5)) +   # Move title below legend) +  # Remove size legend
+  mytheme$large_new() +
+  labs(y = "Cell type", x = "Distance to islet",
+       color = "Enrichment score") +  # Remove size legend label
+  theme(
+    legend.position = "top",  # Move color legend to bottom
+    legend.direction = "horizontal",  # Arrange legend horizontally
+    legend.title = element_text(size = 30, "bold"),  # Adjust legend title size
+    legend.key.width = unit(2, "cm"),  # Make legend wider if needed
+    axis.text.x = element_text(angle = 90, hjust = 1),  # Rotate x-axis text
+    axis.text.y = element_text(vjust = 0.5, hjust = 1),  # Tighten y-axis text
+    axis.title.x = element_text(margin = margin(t = 5)),  # Adjust spacing
+    axis.title.y = element_text(margin = margin(r = 10)),  
+    panel.grid.major = element_blank(),  # Remove large grid spacing
+    panel.grid.minor = element_blank(),  # Remove minor grids
+    panel.spacing = unit(0.1, "lines"),  # Reduce spacing between panels
+    plot.margin = margin(0, 5, 5, 5),  # Reduce whitespace around the plot
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5) 
+  ) +
+  scale_x_discrete(position = "bottom")  # Moves x-axis to the top
+
+dev.off()
+```
+
+## Extended Data Figure 5:
+
+Test:
+```{r load_suppfig6}
+# Extended Data Fig. 5: (not working).
+hm <- readRDS(file.path(paths$home_git, "figures", "extfig5a.rds"))
+cell_type_counts <- readRDS(file.path(paths$home_git, "figures", "extfig5a_anno.rds"))
+cell_type_counts <- cell_type_counts[names(cell_type_counts) != "Other"]
+hm <- hm[rownames(hm) != "Other", ]
+
+cell_type_counts <- cell_type_counts[rownames(hm)]
+
+# Create row annotation for cell type counts
+row_anno <- ComplexHeatmap::rowAnnotation(
+  "Cell counts" = ComplexHeatmap::anno_barplot(cell_type_counts, 
+                         gp = grid::gpar(fill = "skyblue", col = "black"),
+                         border = TRUE,
+                         width = grid::unit(4, "cm"),
+      axis_param = list(gp = grid::gpar(fontsize = 25)),
+),       
+  show_annotation_name = TRUE,
+  annotation_name_gp = grid::gpar(fontsize = 30),
+  annotation_name_side = "top",
+  annotation_name_rot = 0,
+  annotation_name_offset = unit(c(0.5, 0.5), "cm")
+    # Adjust title size here
+)
+
+rownames(hm) <- immune_labels[rownames(hm)]
+names(cell_type_counts) <- immune_labels[names(cell_type_counts)]
+
+fn <- file.path(paths$home_git, "figures", "extfig5a.png")
+
+# plotsave_param
+png(fn, width = 1200, height = 800)
+p <- ComplexHeatmap::Heatmap(heatmaply::normalize(hm), name = "Scaled counts", 
+                              col= col_fun,
+                              show_row_names = TRUE, show_column_names = TRUE,
+                              cluster_rows = TRUE, cluster_columns = TRUE,
+                              row_names_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"),
+                              column_names_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"), 
+                              heatmap_legend_param = list(legend_direction = "horizontal",
+                                                          title_position = "topcenter",
+                                                          title_gp = grid::gpar(fontsize = 40, fontfamily = "Arial"),
+                                                          labels_gp = grid::gpar(fontsize = 40, fontfamily = "Arial")),                             
+                            row_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for rows
+                            column_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for columns
+                            row_names_side = "left",
+                            row_dend_side = "right") + 
+      row_anno
+
+ComplexHeatmap::draw(p, heatmap_legend_side = "top", 
+                      padding = unit(c(12, 12, 2, 12), "mm"))   # right and bottom padding
+dev.off()
+
+
+# Density minor cell types across Progression.
+extfig5b <- readRDS(file.path(paths$home_git, "figures", "extfig5b.rds"))
+extfig5b <- extfig5b + 
+  scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration"), 
+                   labels = c("Control", "sAAb+", "mAAb+", "Onset", "LD")) +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.05))) + 
+  facet_wrap(~ cell_type, scales = "free_y", 
+            labeller = as_labeller(immune_labels), axes = "all") + 
+  theme(panel.spacing = unit(1, "cm")) +
+  theme(legend.position = "none") + 
+  ylab("log1p: Cell density (cells/mm^2)")
+
+extfig5b$data |> as_tibble() |> 
+  dplyr::distinct(case_id, donor_type) |> 
+  dplyr::count(donor_type)
+
+fn <- "extfig5b.png"
+do.call(ggsave, c(list(fn, extfig5b), plotsave_param_large))
+
+# Good.
+# 
+extfig5c <- readRDS(file.path(paths$home_git, "figures", "extfig5c.rds"))
+extfig5c <- extfig5c + 
+  scale_color_manual(name = "Stage",
+                     values = palettes$stages[1:4],
+                     breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"),
+                     labels = c("Control", "sAAb+", "mAAb+", "Onset")) + 
+  facet_wrap(~ cell_type, scales = "free_y", labeller = as_labeller(immune_labels),
+  axes = "all") + 
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) + 
+  ylab("log1p: Cell density (cells/mm^2)") + 
+  theme(panel.spacing = unit(1, "cm")) + 
+  xlab("Age groups (years)") # Adjust the value as needed + 
+  
+extfig5c$data |> as_tibble() |> 
+  dplyr::distinct(case_id, donor_type) |> 
+  dplyr::count(donor_type)
+
+fn <- "extfig5c.png"
+do.call(ggsave, c(list(fn, extfig5c), plotsave_param_large))
+
+# InfiltrationScore-Immune (11_Immune)
+extfig5d <- readRDS(file.path(paths$home_git, "figures", "extfig5d.rds"))
+
+extfig5d$data$immune_cluster <- factor(
+  extfig5d$data$immune_cluster,
+  levels = c("B", "CD303_VIM", "NK", "T_DN")  # <- replace with your desired order
+)
+
+extfig5d <- extfig5d + 
+  scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration"), 
+                   labels = c("Control", "sAAb+", "mAAb+", "Onset", "LD")) +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.05))) + 
+  facet_wrap(~ immune_cluster, scales = "free_y", 
+    labeller = as_labeller(immune_labels), axes = "all") + 
+  ylab("log1p: Infiltration score") + 
+  theme(panel.spacing = unit(1, "cm"))  # Adjust the value as needed
+
+extfig5d$data |> as_tibble() |> 
+  dplyr::distinct(case_id, donor_type) |> 
+  dplyr::count(donor_type)
+
+fn <- "extfig5d.png"
+do.call(ggsave, c(list(fn, extfig5d), plotsave_param_large))
+
+# 28_Immune. 
+## Correlations Immune infiltraitons.
+extfig5e <- readRDS(file.path(paths$home_git, "figures", "extfig5e.rds"))
+
+extfig5e <- extfig5e +    
+  xlab(expression(beta ~ "-cell normalized counts")) + 
+  facet_wrap(~ CellTypeNormScoreTot, scales = "free_y", 
+            axes = "all", labeller = as_labeller(immune_labels))  +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) + 
+  scale_color_manual(name = "Stage",
+                     values = palettes$stages[1:4],
+                     breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"),
+                    labels = c("Control", "sAAb+", "mAAb+", "Onset"))  + 
+  theme(legend.position = "top", legend.justification = "center", legend.box = "horizontal")
+
+fn <- "extfig5e.png"
+do.call(ggsave, c(list(fn, extfig5e), plotsave_param_large))
+```
+
+
+# Figure 4: T-cells
+
+```{r}
+# ComplexHeatmap: doesnt work. (07_Clustering)
+hm <- readRDS(file.path(paths$home_git, "figures", "CH_fig4a.rds"))
+
+# hm <- hm[rownames(hm) != "T_CD4_Other", ]
+cell_type_counts <- readRDS(file.path(paths$home_git, "figures", "CH_fig4a_anno.rds"))
+# cell_type_counts <- cell_type_counts[names(cell_type_counts) != "T_CD4_Other"]
+
+tcd4_labels2 <- tcd4_labels3[rownames(hm)]
+rownames(hm) <- tcd4_labels2  
+
+formatted_rowlabels <- parse(text = rownames(hm))
+
+# Create row annotation for cell type counts
+row_anno <- ComplexHeatmap::rowAnnotation(
+  "Cell counts" = ComplexHeatmap::anno_barplot(cell_type_counts, 
+                         gp = grid::gpar(fill = "skyblue", col = "black"),
+                         border = TRUE,
+                         width = grid::unit(4, "cm"),
+      axis_param = list(gp = grid::gpar(fontsize = 25)),
+),       
+  show_annotation_name = TRUE,
+  annotation_name_gp = grid::gpar(fontsize = 30),
+  annotation_name_side = "top",
+  annotation_name_rot = 0,
+  annotation_name_offset = unit(c(0.5, 0.5), "cm")
+    # Adjust title size here
+)
+
+# Display the heatmap
+fn <- file.path(paths$home_git, "figures", "fig4a.png")
+
+png(fn, width = 1200, height = 800)
+p <- ComplexHeatmap::Heatmap(hm, name = "Scaled counts", 
+                              col= col_fun,
+                              show_row_names = TRUE, show_column_names = TRUE,
+                              cluster_rows = TRUE, cluster_columns = TRUE,
+                              row_names_gp = grid::gpar(fontsize = 30),
+                              row_labels = formatted_rowlabels,
+                              column_names_gp = grid::gpar(fontsize = 30), 
+                              row_names_max_width = unit(8, "cm"),
+                              row_title = "T-CD4 subtypes",
+                              row_title_gp = grid::gpar(fontsize = 35, lineheight = 100),
+                              heatmap_legend_param = list(legend_direction = "horizontal",
+                                                          title_position = "topcenter",
+                                                          title_gp = grid::gpar(fontsize = 40),
+                                                          labels_gp = grid::gpar(fontsize = 40)),                             
+                            row_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for rows
+                            column_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for columns
+                            row_names_side = "left",
+                            row_dend_side = "right") + 
+      row_anno
+
+ComplexHeatmap::draw(p, heatmap_legend_side = "top", 
+                      padding = unit(c(12, 12, 2, 12), "mm"))  # right and bottom padding
+dev.off()
+```
+
+T-CD8 cells:
+
+```{r}
+breaks <- c(0, 0.5, 0.7, 1) 
+colors <- viridis::viridis(4) 
+col_fun <- circlize::colorRamp2(breaks, colors)
+```
+
+```{r}
+hm <- readRDS(file.path(paths$home_git, "figures", "CH_fig4b.rds"))
+cell_type_counts <- readRDS(file.path(paths$home_git, "figures", "CH_fig4b_anno.rds"))
+
+tcd8_labels2 <- tcd8_labels3[rownames(hm)]
+rownames(hm) <- tcd8_labels2  
+
+formatted_rowlabels <- parse(text = rownames(hm))
+
+# Create row annotation for cell type counts
+row_anno <- ComplexHeatmap::rowAnnotation(
+  "Cell counts" = ComplexHeatmap::anno_barplot(cell_type_counts, 
+                         gp = grid::gpar(fill = "skyblue", col = "black"),
+                         border = TRUE,
+                         width = grid::unit(4, "cm"),
+      axis_param = list(gp = grid::gpar(fontsize = 25)),
+),       
+  show_annotation_name = TRUE,
+  annotation_name_gp = grid::gpar(fontsize = 30),
+  annotation_name_side = "top",
+  annotation_name_rot = 0,
+  annotation_name_offset = unit(c(0.5, 0.5), "cm")
+    # Adjust title size here
+)
+
+# Display the heatmap
+fn <- file.path(paths$home_git, "figures", "fig4b.png")
+
+png(fn, width = 1200, height = 800)
+p <- ComplexHeatmap::Heatmap(hm, name = "Scaled counts", 
+                              col= col_fun,
+                              row_title = "T-CD8 subtypes",
+                              show_row_names = TRUE, show_column_names = TRUE,
+                              cluster_rows = TRUE, cluster_columns = TRUE,
+                              row_names_gp = grid::gpar(fontsize = 30),
+                              column_names_gp = grid::gpar(fontsize = 30), 
+                              row_title_gp = grid::gpar(fontsize = 35),
+                              row_names_max_width = unit(8, "cm"),
+                              heatmap_legend_param = list(legend_direction = "horizontal",
+                                                          title_position = "topcenter",
+                                                          title_gp = grid::gpar(fontsize = 40),
+                                                          labels_gp = grid::gpar(fontsize = 40)),                             
+                            row_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for rows
+                            column_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for columns
+                            row_names_side = "left",
+                            row_dend_side = "right",
+                            row_labels = formatted_rowlabels) + 
+      row_anno
+
+ComplexHeatmap::draw(p, heatmap_legend_side = "top", 
+                      padding = unit(c(12, 12, 2, 12), "mm"))  # right and bottom padding
+
+dev.off()
+```
+
+Figure 4c + 4D Chi-squared Analyses. 
+
+
+Continue here.
+
+```{r fig4c}
+# Missing: Chi-squared (10_DistanceAnalysis)
+chisq <- readRDS(file.path(paths$home_git, "figures", "chisq_fig4c.rds"))
+
+std_residuals <- chisq$stdres
+std_residuals <- std_residuals[rownames(std_residuals) != "T_CD4_Other", ]
+
+# Reorder rows based on clustering
+row_dist <- dist(std_residuals) 
+row_hclust <- hclust(row_dist, method = "ward.D2")
+ordered_rows <- chisq$residuals[row_hclust$order, ]
+
+# ordered_rows <- ordered_rows[rownames(ordered_rows) != "T_CD4_Other", ]
+tcd4_labels2 <- tcd4_labels3[names(tcd4_labels) != "T_CD4_Other"]
+tcd4_labels2 <- tcd4_labels2[rownames(ordered_rows)]
+rownames(ordered_rows) <- tcd4_labels2
+
+ordered_rows2 <- data.frame(immune_cluster = rownames(ordered_rows), ordered_rows)
+
+formatted_rowlabels <- parse(text = rownames(ordered_rows))
+
+fn <- file.path(file.path(paths$home_git, "figures", "fig4c.png"))
+png(fn, units = "mm", width = 230, height = 300, res = 300)
+
+ggplot(ordered_rows2, aes(x = `test.infiltration`, y = immune_cluster, 
+                           color = Freq,
+                           size = abs(Freq))) +
+  geom_point() +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  scale_size_continuous(range = c(3, 27)) +  # Keep large dots in plot
+  guides(size = "none",
+         color = guide_colorbar(title.position = "top", title.hjust = 0.5)) +   # Move title below legend) +  # Remove size legend
+  mytheme$large_new() +
+  labs(y = "T-CD4 subtypes", x = "Distance to islet",
+       color = "Enrichment score") +  # Remove size legend label
+  theme(
+    legend.position = "top",  # Move color legend to bottom
+    legend.direction = "horizontal",  # Arrange legend horizontally
+    legend.title = element_text(size = 30, "bold"),  # Adjust legend title size
+    legend.key.width = unit(2, "cm"),  # Make legend wider if needed
+    axis.text.x = element_text(angle = 90, hjust = 1),  # Rotate x-axis text
+    axis.text.y = element_text(vjust = 0.5, hjust = 1),  # Tighten y-axis text
+    axis.title.x = element_text(margin = margin(t = 5)),  # Adjust spacing
+    axis.title.y = element_text(margin = margin(r = 10)),  
+    panel.grid.major = element_blank(),  # Remove large grid spacing
+    panel.grid.minor = element_blank(),  # Remove minor grids
+    panel.spacing = unit(0.1, "lines"),  # Reduce spacing between panels
+    plot.margin = margin(0, 5, 5, 5),  # Reduce whitespace around the plot
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5) 
+  ) +
+  scale_x_discrete(position = "bottom") + 
+  ggplot2::scale_y_discrete(breaks = rownames(ordered_rows),
+                  labels = formatted_rowlabels)  # Moves x-axis to the top
+
+dev.off()
+```
+
+
+Figure 4D: T-CD8 subtypes.
+```{r fig6c}
+chisq <- readRDS(file.path(paths$home_git, "figures", "chisq_fig4d.rds"))
+std_residuals <- chisq$stdres
+
+# Reorder rows based on clustering
+row_dist <- dist(std_residuals) 
+row_hclust <- hclust(row_dist, method = "ward.D2")
+ordered_rows <- chisq$residuals[row_hclust$order, ]
+
+# ordered_rows <- ordered_rows[rownames(ordered_rows) != "T_CD4_Other", ]
+tcd8_labels2 <- tcd8_labels3[rownames(ordered_rows)]
+rownames(ordered_rows) <- tcd8_labels2
+
+ordered_rows2 <- data.frame(immune_cluster = rownames(ordered_rows), ordered_rows)
+
+formatted_rowlabels <- parse(text = rownames(ordered_rows))
+
+## Plot with complex heatmap corrplot
+fn <- file.path(file.path(paths$home_git, "figures", "fig4d.png"))
+png(fn, units = "mm", width = 230, height = 300, res = 300)
+
+ggplot(ordered_rows2, aes(x = `test.infiltration`, y = immune_cluster, 
+                           color = Freq,
+                           size = abs(Freq))) +
+  geom_point() +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  scale_size_continuous(range = c(3, 27)) +  # Keep large dots in plot
+  guides(size = "none",
+         color = guide_colorbar(title.position = "top", title.hjust = 0.5)) +   # Move title below legend) +  # Remove size legend
+  mytheme$large_new() +
+  labs(y = "T-CD8 subtypes", x = "Distance to islet",
+       color = "Enrichment score") +  # Remove size legend label
+  theme(
+    legend.position = "top",  # Move color legend to bottom
+    legend.direction = "horizontal",  # Arrange legend horizontally
+    legend.title = element_text(size = 30, "bold"),  # Adjust legend title size
+    legend.key.width = unit(2, "cm"),  # Make legend wider if needed
+    axis.text.x = element_text(angle = 90, hjust = 1),  # Rotate x-axis text
+    axis.text.y = element_text(vjust = 0.5, hjust = 1),  # Tighten y-axis text
+    axis.title.x = element_text(margin = margin(t = 5)),  # Adjust spacing
+    axis.title.y = element_text(margin = margin(r = 10)),  
+    panel.grid.major = element_blank(),  # Remove large grid spacing
+    panel.grid.minor = element_blank(),  # Remove minor grids
+    panel.spacing = unit(0.1, "lines"),  # Reduce spacing between panels
+    plot.margin = margin(0, 5, 5, 5),  # Reduce whitespace around the plot
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5) 
+  ) +
+  scale_x_discrete(position = "bottom") + 
+  ggplot2::scale_y_discrete(breaks = rownames(ordered_rows),
+                  labels = formatted_rowlabels)  # Moves x-axis to the top
+
+dev.off()
+```
+
+Figure 4E+F: Differential Abundance of T-cells.
+
+```{r fig4e}
+# Works.
+fig4e <- readRDS(file.path(paths$home_git, "figures", "fig4e.rds"))
+fig4e <- fig4e + 
+  scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration"), 
+                   labels = c("Control", "sAAb+", "mAAb+", "Onset", "LD")) +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) + 
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.05))) + 
+  theme(legend.position = "none")
+
+fig4e$data |> as_tibble() |> 
+  dplyr::distinct(case_id, donor_type) |> 
+  dplyr::count(donor_type)
+
+fn <- "fig4e.png"
+plotsave_param2 <- plotsave_param
+plotsave_param2$width <- 180
+do.call(ggsave, c(list(fn, fig4e), plotsave_param2))
+```
+
+```{r}
+##T-CD8:
+fig4f <- readRDS(file.path(paths$home_git, "figures", "fig4f.rds"))
+fn <- "fig4f.png"
+
+fig4f$data |> as_tibble() |> 
+  dplyr::distinct(case_id, donor_type) |> 
+  dplyr::count(donor_type)
+
+fig4f <- fig4f +
+  facet_wrap(~immune_cluster, labeller = as_labeller(tcd8_labels3, label_parsed), scales = "free_y") + 
+  scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration"), 
+                   labels = c("Control", "sAAb+", "mAAb+", "Onset", "LD")) +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) + 
+  ylab("Cell density (cells/mm^2)") + 
+  mytheme$standard_new() + 
+  theme(legend.position = "none")
+
+plotsave_param2 <- plotsave_param
+plotsave_param2$width <- 180
+do.call(ggsave, c(list(fn, fig4f), plotsave_param2))
+```
+
+```{r}
+# fig4g <- empty.
+fig4g <- empty_plot
+
+# Fig 4H: Infiltration Scores T-CD8 subtypes (-Treg.)
+## 28_Immune. 
+palettes$custom <- c(rate = palettes$colors[1], rate2 = palettes$colors[2], 
+                     rate3 = palettes$colors[3])
+p <- readRDS(file.path(paths$home_git, "figures", "fig4h.rds"))
+
+p <- p + xlim(0.13, 1) + 
+  scale_fill_manual(values = palettes$custom,
+                    name = "T-eff",  
+                    breaks = c("rate", "rate2", "rate3"),
+                    labels = c("T-naive", "T-EM/CM-like", bquote("T-ex"^eff))) + 
+  scale_color_manual(values = palettes$custom,
+                     name = "T-eff",  
+                     breaks = c("rate", "rate2", "rate3"),
+                    labels = c("T-naive", "T-EM/CM-like",bquote("T-ex"^eff))) + 
+  ylab("Infiltration score: T-reg - T-eff") +
+  scale_y_continuous(labels = scales::label_number(scale = 1000))
+
+p2 <- readRDS(file.path(paths$home_git, "figures", "pseudotime_flat.rds"))
+p2 <- p2 + xlim(0.13, 1)
+
+p3 <- p + p2 + plot_layout(nrow = 2, heights = c(15, 1), guides = "collect") & 
+  theme(legend.position = "top",  # Move legend to top
+        legend.direction = "vertical",
+        legend.text = element_text(size = 20),
+        legend.title = element_text(size = 20),
+        axis.text.x = element_text(size = 22),
+        axis.title.x = element_text(size = 22) ,
+        plot.margin = margin(5, 5, 5, 5)) 
+
+fn <- "fig4h.png"
+plotsave_param2 <- plotsave_param
+plotsave_param2$height <- 200
+plotsave_param2$width <- 200
+do.call(ggsave, c(list(fn, p3), plotsave_param2))
+```
+
+## Supplementary Figure 6:
+
+Extended Data Fig 6A: T-CD4 all subtypes.
+
+```{r t-cd4-all-subtypes}
+# FIXME - 09_Immune.
+# Ext Fig 6a: T-CD4 all subtypes.
+extfig6a <- readRDS(file.path(paths$home_git, "figures", "extfig6a.rds"))
+
+## T-CD4 ALl Subtypes.
+extfig6a <- extfig6a + 
+  scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration"), 
+                   labels = c("Control", "sAAb+", "mAAb+", "Onset", "LD")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 0.5, vjust = 0.5)) + 
+  theme(panel.spacing = unit(1, "cm")) + 
+  theme(legend.position = "none") + 
+  ylab("log1p: Cell density (cells/mm^2)")
+
+extfig6a$data |> as_tibble() |> 
+  dplyr::distinct(case_id, donor_type) |> 
+  dplyr::count(donor_type)
+
+fn <- "extfig6a.png"
+do.call(ggsave, c(list(fn, extfig6a), plotsave_param_large))
+```
+
+```{r tcd8-subtypes}
+## All T-CD8 subtypes.
+## 09_Immune.
+# Ext Fig 6b: T-CD8 all subtypes.
+fn <- "extfig6b.png"
+extfig6b <- readRDS(file.path(paths$home_git, "figures", "extfig6b.rds"))
+extfig6b <- extfig6b + 
+  scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration"), 
+                   labels = c("Control", "sAAb+", "mAAb+", "Onset", "LD")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 0.5, vjust = 0.5)) + 
+  theme(panel.spacing = unit(1, "cm"), legend.position = "none") + 
+  ylab("log1p: Cell density (cells/mm^2)")
+
+extfig6b$data |> as_tibble() |> 
+  dplyr::distinct(case_id, donor_type) |> 
+  dplyr::count(donor_type)
+
+do.call(ggsave, c(list(fn, extfig6b), plotsave_param_large))
+```
+
+```{r t-exeff-pd1-infiltration-score}
+## T-exeff + T_CD4 PD1+ Infiltraiton Score 
+extfig6c <- readRDS(file.path(paths$home_git, "figures", "extfig6c.rds"))
+
+extfig6c <- extfig6c + 
+  facet_wrap(~ immune_cluster, labeller = as_labeller(all_labels, label_parsed), 
+              nrow = 2, axes = "all", scales = "free_y") +
+  scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"), 
+                   labels = c("Control", "sAAb+", "mAAb+", "Onset")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  theme(panel.spacing = unit(1, "cm")) + 
+  ylab("log1p: Infiltration score")
+
+extfig6c$data |> as_tibble() |> 
+  dplyr::distinct(case_id, donor_type) |> 
+  dplyr::count(donor_type)
+
+fn <- "extfig6c.png"
+plotsave_param2 <- plotsave_param
+plotsave_param2$height <- 500
+do.call(ggsave, c(list(fn, extfig6c), plotsave_param2))
+```
+
+```{r}
+# extfig6d -> EMPTY PLOT
+```
+
+
+```{r t-exeff-pd1-hla-dr-infiltration-score}
+# Extended Data Fig. 6e: -> AS 6c, but with HLA-DR + HLA-ABC.
+extfig6e <- readRDS(file.path(paths$home_git, "figures", "extfig6e.rds"))
+fn <- "extfig6e.png"
+plotsave_param2 <- plotsave_param
+plotsave_param2$width <- 200
+plotsave_param2$height <- 250
+do.call(ggsave, c(list(fn, extfig6e), plotsave_param))
+```
+
+```{r}
+extfig6f <- readRDS(file.path(paths$home_git, "figures", "extfig6f.rds"))
+relevel_cell <- function(d) {
+  d$channel <- factor(d$channel, levels = c("GranB", "CD103", "PD1", "TIM3"))
+  d
+}
+
+extfig6f$data  <- relevel_cell(extfig6f$data)
+extfig6f$layers <- lapply(extfig6f$layers, \(ly) { ly$data <- relevel_cell(ly$data); ly })
+
+extfig6f <- extfig6f +
+  facet_wrap(~ channel, scales = "free_y", nrow = 3, axes = "all") + 
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) + 
+  scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration"), 
+                   labels = c("Control", "sAAb+", "mAAb+", "Onset", "LD")) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 0.5, vjust = 0.5)) + 
+  ylab(expression(paste("PD1"^"+", " act. normalized counts"))) +
+  theme(panel.spacing = unit(1, "cm"))
+
+extfig6f$data |> as_tibble() |> 
+  dplyr::distinct(case_id, donor_type) |> 
+  dplyr::count(donor_type)
+
+fn <- "extfig6f.png"
+plotsave_param2 <- plotsave_param
+plotsave_param2$height <- 400
+plotsave_param2$width <- 330
+do.call(ggsave, c(list(fn, extfig6f), plotsave_param2))
+
+# PD1+CD27+ expression.
+extfig6g <- readRDS(file.path(paths$home_git, "figures", "extfig6g.rds"))
+extfig6g$data  <- relevel_cell(extfig6g$data)
+extfig6g$layers <- lapply(extfig6g$layers, \(ly) { ly$data <- relevel_cell(ly$data); ly })
+
+extfig6g <- extfig6g + ylab(expression(T-ex^eff ~ "normalized counts")) + 
+  facet_wrap(~ channel, scales = "free_y", nrow = 3, axes = "all") + 
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) + 
+  scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration"), 
+                   labels = c("Control", "sAAb+", "mAAb+", "Onset", "LD")) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 0.5, vjust = 0.5)) + 
+  ylab(expression(T-ex^eff ~ "normalized counts")) + 
+  theme(panel.spacing = unit(1, "cm"))
+
+extfig6g$data |> as_tibble() |> 
+  dplyr::distinct(case_id, donor_type) |> 
+  dplyr::count(donor_type)
+
+fn <- "extfig6g.png"
+plotsave_param2 <- plotsave_param
+plotsave_param2$height <- 400
+plotsave_param2$width <- 330
+do.call(ggsave, c(list(fn, extfig6g), plotsave_param2))
+```
+
+## Extended Data Fig 7:
+
+```{r}
+set.seed(222)
+hm <- readRDS(file.path(paths$home_git, "figures", "extfig7a_CH.rds"))
+cell_type_counts <- readRDS(file.path(paths$home_git, "figures", "extfig7a_anno.rds"))
+
+# Cluster rows
+row_dist <- dist(hm)
+row_hclust <- hclust(row_dist, method = "ward.D2")
+ordered_rows <- hm[row_hclust$order, ]
+
+# Cluster columns
+col_dist <- dist(t(hm))
+col_hclust <- hclust(col_dist, method = "ward.D2")
+ordered_rows <- ordered_rows[, col_hclust$order]
+
+cell_type_counts <- cell_type_counts[rownames(ordered_rows)]
+
+tt <- CN_labels_full[names(CN_labels_full) %in% rownames(ordered_rows)]
+rownames(ordered_rows) <- tt[rownames(ordered_rows)]
+
+# Rename colnames
+colnames(ordered_rows) <- full_immune_labels[colnames(ordered_rows)]
+
+# Create row annotation for cell type counts
+row_anno <- ComplexHeatmap::rowAnnotation(
+  "Cell counts" = ComplexHeatmap::anno_barplot(cell_type_counts, 
+                         gp = grid::gpar(fill = "skyblue", col = "black"),
+                         border = TRUE,
+                         width = grid::unit(4, "cm"),
+      axis_param = list(gp = grid::gpar(fontsize = 25)),
+),       
+  show_annotation_name = TRUE,
+  annotation_name_gp = grid::gpar(fontsize = 30),
+  annotation_name_side = "top",
+  annotation_name_rot = 0,
+  annotation_name_offset = unit(c(0.5, 0.5), "cm")
+    # Adjust title size here
+)
+
+fn <- file.path(paths$home_git, "figures", "extfig7a.png")
+
+png(fn, width = 1200, height = 1000)
+p <- ComplexHeatmap::Heatmap(ordered_rows, name = "Scaled fraction", 
+                              #col= colorRampPalette(c("blue", "white", "red"))(100),
+                              show_row_names = TRUE, show_column_names = TRUE,
+                              cluster_rows = FALSE, cluster_columns = FALSE,
+                              row_names_gp = grid::gpar(fontsize = 25, fontfamily = "Arial"),
+                              column_names_gp = grid::gpar(fontsize = 25, fontfamily = "Arial"), 
+                              heatmap_legend_param = list(legend_direction = "horizontal",
+                                                          title_position = "topcenter",
+                                                          title_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"),
+                                                          labels_gp = grid::gpar(fontsize = 30, fontfamily = "Arial")),                             
+                            row_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for rows
+                            column_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for columns
+                            row_names_side = "left",
+                            row_dend_side = "right") + 
+      row_anno
+
+ComplexHeatmap::draw(p, heatmap_legend_side = "top", 
+                      padding = unit(c(20, 60, 2, 10), "mm"))   # right and bottom padding
+dev.off()
+```
+
+```{r}
+### Ext Fig 7B: Chi-squared T-CD8 subtypes.
+### 16_Immune.
+set.seed(222)
+chisq <- readRDS(file.path(paths$home_git, "figures", "chisq_extfig7b.rds"))
+
+# Reorder rows based on clustering
+row_dist <- dist(chisq$residuals) 
+row_hclust <- hclust(row_dist, method = "ward.D2")
+ordered_rows <- chisq$residuals[row_hclust$order, ]
+
+# Re-order columns based on clustering
+col_dist <- dist(t(chisq$residuals))
+col_hclust <- hclust(col_dist, method = "ward.D2")
+ordered_rows <- ordered_rows[, col_hclust$order]
+
+# 
+tcd8_labels2 <- tcd8_labels3[colnames(ordered_rows)]
+colnames(ordered_rows) <- tcd8_labels2
+
+ordered_rows <- ordered_rows[!rownames(ordered_rows) %in% c("Endothelial", "Mixed-Islet",
+                                                            "Ductal", "Ambiguous", "Nerves",
+                                                            "CD303_VIM", "Neutrophil", "Stroma",
+                                                            "Smooth-Muscle", "Islet-Other"), ]
+tt <- CN_labels[names(CN_labels) %in% rownames(ordered_rows)]
+rownames(ordered_rows) <- tt[rownames(ordered_rows)]
+
+# Z-scale ordered-rows:
+# ordered_rows <- scale(ordered_rows)
+formatted_collabels <- parse(text = colnames(ordered_rows))
+
+# Display the heatmap
+fn <- file.path(paths$home_git, "figures", "extfig7b.png")
+png(fn, units = "mm", width = 450, height = 300, res = 300)
+
+lgd <- ComplexHeatmap::Legend(
+  at = seq(-15, 30, 10),  # Adjust based on your data range
+  col_fun = circlize::colorRamp2(c(-15, 0, 30), c("blue", "white", "red")),  # Custom color scale
+  title = "Enrichment score",
+  title_gp = grid::gpar(fontsize = 30),
+  labels_gp = grid::gpar(fontsize = 20),
+  direction = "vertical",
+  title_position = "topcenter",
+  legend_height = unit(5, "cm"),  # Adjust this to the height of the heatmap
+)
+ 
+p <- ComplexHeatmap::Heatmap(ordered_rows,  
+                             cluster_columns = FALSE, cluster_rows = FALSE,
+                             row_names_gp = grid::gpar(fontsize = 30),
+                             column_names_gp = grid::gpar(fontsize = 30),
+                             column_labels = formatted_collabels
+)
+
+# Draw the heatmap and manually position the legend
+ComplexHeatmap::draw(p, show_heatmap_legend = FALSE,
+padding = unit(c(35, 10, 10, 75), "mm"))  # Remove auto-legend
+
+grid::pushViewport(grid::viewport(x = 0.85, y = 0.15, width = 0.1, height = 0.8))  # Adjust position
+grid::grid.draw(lgd)
+grid::popViewport()
+
+dev.off()
+
+### 16_Immune. 
+### Chi-squared T-CD4 subtypes. 
+### Extended Data Fig. 7C
+set.seed(222)
+chisq <- readRDS(file.path(paths$home_git, "figures", "chisq_extfig7c.rds"))
+std_residuals <- chisq$stdres
+
+# Reorder rows based on clustering
+row_dist <- dist(std_residuals) 
+row_hclust <- hclust(row_dist, method = "ward.D2")
+ordered_rows <- std_residuals[row_hclust$order, ]
+
+# Re-order columns based on clustering
+col_dist <- dist(t(std_residuals))
+col_hclust <- hclust(col_dist, method = "ward.D2")
+ordered_rows <- ordered_rows[, col_hclust$order]
+
+ordered_rows <- ordered_rows[!rownames(ordered_rows) %in% c("Endothelial", "Mixed-Islet",
+                                                            "Ductal", "Ambiguous", "Nerves",
+                                                            "CD303_VIM", "Neutrophil", "Stroma",
+                                                            "Smooth-Muscle", "Islet-Other",
+                                                            "Myeloid Inf mAAB+", "Mixed Inf", "Stroma CTRL"), ]
+tcd4_labels2 <- tcd4_labels3[colnames(ordered_rows)]
+colnames(ordered_rows) <- tcd4_labels2
+
+tt <- CN_labels_full[names(CN_labels_full) %in% rownames(ordered_rows)]
+rownames(ordered_rows) <- tt[rownames(ordered_rows)]
+formatted_collabels <- parse(text = colnames(ordered_rows))
+
+# Display the heatmap
+fn <- file.path(paths$home_git, "figures", "extfig7c.png")
+png(fn, units = "mm", width = 450, height = 300, res = 300)
+
+lgd <- ComplexHeatmap::Legend(
+  at = seq(-15, 15, 10),  # Adjust based on your data range
+  col_fun = circlize::colorRamp2(c(-15, 0, 15), c("blue", "white", "red")),  # Custom color scale
+  title = "Enrichment score",
+  title_gp = grid::gpar(fontsize = 30),
+  labels_gp = grid::gpar(fontsize = 20),
+  direction = "vertical",
+  title_position = "topcenter",
+  legend_height = unit(5, "cm"),  # Adjust this to the height of the heatmap
+)
+ 
+p <- ComplexHeatmap::Heatmap(ordered_rows,  
+                             cluster_columns = FALSE, cluster_rows = FALSE,
+                             row_names_gp = grid::gpar(fontsize = 30),
+                             column_names_gp = grid::gpar(fontsize = 30),
+                             column_labels = formatted_collabels
+)
+
+# Draw the heatmap and manually position the legend
+ComplexHeatmap::draw(p, show_heatmap_legend = FALSE,
+padding = unit(c(35, 10, 10, 75), "mm"))  # Remove auto-legend
+
+grid::pushViewport(grid::viewport(x = 0.85, y = 0.15, width = 0.1, height = 0.8))  # Adjust position
+grid.draw(lgd)
+grid::popViewport()
+
+dev.off()
+
+## Pseudotime. T_CD4 cells.
+## Script:
+extfig7d <- readRDS(file.path(paths$home_git, "figures", "extfig7d.rds"))
+extfig7d <- extfig7d + 
+  ylab("Infiltration score: T-reg - T-eff")
+
+palettes$custom <- c(rate = palettes$colors[1], rate2 = palettes$colors[3], 
+                     rate3 = palettes$colors[3])
+
+extfig7d <- extfig7d + xlim(0.13, 1) + 
+  scale_fill_manual(values = palettes$custom,
+                     name = "T-eff",  
+                     breaks = c("rate", "rate2"),
+                     labels = c("PD1+ act", bquote(PD1^low ~ "act."))) +
+    scale_color_manual(values = palettes$custom,
+                     name = "T-eff",  
+                     breaks = c("rate", "rate2"),
+                     labels = c("PD1+ act", bquote(PD1^low ~ "act.")))
+
+p2 <- readRDS(file.path(paths$home_git, "figures", "pseudotime_flat.rds"))
+p2 <- p2 + xlim(0.13, 1)
+
+extfig7d <- extfig7d + p2 + plot_layout(nrow = 2, 
+  heights = c(15, 1), guides = "collect") & 
+  theme(legend.position = "top",  # Move legend to top
+        legend.direction = "vertical",
+        legend.text = element_text(size = 20),
+        legend.title = element_text(size = 20),
+        axis.text.x = element_text(size = 22),
+        axis.title.x = element_text(size = 22) ,
+        plot.margin = margin(5, 5, 5, 5)) 
+
+fn <- "extfig7d.png"
+
+plotsave_param2 <- plotsave_param
+plotsave_param2$height <- 200
+plotsave_param2$width <- 200
+do.call(ggsave, c(list(fn, extfig7d), plotsave_param2))
+```
+
+# Figure 5
+
+```{r fig-5}
+# missing (18_APCs)
+fig5a <- readRDS(file.path(paths$home_git, "figures", "fig5a.rds"))
+fig5a <- fig5a + ylab("Myeloid cells normalized counts") + 
+labs(title = "Stage: Control") + 
+facet_wrap(~ channel, scales = "free_y", axes = "all")
+
+fn <- "fig5a.png"
+do.call(ggsave, c(list(fn, fig5a), plotsave_param_large))
+```
+
+Fig 5B.
+```{r}
+# ComplexHeatmap: doesnt work. (07_Clustering)
+hm <- readRDS(file.path(paths$home_git, "figures", "CH_fig5a.rds"))
+# hm <- hm[rownames(hm) != "Myeloid_Other", ]
+cell_type_counts <- readRDS(file.path(paths$home_git, "figures", "CH_fig5a_anno.rds"))
+# cell_type_counts <- cell_type_counts[names(cell_type_counts) != "Myeloid_Other"]
+
+# Create row annotation for cell type counts
+row_anno <- ComplexHeatmap::rowAnnotation(
+  "Cell counts" = ComplexHeatmap::anno_barplot(cell_type_counts, 
+                         gp = grid::gpar(fill = "skyblue", col = "black"),
+                         border = TRUE,
+                         width = grid::unit(4, "cm"),
+      axis_param = list(gp = grid::gpar(fontsize = 25)),
+),       
+  show_annotation_name = TRUE,
+  annotation_name_gp = grid::gpar(fontsize = 30),
+  annotation_name_side = "top",
+  annotation_name_rot = 0,
+  annotation_name_offset = unit(c(0.5, 0.5), "cm")
+    # Adjust title size here
+)
+
+myeloid_labels2 <- myeloid_labels[rownames(hm)]
+rownames(hm) <- myeloid_labels2
+
+# Display the heatmap
+fn <- file.path(paths$home_git, "figures", "fig5a.png")
+
+png(fn, width = 1200, height = 800)
+p <- ComplexHeatmap::Heatmap(heatmaply::normalize(hm), name = "Scaled counts", 
+                              col= col_fun,
+                              show_row_names = TRUE, show_column_names = TRUE,
+                              cluster_rows = TRUE, cluster_columns = TRUE,
+                              row_names_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"),
+                              column_names_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"), 
+                              heatmap_legend_param = list(legend_direction = "horizontal",
+                                                          title_position = "topcenter",
+                                                          title_gp = grid::gpar(fontsize = 40, fontfamily = "Arial"),
+                                                          labels_gp = grid::gpar(fontsize = 40, fontfamily = "Arial")),                             
+                            row_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for rows
+                            column_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for columns
+                            row_names_side = "left",
+                            row_dend_side = "right") + 
+      row_anno
+
+ComplexHeatmap::draw(p, heatmap_legend_side = "top", 
+                      padding = unit(c(12, 32, 2, 12), "mm"))   # right and bottom padding
+
+dev.off()
+```
+
+Fig 5B:
+```{r}
+chisq <- readRDS(file.path(paths$home_git, "figures", "chisq_fig5b.rds"))
+
+std_residuals <- chisq$stdres
+std_residuals <- std_residuals[rownames(std_residuals) != "Myeloid_Other", ]
+rownames(std_residuals) <- myeloid_labels[rownames(std_residuals)]
+
+# Reorder rows based on clustering
+row_dist <- dist(std_residuals) 
+row_hclust <- hclust(row_dist, method = "ward.D2")
+ordered_rows <- std_residuals[row_hclust$order, ]
+# ordered_rows <- scale(ordered_rows)
+
+ordered_rows2 <- data.frame(immune_cluster = rownames(ordered_rows), ordered_rows)
+
+## Plot with complex heatmap corrplot
+fn <- file.path(file.path(paths$home_git, "figures", "fig5b.png"))
+png(fn, units = "mm", width = 200, height = 260, res = 300)
+
+p <- ggplot(ordered_rows2, aes(x = `test.infiltration`, y = immune_cluster, 
+                           color = Freq,
+                           size = abs(Freq))) +
+  geom_point() +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  scale_size_continuous(range = c(3, 27)) +  # Keep large dots in plot
+  guides(size = "none",
+         color = guide_colorbar(title.position = "top", title.hjust = 0.5)) +   # Move title below legend) +  # Remove size legend
+  mytheme$large_new() +
+  labs(y = "Subtype", x = "Distance to islet",
+       color = "Enrichment score") +  # Remove size legend label
+  mytheme$standard_new() + 
+  theme(
+    legend.position = "top",  # Move color legend to bottom
+    legend.direction = "horizontal",  # Arrange legend horizontally
+    legend.title = element_text(size = 20, "bold"),  # Adjust legend title size
+    legend.key.width = unit(2, "cm"),  # Make legend wider if needed
+    axis.text.x = element_text(angle = 90, hjust = 1),  # Rotate x-axis text
+    axis.text.y = element_text(vjust = 0.5, hjust = 1),  # Tighten y-axis text
+    axis.title.x = element_text(margin = margin(t = 5)),  # Adjust spacing
+    axis.title.y = element_text(margin = margin(r = 10)),  
+    panel.grid.major = element_blank(),  # Remove large grid spacing
+    panel.grid.minor = element_blank(),  # Remove minor grids
+    panel.spacing = unit(0.1, "lines"),  # Reduce spacing between panels
+    plot.margin = margin(0, 5, 5, 5),  # Reduce whitespace around the plot
+    panel.border = element_rect(color = "black", fill = NA, size = 0.5) 
+  ) +
+  scale_x_discrete(position = "bottom")  # Moves x-axis to the top
+
+print(p)
+dev.off()
+```
+
+FIG 5C:
+```{r}
+fig5c <- readRDS(file.path(paths$home_git, "figures", "fig5c.rds"))
+fig5c <- fig5c + ylab("Myeloid cells normalized counts") + 
+      ggtitle("Stage: Control")
+
+fn <- "fig5c.png"
+do.call(ggsave, c(list(fn, fig5c), plotsave_param_large))
+```
+
+```{r fig5d}
+# M1/M2-like act. 
+fig5d <- readRDS(file.path(paths$home_git, "figures", "fig5d.rds"))
+fig5d <- fig5d +
+      scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"), 
+                       labels = c("Control", "sAAb+", "mAAb+", "Onset")) + 
+      theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) + 
+      scale_y_continuous(expand = expansion(mult = c(0.05, 0.05))) + 
+      theme(legend.position = "none")
+
+print(fig5d)
+
+fn <- "fig5d.png"
+plotsave_param2 <- plotsave_param
+plotsave_param2$height <- 400
+do.call(ggsave, c(list(fn, fig5d), plotsave_param2))
+
+# Fig 5E: 
+# Infiltration Score vs HLA-ABC expression.
+# FIX: 28_Immune.
+fig5e <- readRDS(file.path(paths$home_git, "figures", "fig5e.rds"))
+fn <- "fig5e.png"
+do.call(ggsave, c(list(fn, fig5e), plotsave_param))
+
+## Check if these belong to 5E.
+p <- readRDS(file.path(paths$home_git, "figures", "suppfig10yyyy.rds"))
+fn <- "suppfig10yyyy.png"
+plotsave_param2 <- plotsave_param
+plotsave_param2$width <- 300
+plotsave_param2$height <- 250
+do.call(ggsave, c(list(fn, p), plotsave_param2))
+# do.call(ggsave, c(list(fn, p), plotsave_param))
+
+
+# Fig 5F:
+# Works.
+fig5f <- readRDS(file.path(paths$home_git, "figures", "fig5f.rds"))
+fig5f <- fig5f + ylab("M1/M2-like act. normalized counts") + 
+        facet_wrap(~ channel, scales = "free_y", nrow = 2, axes = "all") + 
+        scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"), 
+                       labels = c("Control", "sAAb+", "mAAb+", "Onset")) +  
+#      scale_y_continuous(expand = expansion(mult = c(0.05, 0.05))) + 
+      theme(panel.spacing = unit(1, "cm")) + # Adjust the value as needed
+      mytheme$large_new()
+
+fn <- "fig5f.png"
+do.call(ggsave, c(list(fn, fig5f), plotsave_param_large))
+
+fig5h <- empty_plot
+```
+
+Chi-squared CNs:
+```{r}
+set.seed(222)
+chisq <- readRDS(file.path(paths$home_git, "figures", "chisq_fig5g.rds"))
+std_residuals <- chisq$stdres
+
+# Reorder rows based on clustering
+row_dist <- dist(std_residuals) 
+row_hclust <- hclust(row_dist, method = "ward.D2")
+ordered_rows <- std_residuals[row_hclust$order, ]
+
+# Reorder columns based on clustering
+col_dist <- dist(t(std_residuals))
+col_hclust <- hclust(col_dist, method = "ward.D2")
+ordered_rows <- ordered_rows[, col_hclust$order]
+
+myeloid_labels2 <- myeloid_labels[colnames(ordered_rows)]
+colnames(ordered_rows) <- myeloid_labels2
+
+ordered_rows <- ordered_rows[!rownames(ordered_rows) %in% c("Endothelial", "Mixed-Islet",
+                                                            "Ductal", "Ambiguous", "Nerves",
+                                                            "CD303_VIM", "Neutrophil", "Stroma",
+                                                            "Smooth-Muscle", "Islet-Other", 
+                                                            "Myeloid Inf mAAB+", "Mixed Inf", "Stroma CTRL"), ]
+
+tt <- CN_labels_full[names(CN_labels_full) %in% rownames(ordered_rows)]
+rownames(ordered_rows) <- tt[rownames(ordered_rows)]
+
+# Display the heatmap
+fn <- file.path(paths$home_git, "figures", "fig5g.png")
+png(fn, units = "mm", width = 450, height = 300, res = 300)
+
+lgd <- ComplexHeatmap::Legend(
+  at = seq(-75, 85, 50),  # Adjust based on your data range
+  col_fun = circlize::colorRamp2(c(-75, 0, 85), c("blue", "white", "red")),  # Custom color scale
+  title = "Enrichment score",
+  title_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"),
+  labels_gp = grid::gpar(fontsize = 20, fontfamily = "Arial"),
+  direction = "vertical",
+  title_position = "topcenter",
+  legend_height = unit(5, "cm"),  # Adjust this to the height of the heatmap
+)
+
+p <- ComplexHeatmap::Heatmap(ordered_rows,  
+                             cluster_columns = TRUE, cluster_rows = TRUE,
+                             row_names_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"),
+                             column_names_gp = grid::gpar(fontsize = 30, fontfamily = "Arial")
+)
+
+# Draw the heatmap and manually position the legend
+ComplexHeatmap::draw(p, show_heatmap_legend = FALSE,
+padding = unit(c(35, 10, 10, 75), "mm"))  # Remove auto-legend
+
+grid::pushViewport(grid::viewport(x = 0.85, y = 0.15, width = 0.1, height = 0.8))  # Adjust position
+grid::grid.draw(lgd)
+grid::popViewport()
+
+dev.off()
+```
+
+```{r}
+# Figure 5I: Co-infiltration.
+fig5i <- readRDS(file.path(paths$home_git, "figures", "fig5i.rds"))
+fig5i <- fig5i + labs(y = bquote("Infiltration score: T-ex"^eff),
+                                x = "Infiltration score: M1/M2-like act.")
+
+fn <- "fig5i.png"
+do.call(ggsave, c(list(fn, fig5i), plotsave_param))
+```
+
+Extended Data Fig. 8:
+```{r}
+# Extended Data Fig. 8A: Total immune cells across stages.
+## 09_Immune.
+extfig8a <- readRDS(file.path(paths$home_git, "figures", "extfig8a.rds"))
+extfig8a <- extfig8a + ylab("log1p: Cell density (cells / mm^2)") +  
+  scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"), 
+                   labels = c("Control", "sAAb+", "mAAb+", "Onset")) + 
+  theme(panel.spacing = unit(1, "cm"))  + 
+  theme(legend.position = "none") # Adjust the value as needed
+
+fn <- "extfig8a.png"
+do.call(ggsave, c(list(fn, extfig8a), plotsave_param_large))
+
+# Boxplots of Subtypes across stages.
+extfig8b <- readRDS(file.path(paths$home_git, "figures", "extfig8b.rds"))
+extfig8b <- extfig8b + 
+  facet_wrap(~ channel, scales = "free_y", nrow = 2, axes = "all") + 
+  scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration"), 
+                   labels = c("Control", "sAAb+", "mAAb+", "Onset", "LD")) + 
+  scale_fill_discrete(name = "Distance to islet") + 
+  theme(panel.spacing = unit(1, "cm"))  # Adjust the value as needed
+
+fn <- "extfig8b.png"
+do.call(ggsave, c(list(fn, extfig8b), plotsave_param_large))
+
+
+# Infiltration Scores. M1/M2-like + cDCs.
+extfig8c <- readRDS(file.path(paths$home_git, "figures", "extfig8c.rds"))
+extfig8c <- extfig8c + 
+  facet_wrap(~ immune_cluster, labeller = as_labeller(myeloid_labels), 
+  scales = "free_y", nrow = 2, axes = "all") +   
+  scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration"), 
+                   labels = c("Control", "sAAb+", "mAAb+", "Onset", "LD")) + 
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) + 
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.05))) +
+  ylab("log1p: Infiltration score") + 
+  theme(panel.spacing = unit(1, "cm"))  # Adjust the value as needed
+          
+fn <- "extfig8c.png"
+plotsave_param2 <- plotsave_param
+plotsave_param2$height <- 400
+do.call(ggsave, c(list(fn, extfig8c), plotsave_param2))
+
+# Works -> get right size.
+extfig8d <- readRDS(file.path(paths$home_git, "figures", "extfig8d.rds"))
+extfig8d <- extfig8d + mytheme$large_new()
+
+extfig8d <- extfig8d + facet_wrap(~ cell_cluster_scaled, labeller = 
+    as_labeller(c("Activated M1/M2" = "M1/M2-like act.",
+                  "cDC" = "cDC")), scales = "free_y", nrow = 2, axes = "all") + 
+  scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration"), 
+                   labels = c("Control", "sAAb+", "mAAb+", "Onset", "LD")) +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) + 
+  ylab("Distance to islet edge (µm)") + 
+  theme(panel.spacing = unit(1, "cm"))  # Adjust the value as needed
+
+fn <- "extfig8d.png"
+plotsave_param2 <- plotsave_param
+plotsave_param2$height <- 400
+do.call(ggsave, c(list(fn, extfig8d), plotsave_param2))
+
+# Myeloid along Pseudotime.
+p <- readRDS(file.path(paths$home_git, "figures", "extfig8e.rds"))
+p <- p + ylab("M1/M2-like act. normalized counts") + xlim(0.13, 1)
+
+p2 <- readRDS(file.path(paths$home_git, "figures", "pseudotime_flat.rds"))
+p2 <- p2 + xlim(0.13, 1)
+
+p3 <- p + p2 + 
+  plot_layout(nrow = 2, heights = c(15, 1), guides = "collect") &  # Adjust heights ratio
+  theme(legend.position = "right",  # Move legend to top
+        legend.direction = "vertical",
+        legend.text = element_text(size = 20),
+        legend.title = element_text(size = 20),
+        axis.text.x = element_text(size = 20),
+        axis.title = element_text(size = 20))
+
+plotsave_param2 <- plotsave_param
+plotsave_param2$height <- 300
+plotsave_param2$width <- 300
+fn <- "extfig8e.png"
+do.call(ggsave, c(list(fn, p3), plotsave_param))
+
+# 
+p <- readRDS(file.path(paths$home_git, "figures", "extfig8f.rds"))
+extfig8f <- p + ylab("M1/M2-like act. normalized counts") +
+  facet_wrap(~channel, scales = "free_y", nrow = 2, axes = "all") +
+  scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration"), 
+                   labels = c("Control", "sAAb+", "mAAb+", "Onset", "LD")) + 
+  theme(panel.spacing = unit(1, "cm"))  # Adjust the value as needed
+
+extfig8f$data |> 
+  as_tibble() |> 
+  distinct(case_id, donor_type) |> 
+  dplyr::count(donor_type)
+
+fn <- "extfig8f.png"
+do.call(ggsave, c(list(fn, extfig8f), plotsave_param_large))
+```
+
+Extended Data Fig 9:
+
+```{r}
+extfig9a <- empty_plot
+
+# 
+extfig9b <- readRDS(file.path(paths$home_git, "figures", "extfig9b.rds"))
+extfig9b <- extfig9b + ylab("M1/M2-like act. normalized counts") + 
+  facet_wrap(~ channel, scales = "free_y", nrow = 2, axes = "all") + 
+    theme(panel.spacing = unit(1, "cm"))  # Adjust the value as needed
+
+fn <- "extfig9b.png"
+do.call(ggsave, c(list(fn, extfig9b), plotsave_param))
+
+# Islet panel: Macrophage expression.
+extfig9c <- readRDS(file.path(paths$home_git, "figures", "extfig9c.rds"))
+extfig9c <- extfig9c + facet_wrap(~ channel, scales = "free_y", nrow = 2, axes = "all") + 
+  ylab("Macrophage normalized counts") + 
+  theme(panel.spacing = unit(1, "cm"))  # Adjust the value as needed
+
+fn <- "extfig9c.png"
+do.call(ggsave, c(list(fn, extfig9c), plotsave_param))
+
+# Extfig9d:
+extfig9d <- readRDS(file.path(paths$home_git, "figures", "extfig9d.rds"))
+extfig9d <- extfig9d +
+  facet_wrap(~ cell_cluster_scaled, 
+    labeller = as_labeller(myeloid_labels), scales = "free_y") + 
+  ylab("log: Infiltration score") + 
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) + 
+  scale_fill_manual(values = 
+    c("insulitis" = "#E69F00", "non-insulitis" = "#009E73"),
+    breaks = c("insulitis", "non-insulitis"),
+    labels = c("Insulitic", "Non-Insulitic"), name = "Insulitis") + 
+  theme(legend.position = "none")
+fn <- "extfig9d.png"
+do.call(ggsave, c(list(fn, extfig9d), plotsave_param))
+
+# Extfig9e:
+extfig9e <- readRDS(file.path(paths$home_git, "figures", "extfig9e.rds"))
+extfig9e <- extfig9e + 
+  ylab("cDC normalized counts") + 
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) + 
+  scale_fill_manual(values = palettes$insulitic, name = "Insulitis")
+
+fn <- "extfig9e.png"
+plotsave_param2 <- plotsave_param
+plotsave_param2$width <- 350
+do.call(ggsave, c(list(fn, extfig9e), plotsave_param2))
+```
+## Fig 6
+
+```{r fig6}
+fig6a <- empty_plot
+## 09_Immune. 
+## CD11c+ & T-CD8_2 by age.
+fig6b <- readRDS(file.path(paths$home_git, "figures", "fig6b.rds"))
+fig6b <- fig6b + ylab("Cell density (cells / mm^2)") +  
+  scale_color_manual(name = "Stage", 
+                     values = palettes$stages[1:4], 
+                     breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"),
+                     labels = c("Control", "sAAb+", "mAAb+", "Onset")) + 
+   xlab("Age groups (years)")
+
+fn <- "fig6b.png"
+do.call(ggsave, c(list(fn, fig6b), plotsave_param))
+
+fig6c <- empty_plot
+
+## Fig 6D: Image. 
+fig6d <- empty_plot.
+
+## Fig 6E: complext-heatmap. Motifs. 19_Insulitis.
+ch_heatmap <- readRDS(file.path(paths$home_git, "figures", "ch_fig6e.rds"))
+# Cluster rows
+row_dist <- dist(ch_heatmap)
+row_hclust <- hclust(row_dist, method = "ward.D2")
+ordered_rows <- ch_heatmap[row_hclust$order, ]
+
+# Cluster cols:
+col_dist <- dist(t(ch_heatmap))
+col_hclust <- hclust(col_dist, method = "ward.D2")
+ordered_rows <- ordered_rows[, col_hclust$order]
+
+# 
+all_labels2 <- all_labels[colnames(ch_heatmap)]
+colnames(ch_heatmap) <- all_labels2
+
+all_labels2 <- all_labels[rownames(ch_heatmap)]
+rownames(ch_heatmap) <- all_labels2
+
+formatted_rowlabels <- parse(text = rownames(ch_heatmap))
+formatted_collabels <- parse(text = colnames(ch_heatmap))
+
+
+fn <- "fig6e.png"
+set.seed(222)
+png(file.path(paths$home_git, "figures", fn), width = 1000, height = 1150)
+p <- ComplexHeatmap::Heatmap(ch_heatmap, 
+  col = circlize::colorRamp2(c(-1, 0, 1), c("blue", "white", "red")), 
+  name = "Correlation", 
+  clustering_distance_rows = "euclidean", clustering_method_rows = "complete", 
+  clustering_distance_columns = "euclidean", clustering_method_columns = "complete",
+  show_row_names = TRUE, show_column_names = TRUE,
+  # increase row and column names font
+  row_labels = formatted_rowlabels,
+  column_labels = formatted_collabels,
+  row_names_gp = grid::gpar(fontsize = 25),
+  column_names_gp = grid::gpar(fontsize = 25),
+  # increase legend font size
+  heatmap_legend_param = list(
+    legend_direction = "horizontal",
+    title_gp = grid::gpar(fontsize = 20, fontfamily = "Arial"),
+    labels_gp = grid::gpar(fontsize = 20, fontfamily = "Arial")))
+
+ComplexHeatmap::draw(p, heatmap_legend_side = "top", 
+                      padding = unit(c(40, 5, 5, 40), "mm"))
+dev.off()
+
+## 09_Immune. Age-association with Insulitis.
+fig6f <- readRDS(file.path(paths$home_git, "figures", "fig6f.rds"))
+fig6f <- fig6f + ylab("Insulitis: average cell number") + 
+  facet_wrap(~ immune_cluster, labeller = 
+      as_labeller(all_labels, label_parsed), nrow = 4, scales = "free_y", axes = "all") + 
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5))+ 
+  xlab("Age groups (years)")
+
+fig6f$data |> 
+  as_tibble() |> 
+  distinct(case_id, donor_type) |> 
+  dplyr::count(donor_type)
+
+plotsave_param_large2 <- plotsave_param_large 
+plotsave_param_large2$width <- 400
+plotsave_param_large2$height <- 600
+fn <- "fig6f.png"
+do.call(ggsave, c(list(fn, fig6f), plotsave_param_large2))
+```
+
+## Extended Data Fig 10:
+```{r}
+# Age-association of Immune Subtypes.
+# 09_Immune.
+extfig10a <- readRDS(file.path(paths$home_git, "figures", "extfig10a.rds"))
+extfig10a <- extfig10a +
+    scale_x_discrete(labels = function(x) parse(text = all_labels[x])) + 
+    # scale_x_discrete(labels = all_labels) + 
+    scale_fill_manual("Age groups (years)", values = palettes$colors50[c(9, 12)],
+      labels = c("< 13", ">= 13")) +
+    labs(title = "", x = "Immune subtype", y = "-log10(p.adj)") + 
+    theme(legend.position = "top", legend.direction = "horizontal") +
+    theme(plot.margin = margin(5, 5, 5, 5)) + 
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+
+extfig10a
+fn <- "extfig10a.png"
+do.call(ggsave, c(list(fn, extfig10a), plotsave_param))
+
+## Correlation T-naive with T_Cd4_5. 19_Immune.
+## REMOVED. Update Extended Data Fig 10 numbering.
+extfig10b <- readRDS(file.path(paths$home_git, "figures", "extfig10b.rds")) + 
+  mytheme$standard_new()
+fn <- "extfig10b.png"
+do.call(ggsave, c(list(fn, extfig10b), plotsave_param))
+
+
+extfig10c <- readRDS(file.path(paths$home_git, "figures", "extfig10c.rds"))
+extfig10c <- extfig10c + 
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) + 
+  ylab("Cell density (cells / mm^2)") + 
+  xlab("Age groups (years)")
+
+extfig10c
+extfig10c$data |> 
+  as_tibble() |> 
+  distinct(case_id, donor_type) |> 
+  dplyr::count(donor_type)
+
+fn <- "extfig10c.png"
+do.call(ggsave, c(list(fn, extfig10c), plotsave_param))
+
+# ExtFig10D
+# Density of CNs.
+extfig10d <- readRDS(file.path(paths$home_git, "figures", "extfig10d.rds"))
+extfig10d <- extfig10d + ylab("Cell density (cells / mm^2)") + 
+  scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration"), 
+                   labels = c("Control", "sAAb+", "mAAb+", "Onset", "LD")) +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) + 
+  mytheme$large_new()  + 
+  theme(panel.spacing = unit(1, "cm")) + 
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.05)))
+
+extfig10d$data |>
+  as_tibble() |> 
+  distinct(case_id, donor_type) |> 
+  dplyr::count(donor_type)
+
+fn <- "extfig10d.png"
+do.call(ggsave, c(list(fn, extfig10d), plotsave_param_large))
+
+## Myeloid-5. Redo in 19_Immune.
+extfig10f <- readRDS(file.path(paths$home_git, "figures", "extfig10f.rds"))
+extfig10f <- extfig10f + 
+  labs(y = "log1p: Infiltration score", 
+       x = "") +  
+  mytheme$standard_new() + 
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) + 
+  facet_wrap(~ cell_cluster_scaled, 
+        labeller = as_labeller(c("CD11c+ Macrophages" = "CD11c+ macrophages")), 
+        scales = "free_y", nrow = 1, axes = "all")
+
+extfig10f
+fn <- "extfig10f.png"
+do.call(ggsave, c(list(fn, extfig10f), plotsave_param))
+```
+
+# Reviewer + Supplementary Figures.
+
+# supplementary Figure 1:
+
+```{r}
+supplfig1a <- readRDS(file.path(paths$home_git, "figures", "rev_supplfig1a.rds"))
+supplfig1a <- supplfig1a +   scale_fill_distiller(
+    palette = "Blues",
+    direction = 1,
+    limits = c(0, 1.5),
+    labels = c(0, 0.6, 1.2),
+    breaks = c(0, 0.6, 1.2),
+    na.value = "grey90",
+    guide = guide_colorbar(
+      title.position = "top",
+      barwidth = unit(6, "cm"),   # increase horizontal length
+      barheight = unit(0.6, "cm") # increase thickness
+    )) + theme(legend.position = "top")
+
+fn <- "rev_supplfig1a.png"
+plotsave_param_large$height <- 460
+do.call(ggsave, c(list(fn, supplfig1a), plotsave_param_large))
+
+
+
+
+supplfig1c <- readRDS(file.path(paths$home_git, "figures", "rev_supplfig1c.rds"))
+supplfig1c <- supplfig1c + labs(y = "log(p.adj) Age groups")
+
+fn <- "rev_supplfig1c.png"
+plotsave_param2 <- plotsave_param
+plotsave_param2$width <- plotsave_param$height
+plotsave_param2$height <- plotsave_param$width
+
+do.call(ggsave, c(list(fn, supplfig1c), plotsave_param2))
+
+```
+
+
+```{r}
+rev_supplfig6b <- readRDS(file.path(paths$home_git, "figures", "rev_supplfig6b.rds"))
+rev_supplfig6b <- rev_supplfig6b + 
+  xlim(-1.75, +2.5)
+
+fn <- "rev_supplfig6b.png"
+do.call(ggsave, c(list(fn, rev_supplfig6b), plotsave_param_large))  
+
+
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(RColorBrewer)
+
+cur_celltype <- "Myeloid"
+ll <- readRDS(file.path(paths$home_git, "figures", paste(cur_celltype, "chisq_supplfig8.rds")))
+
+p <- ll |> 
+      filter(infiltration == "Islet") |>
+      ggpubr::ggline(x = "stage", y = "n", color = "immune_cluster", linewidth = 3) +
+      geom_point() +
+      labs(x = "Stage", y = "Enrichment score (Islet)") +
+      scale_x_discrete(labels = c("Control", "sAAb+", "mAAb+", "Onset", "LD")) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      mytheme$standard_new() + 
+      theme(legend.position = "right") +
+      scale_color_manual(values = brewer.pal(n = 10, name = "Set3"), name = "Immune cluster", 
+              labels = myeloid_labels)
+
+fn <- "rev_supplfig8b.png"
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+cur_celltype <- "T_CD8"
+ll <- readRDS(file.path(paths$home_git, "figures", paste(cur_celltype, "chisq_supplfig8.rds")))
+p <- ll |> 
+      # recode
+      mutate(immune_cluster = recode(immune_cluster, !!!tcd8_labels3)) |>
+      filter(infiltration == "Islet") |>
+      ggpubr::ggline(x = "stage", y = "n", color = "immune_cluster", linewidth = 3) +
+      geom_point() +
+      labs(x = "Stage", y = "Enrichment score (Islet)") +
+      scale_x_discrete(labels = c("Control", "sAAb+", "mAAb+", "Onset", "LD")) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      mytheme$standard_new() + 
+      theme(legend.position = "right") +
+      scale_color_manual(values = brewer.pal(n = 10, name = "Set3"), name = "Immune cluster", 
+            labels = scales::parse_format())
+
+p
+fn <- "rev_supplfig8c.png"
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+
+cur_celltype <- "T_CD4"
+ll <- readRDS(file.path(paths$home_git, "figures", paste(cur_celltype, "chisq_supplfig8.rds")))
+p <- ll |> 
+      # recode
+      mutate(immune_cluster = recode(immune_cluster, !!!tcd4_labels3)) |>
+      filter(infiltration == "Islet") |>
+      ggpubr::ggline(x = "stage", y = "n", color = "immune_cluster", linewidth = 3) +
+      geom_point() +
+      labs(x = "Stage", y = "Enrichment score (Islet)") +
+      scale_x_discrete(labels = c("Control", "sAAb+", "mAAb+", "Onset", "LD")) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      mytheme$standard_new() + 
+      theme(legend.position = "right") +
+      scale_color_manual(values = brewer.pal(n = 10, name = "Set3"), name = "Immune cluster", 
+            labels = scales::parse_format())
+
+p
+fn <- "rev_supplfig8d.png"
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+
+## HPAP scRNA-seq re-analysis.
+```{r}
+fn <- "rev_supplfig3d.png"
+p <- readRDS(file.path(paths$home_git, "figures", "rev_supplfig3d.rds"))
+
+p$data$source <- recode(p$data$source, 
+  "ATF6" = "ATF6", 
+  "CIITA" = "CIITA", 
+  "CREB5" = "CREB-5", 
+  "DDIT3" = "CHOP",
+  "FOXJ1" = "FOXJ1", 
+  "HIVEP2" = "HIVEP2",
+  "IRF1" = "IRF1-1",
+  "MTF1" = "MTF-1",
+  "MYC" = "MYC",
+  "NFE2L2" = "NRF2",
+  "RELA" = "p65",
+  "SIRT1" = "SIR2",
+  "STAT1" = "STAT1",
+  "XBP1" = "XBP1"
+)
+p <- p + ggplot2::xlab("Transcription factors") + 
+     ggplot2::ylab("Activity score (ULM)") + 
+     mytheme$standard_new()
+
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```

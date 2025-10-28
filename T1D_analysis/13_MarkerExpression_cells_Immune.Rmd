@@ -1,0 +1,2312 @@
+---
+title: "13_MarkerExpression_cells_Immune"
+author: "Nathan Steenbuck, Nicolas Damond"
+date: "Created: 05 November, 2022; Compiled: `r format(Sys.time(), '%d %b, %Y')`"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+if (rstudioapi::isAvailable()) {
+  script_name <- basename(rstudioapi::getSourceEditorContext()$path)
+} else {
+  script_name <- knitr::current_input()
+}
+
+cur_user <- Sys.info()[["user"]]
+script_name <- "13_MarkerExpression_cells_Immune.Rmd"
+
+if (cur_user == "ubuntu") {
+    source(file.path("/", "mnt", "central_nas", "projects", 
+    "type1_diabetes", "nathan", "T1D_Vol", "T1D_analysis", 
+    "analysis", "helpers.R"))  
+  #n_cores <- future::availableCores() - 1
+  n_cores <- 4
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  knitr::opts_knit$set(root_dir = paths$home_data)
+  do_print <- FALSE
+} else {
+  source(file.path("/", "home", "nsteen", "scripts", "T1D_analysis", "analysis", "helpers.R"))
+  n_cores <- 8
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  paths$folder_script <- paths$cluster_folder_script
+  paths$folder_in <- paths$cluster_folder_in
+  paths$folder_out <- paths$cluster_home 
+  knitr::opts_knit$set(root_dir = paths$cluster_home)
+  do_print <- TRUE
+}
+
+seed <- 123456
+set.seed(seed)
+options <- furrr::furrr_options(seed = seed)
+paths$prev <- paste("08_CellTypesIslet", paths$object_type, paths$panel_type, sep = "_")
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Rscript -e "rmarkdown::render('T1D_analysis/analysis/13_MarkerExpression_cells_Immune.Rmd')"
+
+
+# **Goal**
+
+Examine protein abundance. The marker expression levels are plotted in function of cell types, donors, T1D stages and distance to islet edge.  
+
+Current data representations:
+* Heatmaps (annotated by cell type, donor and stage).
+* Cell type comparison (boxplots, violin plots, density plots).
+* Case and stage comparison (boxplots, violin plots, density plots).
+* Distance to islet edge (scatter plots).
+
+Additionally, immune cell composition and expression is compared between ICIs and IDIs,
+as well as between Insulitic & Non-Insulitic cases.
+
+# A0: **Settings**
+
+## A0.1: Load packages
+
+```{r packages, results='hide'}
+suppressPackageStartupMessages(c(
+  library(data.table),
+  library(dplyr),
+  library(SpatialExperiment),
+  library(scuttle),
+  library(parallel),
+  library(patchwork),
+  library(tidyr),
+  library(RSpectra)
+))
+```
+
+## A0.2: Paths and settings
+
+```{r settings}
+# Paths
+if (!dir.exists(paths$folder_script)) dir.create(paths$folder_script)
+plotsave_param$path <- paths$folder_script
+plotsave_param_large$path <- paths$folder_script
+
+# Misc settings
+today <- gsub("-", "", Sys.Date())
+```
+
+##  A0.3: Read in the data
+
+Load the SpatialExperiment (SPE) object saved at the previous step.
+
+```{r load-data}
+fn_spe <- file.path(paths$folder_out, paths$prev, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+spe <- readRDS(fn_spe)
+print(spe)
+```
+
+## A0.4: Read in Immune Subset only
+
+```{r load_sce_imm}
+sce_imm <- spe[, spe$cell_category == "immune"]
+# fn_sceimm <- file.path(paths$folder_script, paste0("sce_imm", "_", paths$object_type, "_", paths$panel_type, ".rds"))
+# saveRDS(sce_imm, fn_sceimm)
+# sce_imm <- readRDS(fn_sceimm)
+```
+
+
+## A0.5: Parameters
+
+**Note: this step has to be manually adapted**  
+
+- Define the assay(s) of interest.  
+- Define the markers to keep for marker expression analysis.  
+
+```{r parameters}
+# Censor value for counts scaling
+censor_val <- 0.9999
+
+# Select assays and reduced dimensions
+assay_sel <- c("exprs", "scaled")
+writeLines(c("Assay:", assay_sel[assay_sel %in% assayNames(spe)]))
+
+# Variables to plot
+plot_variables <- c("donor_type", "case_id")
+names(plot_variables) <- c("stages", "cases")
+cat("\nVariables to plot:", plot_variables)
+plot_variables_stages <- plot_variables["stages"]
+
+# List of cell types to plot
+# celltypes <- names(metadata(spe)$channels)
+# names(celltypes) <- celltypes
+## Add other cell types as well!
+celltypes <- c("T_CD4", "T_CD8", "B", "NK", "Neutrophil", 
+               "Myeloid", "Alpha", "Ductal", "Acinar", "Endothelial", "Beta")
+names(celltypes) <- rep("cell_type", length(celltypes))
+
+# Color palette
+palette_ct <- palettes$colors[seq_len(length(celltypes))]
+names(palette_ct) <- celltypes
+
+# All channels to display
+channels <- unique(unlist(metadata(spe)$channels))
+```
+
+## Subset the SCE
+
+```{r subset-spe}
+sce_sub <- as(spe, "SingleCellExperiment")
+sce_sub <- sce_sub[channels, sce_sub$cell_type %in% celltypes]
+```
+
+# **A1: Prepare the data**
+
+## A1.1: Functions
+
+### A1.1.1: Aggregate SPE objects.
+
+```{r function-aggregate-SPE}
+aggregate_val <- function(x, cluster_col, aggreg_col, .channels,
+                          stats = "mean", assay.type = "counts") {
+  x <- aggregateAcrossCells(
+    x, ids = DataFrame(
+      SampleId = x[[cluster_col]], x[[aggreg_col]]),
+    subset.row = .channels, statistics = stats,
+    use.assay.type = assay.type, use.dimred = FALSE
+  )
+  colnames(x) <- paste(x[[cluster_col]], x[[aggreg_col]], sep = "_")
+  return(x)
+}
+```
+
+### A1.1.2: Transform and scale counts
+
+```{r function-transform-counts}
+transf_counts <- function(x, censor_val = 0.99) {
+  assay(x, "exprs") <- asinh(assay(x, "counts"))
+  
+  quant <- apply(assay(x, "counts"), 1,
+                 quantile, probs = censor_val)
+  assay(x, "scaled") <- apply(assay(x, "counts"), 2, function(x) x / quant)
+  assay(x, "scaled")[assay(x, "scaled") > 1] <- 1
+  assay(x, "scaled")[assay(x, "scaled") < 0] <- 0
+  return(x)
+}
+```
+
+## A1.2: Summarize 
+
+### A1.2.1: By cell type and stage
+
+Average marker expression per cell type and stage.
+
+```{r summarize-celltype-stage}
+sce_ct_stage <- aggregate_val(
+  sce_sub, "cell_type", "donor_type", channels
+)
+sce_ct_stage <- transf_counts(sce_ct_stage, censor_val)
+```
+
+### A1.2.2: By cell type and case
+
+Average marker expression per cell type and case.
+
+```{r summarize-celltype-case}
+sce_ct_case <- aggregate_val(
+  sce_sub, "cell_type", "case_id", channels
+)
+sce_ct_case <- transf_counts(sce_ct_case, censor_val)
+```
+
+### A1.2.3: By cell type and Islet
+
+Average marker expression per cell type and Islet.
+For this we take the average of all cells across the **image_id**.
+One image may contain multiple islets, but this corrects for small islets, which skews averages.
+
+```{r summarize-celltype-case-islet}
+sce_ct_islet <- aggregate_val(
+  sce_sub, "cell_type", "image_id", channels)
+sce_ct_islet <- transf_counts(sce_ct_islet, censor_val)
+```
+
+### A1.2.4: Save the SCEs
+
+```{r save_rds, results='hide'}
+# save sce_ct_case
+fn_sce_ct_case <- file.path(paths$folder_script, paste0("sce_ct_case", "_", paths$object_type, "_", paths$panel_type, ".rds"))
+saveRDS(sce_ct_case, fn_sce_ct_case)
+# sce_ct_case <- readRDS(fn_sce_ct_case)
+
+# save sce_ct_stage
+fn_sce_ct_stage <- file.path(paths$folder_script, paste0("sce_ct_stage", "_", paths$object_type, "_", paths$panel_type, ".rds"))
+saveRDS(sce_ct_stage, fn_sce_ct_stage)
+# sce_ct_stage <- readRDS(fn_sce_ct_stage)
+
+# save sce_ct_islet:
+fn_sce_ct_islet <- file.path(paths$folder_script, paste0("sce_ct_islet", "_", paths$object_type, "_", paths$panel_type, ".rds"))
+saveRDS(sce_ct_islet, fn_sce_ct_islet)
+# sce_ct_islet <- readRDS(fn_sce_ct_islet)
+```
+
+# **A2: Visualize marker expression on heatmaps**
+
+```{r packages2, results='hide'}
+suppressPackageStartupMessages(c(
+  library(ggplot2),
+  library(viridis),
+  library(heatmaply),
+  library(dittoSeq),
+  library(ggridges),
+  library(mclust)
+))
+```
+
+## A2.1: dittoHeatmap
+
+### A2.1.1: Heatmaps by stage
+                     
+```{r dittoheatmap-stages}
+purrr::map(assay_sel, \(cur_assay) {
+  # Non-scaled
+  fn1 <- paste0(paste(today, "HeatmapDitto", "CellType", "Stage", cur_assay, 
+                      "NotScaled", sep = "_"), ".png")
+  
+  h1 <- list(object = sce_ct_stage, assay = cur_assay,
+             annot.by = c("donor_type", "cell_type"),
+             annotation_colors = list(donor_type = palettes$stages,
+                                      cell_type = palette_ct),
+             scale = "none", heatmap.colors = viridis(100),
+             cluster_cols = TRUE,
+             main = paste("Cell type - Not scaled -", cur_assay),
+             plot_method = "plotly")
+  do.call(dittoHeatmap, h1)
+  do.call(dittoHeatmap, c(h1, filename = file.path(paths$folder_script, fn1)))
+  
+  # Centered and scaled
+  fn2 <- paste0(paste(today, "HeatmapDitto", "CellType", "Stage", cur_assay, 
+                      "CenteredScaled", sep = "_"), ".png")
+
+  h2 <- list(object = sce_ct_stage, assay = cur_assay,
+             annot.by = c("donor_type", "cell_type"),
+             annotation_colors = list(donor_type = palettes$stages,
+                                      cell_type = palette_ct),
+             cluster_cols = TRUE,
+             heatmap.colors = colorRampPalette(c("dark blue", "white",
+                                                 "dark red"))(100),
+             breaks = seq(-3, 3, length.out = 101),
+             main = paste("Cell type - Centered and Scaled -", cur_assay))
+  do.call(dittoHeatmap, h2)
+  do.call(dittoHeatmap, c(h2, filename = file.path(paths$folder_script, fn2)))
+  remove(h1, h2)
+})
+```
+
+### A2.1.2: Heatmaps by case
+
+```{r dittoheatmap-cases}
+purrr::map(assay_sel, \(cur_assay) {
+  # Non-scaled
+  fn1 <- paste0(paste(today, "HeatmapDitto", cur_assay, "CellType", "Case",
+                      "NotScaled", sep = "_"), ".png")
+  
+  h1 <- list(object = sce_ct_case, assay = cur_assay,
+             annot.by = c("case_id", "donor_type", "cell_type"),
+             annotation_colors = list(case_id = palettes$cases,
+                                      donor_type = palettes$stages,
+                                      cell_type = palette_ct),
+             scale = "none", heatmap.colors = viridis(100),
+             cluster_cols = TRUE,
+             main = paste("Cell type - Not scaled -", cur_assay),
+             plot_method = "plotly")
+  do.call(dittoHeatmap, h1)
+  do.call(dittoHeatmap, c(h1, filename = file.path(paths$folder_script, fn1)))
+  
+  # Centered and scaled
+  fn2 <- paste0(paste(today, "HeatmapDitto", cur_assay, "CellType", "Case",
+                      "CenteredScaled", sep = "_"), ".png")
+
+  h2 <- list(object = sce_ct_case, assay = cur_assay,
+             annot.by = c("case_id", "donor_type", "cell_type"),
+             annotation_colors = list(case_id = palettes$cases,
+                                      donor_type = palettes$stages,
+                                      cell_type = palette_ct),
+             cluster_cols = TRUE,
+             heatmap.colors = colorRampPalette(c("dark blue", "white",
+                                                 "dark red"))(100),
+             breaks = seq(-3, 3, length.out = 101),
+             main = paste("Cell type - Centered and Scaled -", cur_assay))
+  do.call(dittoHeatmap, h2)
+  do.call(dittoHeatmap, c(h2, filename = file.path(paths$folder_script, fn2)))
+  remove(h1, h2)
+})
+```
+
+
+
+# **A3: Marker expression across cell types**
+
+Marker expression is only plot by stage (by case is unreadable if too many cases).
+
+## A3.1: Prepare the data
+
+Convert SCE to melted data frame.
+
+```{r convert-sce-datatable}
+dat <- vector(mode = "list", length = length(assay_sel))
+names(dat) <- assay_sel
+
+for (i in seq_along(assay_sel)) {
+  dat[[i]] <- makePerCellDF(
+    sce_ct_case,
+    exprs_values = assay_sel[i],
+    features = channels,
+    use.coldata = c("cell_type", plot_variables),
+    use_dimred = FALSE) %>%
+    mutate(case_id = factor(case_id, levels = metadata(spe)$cases),
+           donor_type = factor(donor_type, levels = metadata(spe)$stages),
+           cell_type = factor(cell_type, levels = celltypes)) %>%
+    arrange(cell_type, case_id, donor_type) %>%
+    as.data.table()
+  
+  dat[[i]] <- melt.data.table(
+    dat[[i]],
+    id.vars = c("cell_type", plot_variables),
+    measure.vars = channels,
+    variable.name = "channel",
+    value.name = assay_sel[i]
+  )
+  dat[[i]][, case_id := as.factor(case_id)]
+}
+```
+
+## A3.2: Boxplots
+
+```{r boxplots-celltype, fig.width=15, fig.height=10}
+purrr::iwalk(assay_sel, \(cur_assay, idx) {
+  purrr::iwalk(plot_variables_stages, \(cur_variable, k) {
+    cur_dat <- dat[[idx]]
+    cur_dat[, MeanExprs := mean(get(cur_assay)),
+            by = c(plot_variables[k], "cell_type", "channel")]
+    
+    p <- plot_boxes(cur_dat, x = "cell_type", y = cur_assay, 
+                    fill_by = "MeanExprs", color_by = plot_variables_stages[k],
+                    facet_by = "channel", ncol = 10,
+                    title = paste(plot_variables_stages[k], cur_assay, "Cell types")) +
+      scale_color_manual(values = palettes[[names(plot_variables_stages[k])]])
+    
+    fn <- paste0(paste(today, "Boxplot", "CellTypes", cur_assay,
+                       names(plot_variables[k]), sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param_large))
+    if (do_print) print(p)
+  })
+})
+```
+
+## A3.3: Violin plots
+
+```{r violin-celltype, message=FALSE, warning=FALSE, fig.width=15, fig.height=10}
+purrr::iwalk(assay_sel, \(cur_assay, idx) {
+  purrr::iwalk(plot_variables_stages, \(cur_variable, k) {
+    cur_dat <- dat[[idx]]
+    cur_dat[, MeanExprs := mean(get(cur_assay)),
+            by = c(plot_variables_stages[k], "cell_type", "channel")]
+    
+    p <- plot_violin(cur_dat, x = "cell_type", y = cur_assay, 
+                     fill_by = "MeanExprs", color_by = plot_variables_stages[k],
+                     facet_by = "channel", ncol = 10,
+                     title = paste(plot_variables_stages[k], cur_assay,
+                                   "Cell types")) +
+      scale_color_manual(values = palettes[[names(plot_variables_stages[k])]])
+    
+    fn <- paste0(paste(today, "Violin", "CellTypes", cur_assay,
+                       names(plot_variables_stages[k]), sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param_large))
+    suppressMessages(if (do_print) print(p))
+  })
+})
+```
+
+
+## A3.4: Violin Plots, without LongDuration
+```{r violin-celltype-woLD}
+purrr::iwalk(assay_sel, \(cur_assay, idx) {
+  purrr::iwalk(plot_variables_stages, \(cur_variable, k) {
+    
+    cur_dat <- dat[[idx]] |> filter(!(cell_type == "Beta" & donor_type == "LongDuration"))
+    cur_dat[, MeanExprs := mean(get(cur_assay)),
+            by = c(plot_variables_stages[k], "cell_type", "channel")]
+    
+    p <- plot_violin(cur_dat, x = "cell_type", y = cur_assay, 
+                     fill_by = "MeanExprs", color_by = plot_variables_stages[k],
+                     facet_by = "channel", ncol = 10,
+                     title = paste(plot_variables_stages[k], cur_assay,
+                                   "Cell types")) +
+      scale_color_manual(values = palettes[[names(plot_variables_stages[k])]])
+    
+    fn <- paste0(paste(today, "Violin", "CellTypes_noLD", cur_assay,
+                       names(plot_variables_stages[k]), sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param_large))
+    if (do_print) suppressMessages(print(p))
+  })
+})
+```
+
+## A3.5: Density plots
+
+```{r density-celltypes, message=FALSE, warning=FALSE, fig.width=15, fig.height=10}
+purrr::iwalk(assay_sel, \(cur_assay, i) {
+  purrr::iwalk(plot_variables_stages, \(cur_variable, k) {
+    cur_dat <- dat[[i]]
+    cur_dat <- subset(cur_dat, !is.infinite(cur_assay))
+    cur_dat[, MeanExprs := mean(get(cur_assay)),
+            by = c(plot_variables[k], "cell_type", "channel")]
+    
+    p <- plot_density(cur_dat, x = cur_assay, y = "cell_type", 
+                      fill_by = "MeanExprs", color_by = plot_variables[k],
+                      facet_by = "channel", ncol = 4,
+                      title = paste(plot_variables[k], cur_assay, "Cell types")) +
+      scale_color_manual(values = palettes[[names(plot_variables[k])]])
+    
+    fn <- paste0(paste(today, "Density", "CellTypes", cur_assay,
+                       names(plot_variables[k]), sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param_large))
+    if (do_print) suppressMessages(print(p))
+  })
+})
+```
+
+## A3.6: Remove unneeded objects
+
+```{r clean-env}
+remove(sce_sub, dat); gc()
+```
+
+
+
+# A4: **Marker expression by cell type**
+
+## A4.1: Read in the data
+
+Load the list containing one SPE object per cell type.
+
+```{r load-data2}
+# Load the SCE list
+prev <- "12_CellTypeSCEs_cells_Immune"
+fn_sces <- file.path(paths$folder_out, prev, paste0("celltypes", "_", paths$panel_type, ".rds"))
+sces <- readRDS(fn_sces)
+```
+
+Convert SPEs to SCEs
+
+```{r convert-to-SCEs}
+sces <- lapply(sces, as, "SingleCellExperiment")
+print(sces)
+```
+
+## A4.2: Aggregate the data
+
+Aggregate by cell type and case.
+
+```{r aggregate-sces-celltype-case}
+sces_ct_cases <- lapply(sces, aggregate_val, "cell_type", "case_id", NULL)
+sces_ct_cases <- lapply(sces_ct_cases, transf_counts, censor_val)
+```
+
+Convert SCEs to melted data frame.
+
+```{r prepare-data-celltype-case}
+prepare_data <- function(cur_sce, assay, variables) {
+  cur_channels <- metadata(cur_sce)$channels
+  
+  cur_sce <- makePerCellDF(
+    cur_sce,
+    features = cur_channels,
+    assay.type = assay,
+    use.coldata = variables,
+    use_dimred = FALSE) %>%
+    mutate(case_id = factor(case_id, levels = metadata(cur_sce)$cases),
+           donor_type = factor(donor_type, levels = metadata(cur_sce)$stages)) %>%
+    arrange(case_id, donor_type) %>%
+    as.data.table()
+  
+  cur_sce <- cur_sce %>%
+    melt.data.table(
+      id.vars = variables,
+      measure.vars = cur_channels,
+      variable.name = "channel",
+      value.name = assay
+    )
+  
+  # COMMENT OUT TO INCLUDE PANCREATITIS CASES
+  cur_sce <- cur_sce[cur_sce$donor_type != "Pancreatitis", ]
+  
+  return(cur_sce)
+}
+
+# Aggregate by cell type and case
+dat_ct_cases <- vector(mode = "list", length = length(assay_sel))
+names(dat_ct_cases) <- assay_sel
+
+for (i in seq_along(assay_sel)) {
+  dat_ct_cases[[assay_sel[i]]] <- lapply(
+    sces_ct_cases, prepare_data, assay_sel[i], plot_variables)
+}
+
+# # Single cell data
+# dat <- vector(mode = "list", length = length(assay_sel))
+# names(dat) <- assay_sel
+# 
+# purrr::map(assay_sel, \(cur_assay) {
+#   dat[[cur_assay] <- lapply(
+#     sces, prepare_data, cur_assay, plot_variables)
+# }
+```
+
+## A4.3: Boxplots
+
+```{r boxplots-celltype-case, fig.width=15, fig.height=10}
+purrr::map(assay_sel, \(cur_assay) {
+  purrr::map(names(dat_ct_cases[[1]]), \(cur_celltype) {
+    # cur_assay <- assay_sel[1]; cur_celltype <- celltypes[1]
+    purrr::iwalk(plot_variables_stages, \(cur_variable, k) {
+      
+      cur_dat <- dat_ct_cases[[cur_assay]][[cur_celltype]]
+      cur_dat[, MeanExprs := mean(get(cur_assay)),
+              by = c(plot_variables_stages[k], "channel")]
+      
+      p <- plot_boxes(cur_dat, x = plot_variables_stages[k], y = cur_assay, 
+                      fill_by = "MeanExprs",
+                      color_by = plot_variables_stages[k],
+                      facet_by = "channel", ncol = 10,
+                      title = paste(plot_variables_stages[k], cur_assay,
+                                    cur_celltype)) +
+        theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+        scale_color_manual(values = palettes[[names(plot_variables_stages[k])]])
+      
+      fn <- paste0(paste(today, "Boxplot", cur_celltype, cur_assay, 
+                         names(plot_variables_stages[k]), sep = "_"), ".png")
+      do.call(ggsave, c(list(fn, p), plotsave_param_large))
+      if (do_print) print(p)
+    })
+  })
+})
+```
+
+## A4.4: Violin plots
+
+```{r violin-casestage, message=FALSE, warning=FALSE, fig.width=15, fig.height=10}
+purrr::map(assay_sel, \(cur_assay) {
+  purrr::map(names(dat_ct_cases[[1]]), \(cur_celltype) {
+    purrr::iwalk(plot_variables_stages, \(cur_variable, k) {
+      cur_dat <- dat_ct_cases[[cur_assay]][[cur_celltype]]
+      cur_dat[, MeanExprs := mean(get(cur_assay)),
+              by = c(plot_variables_stages[k], "channel")]
+      ## Calculate Wilcox-Test between ND and other stages.
+      p_vals <- cur_dat  |> 
+        as_tibble()  |> 
+                # rename scaled to exprs if needed.
+        rename_with(~ stringr::str_replace(., "scaled", "exprs")) |>  
+        nest(data = -c(channel)) |> 
+        # dplyr::mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(data = ., MeanExprs ~ donor_type + (1 | case_id))))) |>
+        mutate(test = purrr::map(data, ~ broom::tidy(lm(data = ., exprs ~ donor_type)))) |>
+        tidyr::unnest(test) |> 
+        filter(term != "(Intercept)") |> 
+        mutate(donor_type = stringr::str_remove(term, "donor_type"))
+      
+      p_vals$significance <- cut(p_vals$p.value,
+                                breaks = c(-Inf, 0.001, 0.01, 0.05, Inf),
+                                labels = c("***", "**", "*", ""))
+                               
+      max_y_value <- max(cur_dat[[cur_assay]]) * 1.2
+      pos_pvals <- max_y_value * 0.85
+      p <- plot_violin(cur_dat, x = plot_variables_stages[k],
+                       y = cur_assay, fill_by = "MeanExprs",
+                       color_by = plot_variables_stages[k],
+                       facet_by = "channel", ncol = 6,
+                       title = paste(plot_variables_stages[k], cur_assay,
+                                     cur_celltype)) +
+        ggplot2::ylim(c(0, max_y_value)) + 
+        theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+        scale_color_manual(values = palettes[[names(plot_variables_stages[k])]])
+        # add the p.values. Plot p-value per channel AND per donor_type
+      # Adding significance stars
+      p <- p + geom_text(data = p_vals, aes(x = donor_type, y = pos_pvals, label = significance), 
+                        inherit.aes = FALSE, vjust = -0.5, color = "black") +
+              facet_wrap(~ channel, ncol = 6)
+      print(p)
+      
+      fn <- paste0(paste(today, "Violin", cur_celltype, cur_assay,
+                         names(plot_variables_stages[k]), sep = "_"), ".png")
+      do.call(ggsave, c(list(fn, p), plotsave_param))
+      suppressMessages(if (do_print) print(p))
+    })
+  })
+})
+```
+
+## A4.5: Density plots
+
+```{r density-casestage, message=FALSE, warning=FALSE, fig.width=15, fig.height=10}
+purrr::map(assay_sel, \(cur_assay) {
+  purrr::map(names(dat_ct_cases[[1]]), \(cur_celltype) {
+    purrr::iwalk(plot_variables_stages, \(cur_variable, k) {
+      
+      cur_dat <- dat_ct_cases[[cur_assay]][[cur_celltype]]
+      cur_dat <- subset(cur_dat, !is.infinite(cur_assay))
+      cur_dat[, MeanExprs := mean(get(cur_assay)),
+              by = c(plot_variables_stages[k], "channel")]
+      
+      p <- plot_density(cur_dat, x = cur_assay, y = plot_variables_stages[k], 
+                        fill_by = "MeanExprs",
+                        color_by = plot_variables_stages[k],
+                        facet_by = "channel", ncol = 4,
+                        title = paste(plot_variables_stages[k], cur_assay,
+                                      cur_celltype)) +
+        scale_color_manual(values = palettes[[names(plot_variables_stages[k])]])
+      
+      fn <- paste0(paste(today, "Density", cur_celltype, cur_assay,
+                         names(plot_variables_stages[k]), sep = "_"), ".png")
+      do.call(ggsave, c(list(fn, p), plotsave_param))
+      suppressMessages(if (do_print) print(p))
+    })
+  })
+})
+```
+
+
+# A5: Downstream analysis
+
+## A5.1: Prepare the data
+
+### A5.1.1: Define ICI/IDIs.
+
+Define ICI and IDIs, which immune cells are located.
+```{r ici-idi}
+image_ids <- sce_imm$image_id |> unique()
+
+## Define ICI and IDIs. DF: 1 row per image.
+composition_islet <- colData(spe) |> 
+  as_tibble() |> 
+  filter(image_id %in% image_ids) |> 
+  group_by(image_id, donor_type, case_id) |> 
+  summarize(fraction_Beta = sum(cell_type == "Beta") / sum(cell_category == "islet") * 100) |> 
+  ungroup() |> 
+  mutate(islet_type = if_else(fraction_Beta > 0, "ICI", "IDI")) |> 
+  select(-fraction_Beta)
+```
+
+### A5.1.2: Define Insulitic islets.
+
+Define Insulitis. 
+An image is defined as insulitic, if it contains >= 6 CD3+ cells in at least one islet. 
+
+```{r label-insulitic}
+insulitic_ids <- colData(sce_imm) |> 
+  as_tibble() |> 
+  filter(donor_type != "Pancreatitis") |>
+  select(image_id, cell_type, donor_type, islet_id, islet_closest, distance_to_islet) |>
+  filter(image_id %in% image_ids) |> 
+  filter(cell_type %in% c("T_DN", "T_CD8", "T_CD4")) |> 
+  filter(distance_to_islet >= -5) |>
+  dplyr::count(donor_type, image_id, islet_closest) |> 
+  arrange(desc(n)) |> 
+  filter(n >= 6) |> 
+  distinct(image_id) |> 
+  pull(image_id)
+
+message("Number of insulitic ROIs: ", length(insulitic_ids))
+saveRDS(insulitic_ids, file.path(paths$folder_script, "insulitic_images.rds"))
+```
+
+Add Composition Data **(cell Types)** to Data Frame. Each row one Image.
+
+```{r add-composition-cts}
+# Immune Cell Type Image Composition.
+image_compo_ct_wide <- metadata(spe)$celltype_compo |> as_tibble()
+
+## Join composition data with metadata. 
+cols_islet <- image_compo_ct_wide |> 
+  inner_join(composition_islet, by = "image_id") |>
+  tidyr::drop_na() |> 
+  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages),
+         case_id = factor(case_id, levels = metadata(spe)$cases),
+         islet_type = factor(islet_type, levels = c("ICI", "IDI"))) |> 
+  select(-starts_with("fraction"), -starts_with("CellNb")) |> 
+  rename_with(~ stringr::str_remove(., "density_")) |> 
+  filter(donor_type != "Pancreatitis") |> 
+  mutate(donor_type = factor(donor_type, levels = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration")))
+```
+
+Equal procedure for the **cluster** data. Join composition with metadata.
+Own Dataframe for Cluster Data. Each row one Image.
+
+```{r cluster_data-ici}
+image_compo_clust_wide <- metadata(spe)$cluster_compo$cell_cluster_scaled |> as_tibble()
+cols_islet_cluster <- image_compo_clust_wide |>
+  as_tibble() |> 
+  filter(image_id %in% image_ids) |> 
+  inner_join(composition_islet, by = "image_id") |>
+  tidyr::drop_na() |> 
+  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages),
+         case_id = factor(case_id, levels = metadata(spe)$cases),
+         islet_type = factor(islet_type, levels = c("ICI", "IDI"))) |> 
+  select(-starts_with("fraction"), -starts_with("CellNb"))
+
+rm(composition_islet); gc()
+```
+
+
+## A5.2: Expression Values & DistScore
+
+```{r get-full-exprs}
+# Define channels of interest.
+channels <- metadata(spe)$channels
+channels_imm <- unique(unlist(channels))
+
+## Prepare the data (average expression per Cell Type) per Image.
+exprs_vals_full <- 
+  as_tibble(scuttle::makePerCellDF(spe, features = channels_imm, 
+                                  assay.type = "exprs", use.dimred = FALSE)) |> 
+  select(all_of(channels_imm), case_id, donor_type, image_id, cell_type, cell_cluster_scaled) |>
+  # average expression per cell type, case, donor type, image.
+  group_by(image_id, case_id, donor_type, cell_type) |> 
+  summarize(across(all_of(channels_imm), \(x) mean(x, na.rm = TRUE)), .groups= "drop")
+
+## Add Distscore
+dist_score <- as_tibble(metadata(spe)$celltype_compo_score) |> 
+  select(image_id, donor_type, case_id, starts_with("NormScoreArea")) |> 
+  pivot_longer(
+    cols = starts_with("NormScoreArea"),
+    names_to = "cell_type",
+    values_to = "NormScoreArea"
+  ) |> 
+  mutate(cell_type = stringr::str_remove(cell_type, "NormScoreArea_")) |> 
+  ungroup()
+
+## Left-joint, to keep expression values for all images.
+exprs_vals_full <- exprs_vals_full |> 
+  left_join(dist_score, by = c("image_id", "donor_type", "case_id", "cell_type")) |> 
+  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages)) |> 
+  arrange(case_id, donor_type, image_id)
+gc()
+```
+
+# A6: MHC-II analysis
+Check expression of MHC-II in cell types and islets.
+
+## A6.1: Prepare the data
+
+Here-we still have one with grouped data per case.
+```{r dat-case}
+dat_case <- vector(mode = "list", length = length(assay_sel))
+names(dat_case) <- assay_sel
+
+for (i in seq_along(assay_sel)) {
+  dat_case[[i]] <- scuttle::makePerCellDF(
+    sce_ct_case,
+    exprs_values = assay_sel[i],
+    features = channels_imm,
+    use.coldata = c("cell_type", plot_variables, "image_id", "distance_to_islet"),
+    use_dimred = FALSE) |>
+    mutate(case_id = factor(case_id, levels = metadata(spe)$cases),
+           donor_type = factor(donor_type, levels = metadata(spe)$stages),
+           cell_type = factor(cell_type, levels = celltypes)) |>
+    arrange(cell_type, case_id, donor_type) |> 
+    as.data.table()
+  
+  dat_case[[i]] <- melt.data.table(
+    dat_case[[i]],
+    id.vars = c("cell_type", plot_variables, "image_id", "distance_to_islet"),
+    measure.vars = channels_imm,
+    variable.name = "channel",
+    value.name = assay_sel[i]
+  )
+  dat_case[[i]][, case_id := as.factor(case_id)]
+}
+```
+
+```{r islet-case-dat}
+dat <- vector(mode = "list", length = length(assay_sel))
+names(dat) <- assay_sel
+
+for (i in seq_along(assay_sel)) {
+  dat[[i]] <- scuttle::makePerCellDF(
+    sce_ct_islet,
+    # sce_ct_case,
+    exprs_values = assay_sel[i],
+    features = channels_imm,
+    use.coldata = c("cell_type", plot_variables, "image_id", "distance_to_islet"),
+    use_dimred = FALSE) |>
+    mutate(case_id = factor(case_id, levels = metadata(spe)$cases),
+           donor_type = factor(donor_type, levels = metadata(spe)$stages),
+           cell_type = factor(cell_type, levels = celltypes)) |>
+    arrange(cell_type, case_id, donor_type) |>
+    as.data.table()
+  
+  dat[[i]] <- melt.data.table(
+    dat[[i]],
+    id.vars = c("cell_type", plot_variables, "image_id", "distance_to_islet"),
+    measure.vars = channels_imm,
+    variable.name = "channel",
+    value.name = assay_sel[i]
+  )
+  dat[[i]][, case_id := as.factor(case_id)]
+}
+```
+
+## A6.2: MHC-II hyperexpression in Cell Types
+
+Akin, to the results in MHC-I we perform differential expression analysis for MHC-II.
+```{r mhc-ii}
+library(emmeans)
+cur_assay <- "exprs"
+exprs_dat <- dat[["exprs"]]
+
+exprs_islet <- exprs_dat |> 
+  filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration")) |>
+  filter(cell_type %in% c("Alpha", "Beta", "Acinar", "Ductal")) |> 
+  mutate(cell_type = factor(cell_type, levels = c("Beta", "Alpha", "Acinar", "Ductal")))
+
+icis <- colData(spe) |> 
+  as_tibble() |> 
+  filter(cell_type == "Beta") |> 
+  distinct(image_id) |>
+  pull(image_id)
+
+to_del <- colData(spe) |> 
+  as_tibble() |> 
+  filter(cell_type == "Beta") |> 
+  dplyr::count(case_id) |> 
+  filter(n < 100) |> pull(case_id)
+
+exprs_islet <- exprs_islet |> 
+  left_join(colData(spe) |> as_tibble() |> distinct(case_id, age_group.y, ICU_time_days.y), by = "case_id") |> 
+  as_tibble() |> 
+  filter(image_id %in% icis) |>
+  filter(!(case_id %in% to_del)) |>
+  mutate(ICU_time_days.y = ifelse(is.na(ICU_time_days.y), mean(ICU_time_days.y, na.rm = TRUE), ICU_time_days.y))
+
+library(ggpubr); library(rstatix)
+p <- plot_expression_violin(exprs_islet, 
+                            "HLA_DR", 
+                            cell_types = c("Alpha", "Beta", "Acinar", "Ductal"),
+                            facet_by = "cell_type",
+                            immune_adjustment = TRUE,
+                            y_label = "HLA_DR expression")
+print(p)
+
+fn <- paste0(paste(today, "Boxplot", "MHC-II", "CellTypes", "HLA_ABC", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+fig2b <- p
+saveRDS(fig2b, file.path(paths$home_git, "figures", "fig2b.rds"))
+```
+
+## A6.3 Islet-wide upregulation?
+
+Check Correlations between cell types.
+
+```{r mhc-ii-islet}
+## MHC-II -> Hypothesize for islet-wide upregulation.
+ab_hla <- exprs_vals_full  |> 
+  pivot_longer(all_of(c(channels_imm, "NormScoreArea")), names_to = "channel", values_to = "exprs") |>
+  dplyr::filter(channel == "HLA_DR") |> 
+  dplyr::filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset")) |>
+  mutate(donor_type = factor(donor_type, levels = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"))) |>
+  tidyr::pivot_wider(names_from = cell_type, values_from = exprs)
+
+# Compute correlation between alpha and beta expression in same islet.
+# 0.7 - 0.77
+ab_hla |> dplyr::group_by(donor_type) |>
+  dplyr::summarise(cors = cor(Beta, Alpha, use = "complete.obs", method = "spearman"))
+
+dd_test <- ab_hla |> filter(donor_type == "RecentOnset")
+lmerTest::lmer(Beta ~ Alpha + (1 | case_id), data = dd_test) |> broom.mixed::tidy() |> filter(term == "Alpha")
+cor.test(dd_test$Beta, dd_test$Alpha, method = "spearman")
+
+# Beta/Delta: 0.7/0.8
+ab_hla |> dplyr::group_by(donor_type) |>
+  dplyr::summarise(cors = cor(Beta, Delta, use = "complete.obs", method = "spearman"))
+
+# Beta-Ductal: 0.3 - 0.6
+ab_hla |> dplyr::group_by(donor_type) |> 
+  dplyr::summarise(cors = cor(Beta, Ductal, use = "complete.obs", method = "spearman"))
+
+# 0.4 - 0.6. Beta + Endothelial (surprisingly; but icnrease along stage).
+ab_hla  |> dplyr::group_by(donor_type) |> 
+  dplyr::summarise(cors = cor(Beta, Endothelial, use = "complete.obs", method = "spearman"))
+
+p <- ab_hla |> 
+  select(donor_type, case_id, image_id, channel, 
+         Alpha, Beta, Delta, Acinar, Ductal, Endothelial) |> 
+  pivot_longer(c("Alpha", "Delta", "Acinar", "Ductal"), names_to = "cell_type", values_to = "exprs") |> 
+  mutate(cell_type = factor(cell_type, levels = c("Alpha", "Delta", "Acinar", "Ductal"))) |>
+  ggplot(aes(x = Beta, y = exprs, color = donor_type)) +
+  geom_point(size = 0.5, alpha = 0.5) +
+  geom_smooth(method = "lm") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(x = expression(beta ~ "-cell HLA_DR expression"), 
+       y = "HLA-DR expression", color = "Stage") +
+  mytheme$large_new() +
+  theme(legend.position = "none") + 
+  facet_wrap(~ cell_type, ncol = 2, scales = "free_y") + 
+  stat_cor(method = "spearman", aes(color = donor_type, label = ..r.label..),
+           label.x = 0, size = 12, show.legend = FALSE) + 
+  scale_color_manual(values = palettes[["stages"]]) + 
+  theme(legend.position = "top",                 # Move legend above the plot
+        legend.justification = "center",         # Center the legend
+        legend.box = "horizontal") 
+
+print(p)
+# Define 2x2 grid
+fn <- paste0(paste(today, "Correlation_Islet_HLA_DR", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+extfig4b <- p
+saveRDS(extfig4b, file.path(paths$home_git, "figures", "extfig4b.rds"))
+
+p <- ab_hla |> 
+  select(donor_type, case_id, image_id, channel, 
+         Alpha, Beta, Delta, Acinar, Ductal, Endothelial) |> 
+  pivot_longer(c("Alpha", "Delta", "Acinar", "Ductal"), names_to = "cell_type", values_to = "exprs") |> 
+  mutate(cell_type = factor(cell_type, levels = c("Alpha", "Delta", "Acinar", "Ductal"))) |>
+  group_by(donor_type, case_id, cell_type) |> 
+  summarise(Beta = mean(Beta, na.rm = TRUE), exprs = mean(exprs, na.rm = TRUE)) |> 
+  ungroup() |>
+  ggplot(aes(x = Beta, y = exprs, color = donor_type)) +
+  geom_point(size = 3, alpha = 0.5) +
+  geom_smooth(method = "lm") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(x = expression(beta ~ "-cell HLA_DR expression"), 
+       y = "HLA-DR expression", color = "Stage") +
+  mytheme$large_new() +
+  theme(legend.position = "none") + 
+  facet_wrap(~ cell_type, ncol = 2, scales = "free_y") + 
+  stat_cor(method = "spearman", aes(color = donor_type, label = ..r.label..),
+           label.x = 0, size = 12, show.legend = FALSE) + 
+  scale_color_manual(values = palettes[["stages"]]) + 
+  theme(legend.position = "top",                 # Move legend above the plot
+        legend.justification = "center",         # Center the legend
+        legend.box = "horizontal") 
+
+print(p)
+# Define 2x2 grid
+fn <- paste0(paste(today, "Correlation_Islet_HLA_DR_DONOR", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+
+sd vs mean. Potentially HLA-DR less uniform than HLA-ABC?
+-> Check this.
+```{r}
+exprs_dat  |> 
+  filter(cell_type %in% c("Beta"), channel == "HLA_DR") |> 
+  group_by(cell_type, donor_type) |> 
+  summarise(cv = sd(exprs) / mean(exprs), mm = mean(exprs))
+```
+
+## A6.4: Statistics MHC-II upregulation
+
+### Correlation MHC-II Beta-cells vs Immune Cells Infiltration DistScore
+
+```{r mhc-ii-infiltrationscore}
+hla_distscore <- exprs_vals_full |> filter(cell_type %in% c("Beta", "Myeloid", "T_CD4", "T_CD8", "Neutrophil")) |> 
+  tidyr::pivot_wider(names_from = c(cell_type), values_from = where(is.numeric)) |> 
+  dplyr::select(image_id, case_id, donor_type, starts_with("NormScoreArea"), starts_with("HLA_DR")) 
+
+data_tt <- hla_distscore  |> 
+  pivot_longer(starts_with("NormScoreArea"), names_to = "cell_type", values_to = "NormScoreArea") |>
+  pivot_longer(starts_with("HLA_DR"), names_to = "channel", values_to = "HLA_DR_Beta") |> 
+  filter(channel == "HLA_DR_Beta") |> 
+  filter(!cell_type %in% c("NormScoreArea_Beta")) |> 
+  dplyr::filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset")) |> 
+  mutate(cell_type = stringr::str_remove(cell_type, "NormScoreArea_")) |>
+  mutate(donor_type = factor(donor_type, levels = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset")))
+
+p <- data_tt |> 
+  group_by(cell_type, donor_type, case_id) |>
+  summarise(HLA_DR_Beta = mean(HLA_DR_Beta, na.rm = TRUE),
+            NormScoreArea = mean(NormScoreArea, na.rm = TRUE)) |>
+  ungroup() |>
+  ggplot(aes(x = HLA_DR_Beta, y = log1p(NormScoreArea), color = donor_type)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = palettes[["stages"]], breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset")) + 
+  geom_smooth(method = "lm", alpha = 0.3) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(x = expression(beta ~ "-cell HLA-DR expression"), y = "log: Infiltration Score", color = "Stage") +
+  mytheme$large_new() + 
+  facet_wrap(~ cell_type, scales = "free_y", axes = "all") + 
+  theme(legend.position = "none") + 
+  stat_cor(method = "spearman", aes(color = donor_type, label = ..r.label..),
+           label.x = 0.2, label.y.npc = "top", size = 12)
+
+print(p)
+fn <- paste0(paste(today, "Correlation_HLA_DR_DistScore_DONOR", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+## By Islet.
+p <- data_tt |> 
+  ggplot(aes(x = HLA_DR_Beta, y = log1p(NormScoreArea), color = donor_type)) +
+  geom_point(size = 1) +
+  scale_color_manual(values = palettes[["stages"]], breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset")) + 
+  geom_smooth(method = "lm", alpha = 0.3) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(x = expression(beta ~ "-cell HLA-DR expression"), y = "log: Infiltration Score", color = "Stage") +
+  mytheme$large_new() + 
+  facet_wrap(~ cell_type, scales = "free_y", axes = "all") + 
+  theme(legend.position = "none") + 
+  stat_cor(method = "spearman", aes(color = donor_type, label = ..r.label..),
+           label.x = 2, r.accuracy = 0.01, label.y.npc = "bottom", size = 12)
+print(p)
+fn <- paste0(paste(today, "Correlation_HLA_DR_DistScore", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+extfig4d <- p
+saveRDS(extfig4d, file.path(paths$home_git, "figures", "extfig4d.rds"))
+
+## Statistics:
+## Strong significance. 
+summary(lmerTest::lmer(data = hla_distscore |> filter(donor_type == "RecentOnset"), HLA_DR_Beta ~ NormScoreArea_Neutrophil + (1 | case_id)))
+summary(lmerTest::lmer(data = hla_distscore |> filter(donor_type == "RecentOnset"), HLA_DR_Beta ~ NormScoreArea_Myeloid + (1 | case_id)))
+summary(lmerTest::lmer(data = hla_distscore |> filter(donor_type == "RecentOnset"), HLA_DR_Beta ~ NormScoreArea_T_CD8+ (1 | case_id)))
+summary(lmerTest::lmer(data = hla_distscore |> filter(donor_type == "RecentOnset"), HLA_DR_Beta ~ NormScoreArea_T_CD4 + (1 | case_id)))
+
+## Pictures: 
+hla_distscore |> slice_max(HLA_DR_Beta, n = 5) |> select(image_id)
+```
+
+## A6.5: Cells neighboring MHC-II+ and MHC-II- beta-cells.
+
+Step 1: Define MHC-II+ and MHC-II- Beta-cells (Otsu-threshold.) Only for mAAb+/RecentOnsets.
+Step 2: Aggregate the neighboring cells of MHC-II+ and MHC-II- Beta-cells.
+Step 3: Compare the neighboring cells of MHC-II+ and MHC-II- Beta-cells.
+
+### A6.5.1: Define MHC-II+ and MHC-II- Beta-cells
+Step 1: Define MHC-II+ and MHC-II- Beta-cells (Otsu-threshold.) Only for mAAb+/RecentOnsets.
+
+```{r}
+spe_sub <- spe[, spe$donor_type %in% c("mAAb+", "RecentOnset")]
+exprs_hla <- makePerCellDF(spe_sub, features = "HLA_DR", 
+                          use.dimred = FALSE, assay = "exprs",
+                          use.coldata = c("cell_type", "donor_type", "case_id", "image_id", "cell_id")) |>
+  as_tibble() |> 
+  filter(cell_type == "Beta")
+
+beta_cells <- exprs_hla |> 
+  select(image_id, case_id, donor_type, cell_type, HLA_DR) |> 
+  mutate(HLA_DR = as.numeric(HLA_DR)) |> 
+  arrange(image_id, case_id, donor_type)
+
+## Calculate Otsu threshold for HLA_DR in Beta-cells.
+beta_cells_otsu <- pliman::otsu(beta_cells$HLA_DR)
+message("Otsu Threshold for HLA_DR in Beta-cells: ", beta_cells_otsu)
+
+p <- exprs_hla |> 
+  ggplot(aes(x = HLA_DR, fill = donor_type)) +
+  geom_histogram(bins = 100) + 
+  geom_vline(xintercept = beta_cells_otsu, linetype = "dashed", color = "red") +
+  scale_fill_manual(values = palettes[["stages"]]) +
+  labs(x = "HLA_DR expression", y = "Number of cells", fill = "Stage") +
+  mytheme$standard()
+
+print(p)
+fn <- paste0(paste(today, "HLA_DR_Histogram", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+
+```{r hla-dr-beta-cells}
+## HLA-DR+ beta-cells.
+hla_pos_beta <- exprs_hla |> 
+  mutate(hla_pos = ifelse(HLA_DR >= beta_cells_otsu, "HLA_DR+", "HLA_DR-")) |> 
+  filter(hla_pos == "HLA_DR+") |>
+  pull(cell_id) |> unique()
+
+spe_sub$hla_pos <- ifelse(spe_sub$cell_id %in% hla_pos_beta, "HLA_DR+", "HLA_DR-")
+```
+
+### A6.5.2: Aggregate neighboring cells of MHC-II+ and MHC-II- Beta-cells
+Step 2: Aggregate the neighboring cells of MHC-II+ and MHC-II- Beta-cells.
+
+```{r aggregate-neighbors-hla}
+## Aggregate the neighboring cells of MHC-II+ and MHC-II- Beta-cells.
+tt <- imcRtools::aggregateNeighbors(
+  spe_sub,
+  colPairName = "neighborhood",
+  aggregate_by = "metadata",
+  count_by = "cell_type",
+  proportions = FALSE,
+  assay_type = NULL,
+  subset_row = NULL,
+  statistic = c("mean", "median", "sd", "var"),
+  name = NULL
+)
+
+## When aggregating across all images, see that enriched next to practically all immune cells.
+input_df <- colData(tt)[, c("hla_pos", "cell_type", "islet_id", "image_id", "case_id", "donor_type", "aggregatedNeighbors", "cell_category")] |> 
+  as_tibble() |> 
+  dplyr::rename_with(~ stringr::str_remove(., "aggregatedNeighbors.")) |>
+  filter(cell_type == "Beta")
+
+## Select only Islets with >= 3 HLA_DR+ beta-cells.
+hla_pos_islets <- input_df  |> 
+  filter(hla_pos == "HLA_DR+") |> 
+  dplyr::count(islet_id)  |> filter(n >= 3) |> pull(islet_id) |> unique() 
+```
+
+### A6.5.3: Plot: Compare the neighboring cells of MHC-II+ and MHC-II- Beta-cells
+Step 3: Compare the neighboring cells of MHC-II+ and MHC-II- Beta-cells.
+```{r plot-neighbors-hla}
+## Plot these results.
+plot_df <- input_df  |> 
+  filter(islet_id %in% hla_pos_islets) |> 
+  group_by(hla_pos, image_id, case_id) |> 
+  summarise(across(where(is.numeric), ~ mean(.x, na.rm = TRUE)))  |> 
+  pivot_longer(
+    cols = where(is.numeric),
+    names_to = "cell_type",
+    values_to = "density"
+  ) |> 
+  filter(cell_type %in% c("Alpha", "Beta", "Delta", "IsletOther", 
+                          "Acinar", "Ductal", "Endothelial", "T_CD8", 
+                          "T_CD4", "T_DN", "Myeloid", "NK", "B", "Neutrophil")) |> 
+  ungroup() |> 
+  mutate(cell_category = case_when(cell_type %in% c("Beta", "Alpha", "Delta", "IsletOther") ~ "islet",
+            cell_type %in% c("Endothelial", "Acinar", "Ductal") ~ "exo_stroma",
+            cell_type %in% c("T_CD8", "T_CD4", "T_DN", "Myeloid", "B", "Neutrophil", "NK") ~ "immune",
+            TRUE ~ cell_type))
+```
+
+### A6.5.4: Volcano Plot: HLA-DR+ vs HLA-DR- Beta-cells
+
+```{r volcano-hla-dr-beta}
+p_vals <- plot_df |> 
+  tidyr::nest(data = -cell_type) |> 
+  dplyr::mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(data = ., 
+          density ~ hla_pos + (1 | case_id))))) |> 
+  unnest(test) |> 
+  filter(term == "hla_posHLA_DR+") |> 
+  mutate(p.adj = p.adjust(p.value, method = "fdr")) |> 
+  mutate(p.signif = cut(p.adj, 
+          breaks = c(-Inf, 0.001, 0.01, 0.05, 0.1, Inf), 
+          labels = c("***", "**", "*",   ".", "ns")))
+
+library('EnhancedVolcano')
+
+input <- plot_df |> 
+  group_by(cell_type, hla_pos) |> 
+  summarise(density = mean(density, na.rm = TRUE)) |> 
+  pivot_wider(names_from = hla_pos, values_from = density) |> 
+  mutate(log2FC = log2(`HLA_DR+` / `HLA_DR-`)) |> 
+  arrange(desc(log2FC)) |> 
+  mutate(direction = ifelse(log2FC > 0, "Enriched", "Depleted")) |>
+  inner_join(p_vals, by = "cell_type") |> 
+  mutate(p.adj = ifelse(p.adj < 1e-26, 1e-26, p.adj))
+
+## volcano plot
+p <-  EnhancedVolcano(input,
+    lab = input$cell_type,
+    title = NULL,
+    subtitle = NULL,
+    caption = NULL,
+    x = 'log2FC',
+    y = 'p.adj', 
+    xlab = "log2 Fold Change",
+    ylab = "-log10(padj)",
+    axisLabSize = 8,
+    xlim = c(-0.5, 2), 
+    ylim = c(0, 28),
+    selectLab = input$cell_type,  # force all labels
+    FCcutoff = 0.2,
+    pCutoff = 0.05,
+    pointSize = 20,
+    boxedLabels = TRUE,
+    labSize = 10.0,
+    drawConnectors = TRUE, 
+    legendPosition = "top") + 
+    mytheme$large_new() + 
+    ylab("-log10(p.adj)") + 
+    theme(axis.text.x = element_text(size=30)) + 
+    theme(axis.text.y = element_text(size=30))
+
+print(p)
+fn <- paste0(paste(today, "HLA_DR_CellType_Volcano", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+revfigvolcano <- p
+saveRDS(p, file.path(paths$home_git, "figures", "rev_supplfig6b.rds"))
+```
+
+```{r}
+library(rstatix); library(ggpubr)
+max_vals <- plot_df |> 
+  filter(cell_category %in% c("exo_stroma", "immune", "islet")) |>
+  group_by(cell_type, cell_category, case_id, hla_pos) |> 
+  summarise(density = mean(density, na.rm = TRUE))  |> 
+  group_by(cell_type) |>
+  summarise(max_val = max(density, na.rm = TRUE))
+
+stat_test <- plot_df |> 
+  mutate(cell_type = factor(cell_type, levels = c("Alpha", "Beta", "Delta", "IsletOther", 
+                                                  "Acinar", "Ductal", "Endothelial", 
+                                                  "T_CD8", "T_CD4", "T_DN", "Myeloid", 
+                                                  "NK", "B", "Neutrophil"))) |>
+  group_by(cell_type) |> 
+  rstatix::t_test(density ~ hla_pos) |> 
+  add_xy_position(x = "cell_type") |> 
+  inner_join(p_vals, by = "cell_type") |> 
+  select(cell_type, .y., group1, group2, y.position, groups, x, xmin, xmax, p.signif) |> 
+  inner_join(max_vals, by = "cell_type") |> 
+  mutate(y.position = log1p(max_val) * 1.1)
+
+p3 <- plot_df |> 
+  filter(cell_category %in% c("exo_stroma", "immune", "islet")) |>
+  group_by(cell_type, cell_category, case_id, hla_pos) |> 
+  summarise(density = mean(density, na.rm = TRUE)) |>
+  mutate(cell_type = factor(cell_type, levels = c("Alpha", "Beta", "Delta", "IsletOther", 
+                                                  "Acinar", "Ductal", "Endothelial", 
+                                                  "T_CD8", "T_CD4", "T_DN", "Myeloid", 
+                                                  "NK", "B", "Neutrophil"))) |>
+  ggplot(aes(x = cell_type, y = log1p(density), fill = hla_pos)) + 
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_dodge(width = 0.75)) +
+  scale_fill_manual(values = c("HLA_DR+" = "orange", "HLA_DR-" = "red")) +
+  labs(x = "Cell type", y = expression("log1p: # of average " * beta * " -cell neighbors"), fill = "HLA-DR status") +
+  mytheme$large_new() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  theme(legend.position = "top")  + 
+  stat_pvalue_manual(stat_test, label = "p.signif", tip.length = 0.01, size = 8)
+
+print(p3)
+
+fn <- paste0(paste(today, "HLA_DR_CellType_Density", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p3), plotsave_param_large))
+
+revfigboxplot <- p3
+saveRDS(revfigboxplot, file.path(paths$home_git, "figures", "rev_supplfig6a.rds"))
+```
+
+
+### A6.6: Volcano Plot: HLA-DR+ vs HLA-DR- Exocrine Cells.
+
+### A6.6.1: Define MHC-II+ and MHC-II- Beta-cells
+Step 1: Define MHC-II+ and MHC-II- Beta-cells (Otsu-threshold.) Only for mAAb+/RecentOnsets.
+
+```{r}
+spe_sub <- spe[, spe$donor_type %in% c("mAAb+", "RecentOnset")]
+exprs_hla <- makePerCellDF(spe_sub, features = "HLA_DR", 
+                          use.dimred = FALSE, assay = "exprs",
+                          use.coldata = c("cell_type", "donor_type", "case_id", "image_id", "cell_id")) |>
+  as_tibble() |> 
+  filter(cell_type %in% c("Acinar", "Ductal"))
+
+exo_cells <- exprs_hla |> 
+  select(image_id, case_id, donor_type, cell_type, HLA_DR) |> 
+  mutate(HLA_DR = as.numeric(HLA_DR)) |> 
+  arrange(image_id, case_id, donor_type)
+
+## Calculate Otsu threshold for HLA_DR in Exocrine cells.
+exo_cells_otsu <- pliman::otsu(exo_cells$HLA_DR)
+message("Otsu Threshold for HLA_DR in Exocrine cells: ", exo_cells_otsu)
+
+# Choose a more stringent threshold for exocrine cells.
+# This is the beta-cells threshold; it is larger than the computed exocrine threshold.
+p <- exprs_hla |> 
+  ggplot(aes(x = HLA_DR, fill = donor_type)) +
+  geom_histogram(bins = 100) + 
+  geom_vline(xintercept = beta_cells_otsu, linetype = "dashed", color = "red") +
+  scale_fill_manual(values = palettes[["stages"]]) +
+  labs(x = "HLA_DR expression", y = "Number of cells", fill = "Stage") +
+  mytheme$standard()
+
+print(p)
+fn <- paste0(paste(today, "HLA_DR_Histogram_Exo", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+
+```{r hla-dr-beta-cells}
+## HLA-DR+ exocrine cells.
+hla_pos_exo <- exprs_hla |> 
+  mutate(hla_pos = ifelse(HLA_DR >= beta_cells_otsu, "HLA_DR+", "HLA_DR-")) |> 
+  filter(hla_pos == "HLA_DR+") |>
+  pull(cell_id) |> unique()
+
+spe_sub$hla_pos <- ifelse(spe_sub$cell_id %in% hla_pos_exo, "HLA_DR+", "HLA_DR-")
+```
+
+### A6.5.2: Aggregate neighboring cells of MHC-II+ and MHC-II- Exocrine cells
+Step 2: Aggregate the neighboring cells of MHC-II+ and MHC-II- Exocrine cells.
+
+```{r aggregate-neighbors-hla}
+## Aggregate the neighboring cells of MHC-II+ and MHC-II- Exocrine cells.
+tt <- imcRtools::aggregateNeighbors(
+  spe_sub,
+  colPairName = "neighborhood",
+  aggregate_by = "metadata",
+  count_by = "cell_type",
+  proportions = FALSE,
+  assay_type = NULL,
+  subset_row = NULL,
+  statistic = c("mean", "median", "sd", "var"),
+  name = NULL
+)
+
+## When aggregating across all images, see that enriched next to practically all immune cells.
+input_df <- colData(tt)[, c("hla_pos", "cell_type", "islet_id", "image_id", "case_id", "donor_type", "aggregatedNeighbors", "cell_category")] |> 
+  as_tibble() |> 
+  dplyr::rename_with(~ stringr::str_remove(., "aggregatedNeighbors.")) |>
+  filter(cell_type %in% c("Acinar", "Ductal"))
+
+## Select only Islets with >= 3 HLA_DR+ exo-cells.
+hla_pos_rois <- input_df  |> 
+  filter(hla_pos == "HLA_DR+") |> 
+  dplyr::count(image_id)  |> filter(n >= 3) |> pull(image_id) |> unique() 
+```
+
+
+### A6.5.3: Plot: Compare the neighboring cells of MHC-II+ and MHC-II- Beta-cells
+Step 3: Compare the neighboring cells of MHC-II+ and MHC-II- Beta-cells.
+```{r plot-neighbors-hla}
+## Plot these results.
+plot_df <- input_df  |> 
+  filter(image_id %in% hla_pos_rois) |> 
+  group_by(hla_pos, image_id, case_id) |> 
+  summarise(across(where(is.numeric), ~ mean(.x, na.rm = TRUE)))  |> 
+  pivot_longer(
+    cols = where(is.numeric),
+    names_to = "cell_type",
+    values_to = "density"
+  ) |> 
+  filter(cell_type %in% c("Alpha", "Beta", "Delta", "IsletOther", 
+                          "Acinar", "Ductal", "Endothelial", "T_CD8", 
+                          "T_CD4", "T_DN", "Myeloid", "NK", "B", "Neutrophil")) |> 
+  ungroup() |> 
+  mutate(cell_category = case_when(cell_type %in% c("Beta", "Alpha", "Delta", "IsletOther") ~ "islet",
+            cell_type %in% c("Endothelial", "Acinar", "Ductal") ~ "exo_stroma",
+            cell_type %in% c("T_CD8", "T_CD4", "T_DN", "Myeloid", "B", "Neutrophil", "NK") ~ "immune",
+            TRUE ~ cell_type))
+
+case_ids <- plot_df |> distinct(hla_pos, image_id, case_id) |> dplyr::count(hla_pos, case_id) |> 
+  pivot_wider(names_from = hla_pos, values_from = n, values_fill = 0) |> 
+  filter(`HLA_DR+` >= 3 & `HLA_DR-` >= 3) |> 
+  pull(case_id)
+```            
+
+```{r volcano-hla-dr-ductal}
+p_vals <- plot_df |> 
+  filter(case_id %in% case_ids) |>
+  tidyr::nest(data = -cell_type) |> 
+  dplyr::mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(data = ., 
+          density ~ hla_pos + (1 | case_id))))) |> 
+  unnest(test) |> 
+  filter(term == "hla_posHLA_DR+") |> 
+  mutate(p.adj = p.adjust(p.value, method = "fdr")) |> 
+  mutate(p.signif = cut(p.adj, 
+          breaks = c(-Inf, 0.001, 0.01, 0.05, 0.1, Inf), 
+          labels = c("***", "**", "*",   ".", "ns")))
+p_vals
+library('EnhancedVolcano')
+
+input <- plot_df |> 
+  group_by(cell_type, hla_pos) |> 
+  summarise(density = mean(density, na.rm = TRUE)) |> 
+  pivot_wider(names_from = hla_pos, values_from = density) |> 
+  mutate(log2FC = log2(`HLA_DR+` / `HLA_DR-`)) |> 
+  arrange(desc(log2FC)) |> 
+  mutate(direction = ifelse(log2FC > 0, "Enriched", "Depleted")) |>
+  inner_join(p_vals, by = "cell_type") |>
+  mutate(p.adj = ifelse(p.adj < 1e-50, 1e-50, p.adj))
+
+input
+
+## volcano plot
+p <-  EnhancedVolcano(input,
+    lab = input$cell_type,
+    title = "HLA-DR+ vs HLA-DR- Exocrine-cells",
+    subtitle = NULL,
+    caption = NULL,
+    x = 'log2FC',
+    y = 'p.adj', 
+    xlim = c(-0.5, 2), 
+    ylim = c(0, 52),
+    pCutoff = 0.05,
+    selectLab = input$cell_type,  # force all labels
+    FCcutoff = 0.2,
+    pointSize = 20,
+    boxedLabels = TRUE,
+    labSize = 10.0,
+    drawConnectors = TRUE) + 
+    mytheme$large_new() + 
+    ylab("-log10(p.adj)") + 
+    theme(axis.text.x = element_text(size=30)) + 
+    theme(axis.text.y = element_text(size=30))
+
+print(p)
+fn <- paste0(paste(today, "HLA_DR_CellType_Volcano_Exocrine", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+revfigvolcano_exo <- p
+saveRDS(revfigvolcano_exo, file.path(paths$home_git, "figures", "revfigvolcano_exo.rds"))
+```
+
+
+```{r}
+library(rstatix); library(ggpubr)
+max_vals <- plot_df |> 
+  filter(case_id %in% case_ids) |>
+  filter(cell_category %in% c("exo_stroma", "immune", "islet")) |>
+  group_by(cell_type, cell_category, case_id, hla_pos) |> 
+  summarise(density = mean(density, na.rm = TRUE), .groups = "drop")  |> 
+  group_by(cell_type) |>
+  summarise(max_val = max(density, na.rm = TRUE))
+
+stat_test <- plot_df |> 
+  filter(case_id %in% case_ids) |>
+  mutate(cell_type = factor(cell_type, levels = c("Alpha", "Beta", "Delta", "IsletOther", 
+                                                  "Acinar", "Ductal", "Endothelial", 
+                                                  "T_CD8", "T_CD4", "T_DN", "Myeloid", 
+                                                  "NK", "B", "Neutrophil"))) |>
+  group_by(cell_type) |> 
+  rstatix::t_test(density ~ hla_pos) |> 
+  add_xy_position(x = "cell_type") |> 
+  inner_join(p_vals, by = "cell_type") |> 
+  select(cell_type, .y., group1, group2, y.position, groups, x, xmin, xmax, p.signif) |> 
+  inner_join(max_vals, by = "cell_type") |> 
+  mutate(y.position = log1p(max_val) * 1.1)
+
+p3 <- plot_df |> 
+  filter(case_id %in% case_ids) |>
+  filter(cell_category %in% c("exo_stroma", "immune", "islet")) |>
+  group_by(cell_type, cell_category, case_id, hla_pos) |> 
+  summarise(density = mean(density, na.rm = TRUE)) |>
+  mutate(cell_type = factor(cell_type, levels = c("Alpha", "Beta", "Delta", "IsletOther", 
+                                                  "Acinar", "Ductal", "Endothelial", 
+                                                  "T_CD8", "T_CD4", "T_DN", "Myeloid", 
+                                                  "NK", "B", "Neutrophil"))) |>
+  ggplot(aes(x = cell_type, y = log1p(density), fill = hla_pos)) + 
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_dodge(width = 0.75)) +
+  scale_fill_manual(values = c("HLA_DR+" = "orange", "HLA_DR-" = "red")) +
+  labs(x = "Cell type", y = "log1p: # of average exocrine cell neighbors", fill = "HLA-DR status") +
+  mytheme$large_new() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  theme(legend.position = "top")  + 
+  stat_pvalue_manual(stat_test, label = "p.signif", tip.length = 0.01, size = 8)
+
+print(p3)
+
+fn <- paste0(paste(today, "HLA_DR_CellType_Density_Exocrine", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p3), plotsave_param_large))
+
+saveRDS(p3, file.path(paths$home_git, "figures", "rev_supplfig6c.rds"))
+```
+
+# **A7: ICI vs IDI:**
+
+## **A7.1: Number of ICIs per Stage**
+```{r number-of-icis}
+p <- cols_islet  |> 
+  dplyr::count(islet_type, donor_type) |> 
+  dplyr::group_by(donor_type) |>
+  dplyr::mutate(total = sum(n),
+                frac = n / total) |> 
+  # Barplot:
+  ggplot(aes(x = islet_type, y = frac, fill = donor_type)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = palettes[["stages"]]) +
+  labs(x = "Islet type", y = "Fraction of islets", fill = "Stage") +
+  mytheme$standard()
+
+fn <- paste0(paste(today, "IsletType", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+print(p)
+```
+
+Number of Insulitic Images per Stage. 
+Separated by ICI vs IDI. 
+```{r plot-insulitic-images}
+## Plot Barplot for Insulitic vs Non-Insulitic.
+p <- cols_islet |> 
+  mutate(insulitic = ifelse(image_id %in% insulitic_ids, "Insulitic", "Non-Insulitic")) |>
+  dplyr::count(donor_type, islet_type, insulitic) |>
+  filter(insulitic == "Insulitic") |>
+  ggplot(aes(x = donor_type, y = n, fill = donor_type)) +
+  geom_bar(stat = "identity", position = "dodge", 
+           aes(alpha = islet_type), show.legend = c(color = TRUE, fill = FALSE)) + 
+  scale_alpha_manual(values = c("ICI" = 1, "IDI" = 0.5), name = "Islet type")  +
+  scale_fill_manual(values = palettes$stages, name = "Stage") +
+  labs(x = "Stage", y = "Number of insulitic images", fill = "Insulitic") +
+  mytheme$standard_new() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 22))
+
+print(p)
+fn <- paste0(paste(today, "Insulitic", "IsletType", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+## A7.2: Compare the Immune cell compositions for ICI vs IDI
+
+Compare Cell Type Composition between ICI vs IDIs.
+No major differences.
+```{r ici-idi-composition-ct}
+## Compare the Immune cell compositions for ICI vs IDI
+ici_idi <- cols_islet |> 
+  select(where(is.numeric), islet_type, case_id, donor_type, image_id) |>
+  tidyr::pivot_longer(cols = where(is.numeric), names_to = "cell_type", values_to = "density")
+
+## Grouped barplots
+p <- ici_idi |> 
+  filter(donor_type %in% c("RecentOnset")) |> 
+  group_by(case_id, donor_type, cell_type, islet_type) |>
+  summarize(density = mean(density))  |> 
+  ggplot(aes(x = cell_type, y = log1p(density), fill = islet_type)) +
+  geom_boxplot(outlier.shape = NA) +
+  scale_fill_manual(values = c("ICI" = "orange", "IDI" = "red")) +
+  labs(x = "Cell type", y = "Density - RecenOnset", fill = "Islet type") +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p)
+fn <- paste0(paste(today, "ImmuneCellComposition_ici_idi", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+## Paired plot for Myeloid:
+## Average per Donor.
+p <- ici_idi |> 
+  filter(donor_type %in% c("mAAb+", "RecentOnset")) |> 
+  filter(cell_type == "Myeloid") |> 
+  # Group by Donor + CT.
+  group_by(case_id, donor_type, cell_type, islet_type) |>
+  summarize(density = mean(density))  |> 
+  ggplot(aes(x = islet_type, y = density, fill = islet_type)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_line(aes(group = case_id, color = as.factor(case_id)), 
+                position = position_dodge(width = 0.9)) +
+  geom_point(aes(group = case_id, color = as.factor(case_id)), 
+             position = position_dodge(width = 0.9)) +
+  scale_fill_manual(values = c("ICI" = "blue", "IDI" = "red")) +
+  labs(x = "Islet type", y = "Fraction of cells", fill = "Islet type") +
+  mytheme$standard() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  facet_wrap(~donor_type, scales = "free_y")
+
+print(p)
+fn <- paste0(paste(today, "ImmuneCellComposition_ici_idi_myeloid", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+## MM-model between ICI and IDI.
+p <- ici_idi  |> 
+  filter(donor_type %in% c("mAAb+", "RecentOnset")) |> 
+  filter(cell_type != "Other") |> 
+  tidyr::nest(data = -c(cell_type, donor_type)) |> 
+  dplyr::mutate(test = purrr::map(data, ~ broom.mixed::tidy(lme4::lmer(data = ., density ~ islet_type + (1 | case_id))))) |> 
+  tidyr::unnest(test) |> 
+  filter(term %in% c("islet_typeIDI")) |>
+  dplyr::select(donor_type, statistic, cell_type, term) |> 
+  ggplot(aes(x = cell_type, y = statistic, fill = donor_type)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = palettes[["stages"]]) +
+  labs(x = "Cell type", y = "Statistic", fill = "Stage") +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  # horizontal-line at 2 and -2
+  geom_hline(yintercept = 2, linetype = "dashed", color = "black") + 
+  geom_hline(yintercept = -2, linetype = "dashed", color = "black")
+print(p)
+
+fn <- paste0(paste(today, "ImmuneCellComposition_ici_idi_mixed_effects", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+## A7.3: Immune Cell Cluster - ICI vs IDI
+```{r ici-idi-composition-clust}
+ici_idi_clust <- cols_islet_cluster |> 
+  select(starts_with("density"), islet_type, case_id, image_id, donor_type) |>
+  tidyr::pivot_longer(cols = starts_with("density_"), 
+                      names_to = "cell_type", values_to = "density") |> 
+  # remove the "fraction_total_" prefix & numeric suffix
+  mutate(cell_clust = stringr::str_remove(cell_type, "density_")) |> 
+  mutate(cell_type = stringr::str_remove(cell_clust, "_[0-9]$")) |> 
+  mutate(cell_type = ifelse(cell_clust == "T.naive", "T_CD8", cell_clust),
+         cell_type = ifelse(cell_clust == "T.EMRA", "T_CD8", cell_clust),
+         cell_type = ifelse(cell_clust == "Treg", "T_CD4", cell_clust))
+
+## Grouped barplots
+p <- ici_idi_clust |> 
+  filter(donor_type %in% c("mAAb+", "RecentOnset")) |> 
+  group_by(case_id, donor_type, cell_clust, islet_type) |>
+  summarize(density = mean(density)) |>
+  ggplot(aes(x = cell_clust, y = density, fill = islet_type)) +
+  geom_boxplot(outlier.shape = NA) +
+  scale_fill_manual(values = c("ICI" = "blue", "IDI" = "red")) +
+  labs(x = "Cell type", y = "Fraction of cells", fill = "Islet type") +
+  mytheme$standard() + 
+  # rotate x-axis labels
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap(~donor_type, scales = "free_y")
+
+print(p)
+fn <- paste0(paste(today, "ImmuneCellComposition_ici_idi_clust", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+
+-> These comparisons are not very useful.
+
+# A8: Expression differences between ICI and IDIs
+
+## A8.1: Prepare Data.
+Here, Cell Types.
+```{r idi-ici-expression-diffs}
+# Define channels of interest.
+channels <- metadata(spe)$channels
+channels_imm <- unique(unlist(channels))
+ 
+## Join with the islet type.
+ici_idi <- cols_islet |> select(image_id, donor_type, case_id, islet_type) |> 
+  distinct(image_id, donor_type, case_id, islet_type)
+
+## Prepare the data (average expression per Cell Type)
+exprs_vals_full <- as_tibble(scuttle::makePerCellDF(spe, features = channels_imm, 
+                                                    assay.type = "exprs", use.dimred = FALSE)) |> 
+  select(all_of(channels_imm), case_id, age, donor_type, image_id, cell_type, cell_cluster_scaled) |>
+  filter(cell_type %in% c("T_CD4", "T_CD8", "B", "NK", "Neutrophil", "Myeloid", 
+                          "Beta", "Alpha", "Ductal", "Endothelial"))
+
+exprs_vals_full <- exprs_vals_full |> 
+  left_join(dist_score, by = c("image_id", "donor_type", "case_id", "cell_type")) |> 
+  # by ROI.
+  group_by(image_id, case_id, donor_type, cell_type) |> 
+  summarize(across(where(is.numeric), \(x) mean(x, na.rm = TRUE)), .groups = "drop")
+
+## Join with Expression data. 1 row per image and cell type.
+ici_idi_df <- exprs_vals_full |> 
+  left_join(ici_idi, by = c("image_id", "donor_type", "case_id")) |> 
+  filter(!is.na(islet_type)) |> 
+  mutate(islet_type = factor(islet_type, levels = c("ICI", "IDI"))) |> 
+  mutate(donor_type = factor(donor_type, levels = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset")))
+gc()
+```
+
+## A8.2: MM-models
+
+### A8.2.1: Cell Type
+Run MM-effect models per Cell Type, Channel and Donor Type (mAAb+, RecentOnset).
+```{r mm-model}
+## Run MM-models for each cell type, channel and donor_type (mAAb+, RecentOnset).
+input_stats <- ici_idi_df  |> 
+  filter(donor_type %in% c("mAAb+", "RecentOnset")) |>
+  filter(cell_type != "Beta") |> 
+  # channels are the columns
+  pivot_longer(cols = all_of(channels_imm), names_to = "channel", values_to = "MeanExprs")
+
+results <- input_stats  |> 
+  tidyr::nest(data = -c(donor_type, channel, cell_type)) |> 
+  dplyr::mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(data = ., MeanExprs ~ islet_type + (1 | case_id))))) |> 
+  tidyr::unnest(test)  |> 
+  filter(term %in% c("islet_typeIDI")) |>
+  dplyr::select(channel, donor_type, estimate, statistic, cell_type, term, p.value)
+results
+```
+
+### A8.2.2: Analyze + plot linear mixed-effects models per Cell Type & stage
+Analyze + plot linear mixed-effects models per Cell Type & stage.
+
+```{r ici-ici-lmm-ct}
+celltypes_oi <- c("T_CD8", "T_CD4", "B", "NK", "Myeloid", "Neutrophil", 
+                  "Alpha", "Ductal", "Endothelial")
+channels_ct <- metadata(spe)$channels[celltypes_oi]
+
+## Myeloid: Before M1 afterwards M2 phenotype.
+purrr::map2(celltypes_oi, channels_ct, \(cur_celltype, cur_channels) {
+  p <- results |>
+  filter(cell_type == !!cur_celltype) |>
+  filter(channel %in% !!cur_channels) |> 
+  filter(abs(statistic) > 2) |>
+  ## Plot:
+  ggplot(aes(x = channel, y = statistic, fill = donor_type)) +
+  # vertical lines at + 2 and - 2
+  geom_hline(yintercept = 2, linetype = "dashed") +
+  geom_hline(yintercept = -2, linetype = "dashed") +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = palettes[["stages"]]) +
+  labs(x = "Channel", y = "Fixed-effects Statistics", fill = "Stage") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  mytheme$standard() + 
+  labs(title = cur_celltype)
+  print(p)
+  fn <- paste0(paste(today, "IsletType", cur_celltype, sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param))
+})
+```
+
+-> Biggest changes:
+Exhaustion/Activation/Survival in T-Cells. Lower CD73 in ICIs.
+-> CD73 to restore immunity afterwards likely.
+
+M1 -> M2 phenotype in myeloid cells. (also higher CD73) in IDIs.
+Few differences in e.g. Neutrophils, NK-cells.
+
+Endothelial: CD73 higher in IDIs.
+Ductal: CD54/HLA-DR higher ICIs.
+Alpha: only non-significant changes.
+
+### Plot Myeloid Cell Differences.
+
+```{r myeloid-ici-vs-idis}
+## Expression as Violin Plots for CD163, CD206, CD16, CS, CD54, HLA-DR, 
+channels_oi <- c("CD206", "CD16", "CS", "HLA_DR", "CD54", "CD163")
+## NOTE: applicable to both mAAb+ and RecentOnset.
+donor_type <- "RecentOnset"
+library(ggpubr); library(rstatix)
+
+input_myeloid <- input_stats |> 
+  filter(cell_type == "Myeloid") |>
+  #filter(cell_cluster_scaled == "Myeloid_3") |>
+  filter(donor_type == !!donor_type)
+
+input_myeloid |> 
+  dplyr::count(islet_type, case_id) |> 
+  arrange(case_id) |> 
+  dplyr::count(case_id) |> filter(n == 2) |> pull(case_id) |> unique() -> case_ids
+
+input_myeloid <- input_myeloid |> 
+  filter(case_id %in% case_ids) |>
+  pivot_wider(names_from = channel, values_from = MeanExprs)
+
+p <- plot_ici_insulitic_expression(df = input_myeloid, features_oi = channels_oi,
+                                   cell_types = "Myeloid",
+                                   cur_var = "islet_type", x_var = "islet_type",
+                                   group1 = "ICI", group2 = "IDI", facet_by = "channel", 
+                                   y_label = "Macrophage expression", 
+                                   cur_palette = palettes$colors[3:4]) + 
+                                  geom_line(aes(group = case_id), alpha = 0.5) + 
+                                  theme(legend.position = "none")
+print(p)
+
+fn <- paste0(paste(today, "MyeloidExpression_ICI_IDI_Violin", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+
+## A8.6 Expression differences between ICI and IDIs (My-3)
+
+Just for Myeloid-3 (activated M1/M2 phenotype).
+```{r icisidis-myeloid3-expression-diffs}
+## Prepare the data (average expression for My3 per ImageID)
+gc()
+exprs_vals_my3 <- as_tibble(scuttle::makePerCellDF(spe, features = channels_imm, 
+                                                   assay.type = "exprs", use.dimred = FALSE)) |> 
+  select(all_of(channels_imm), case_id, donor_type, image_id, age, cell_type, cell_cluster_scaled) |>
+  filter(cell_cluster_scaled == "Myeloid_3") |> 
+  group_by(image_id, case_id, donor_type, cell_cluster_scaled) |> 
+  summarize(across(all_of(channels_imm), \(x) mean(x, na.rm = TRUE))) |> 
+  ungroup()
+
+## Join with Expression data. 1 row per image and cell type.
+ici_idi_my3 <- exprs_vals_my3 |> 
+  left_join(ici_idi, by = c("image_id", "donor_type", "case_id")) |> 
+  filter(!is.na(islet_type)) |>
+  mutate(islet_type = factor(islet_type, levels = c("ICI", "IDI")))
+```
+
+Run MM-effect models per Cell Type, Channel and Donor Type (mAAb+, RecentOnset).
+```{r mm-model-my3}
+## Run MM-models for each cell type, channel and donor_type (mAAb+, RecentOnset).
+input_stats <- ici_idi_my3  |> 
+  filter(donor_type %in% c("mAAb+", "RecentOnset")) |>
+  # channels are the columns
+  pivot_longer(cols = all_of(channels_imm), names_to = "channel", values_to = "MeanExprs")
+
+results <- input_stats  |> 
+  tidyr::nest(data = -c(donor_type, channel, cell_cluster_scaled)) |> 
+  dplyr::mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(data = ., MeanExprs ~ islet_type + (1 | case_id))))) |> 
+  tidyr::unnest(test)  |> 
+  filter(term %in% c("islet_typeIDI")) |>
+  dplyr::select(channel, donor_type, estimate, statistic, term, p.value)
+```
+
+### Plot Myeloid Cell Differences.
+
+```{r my3-ici-vs-idis}
+## Expression as Violin Plots for CD163, CD206, CD16, CS, CD54, HLA-DR, 
+channels_oi <- c("CD206", "CD16", "CS", "HLA_DR", "CD54", "CD163")
+
+## NOTE: applicable to both mAAb+ and RecentOnset.
+donor_type <- "RecentOnset"
+case_ids <- input_stats |> 
+  dplyr::count(islet_type, case_id) |> 
+  arrange(case_id) |> 
+  dplyr::count(case_id) |> filter(n == 2) |> pull(case_id) |> unique()
+
+cols_islet <- input_stats |> 
+  filter(cell_cluster_scaled == "Myeloid_3") |>
+  filter(donor_type == !!donor_type) |> 
+  filter(case_id %in% case_ids) |>
+  pivot_wider(names_from = channel, values_from = MeanExprs) |>  
+  dplyr::rename("cell_type" = "cell_cluster_scaled")
+
+p <- plot_ici_insulitic_expression(df = cols_islet, features_oi = channels_oi,
+                                   cell_types = "Myeloid_3",
+                                   cur_var = "islet_type", x_var = "islet_type",
+                                   group1 = "ICI", group2 = "IDI", facet_by = "channel", 
+                                   y_label = "Act. M1/M2-like expression", 
+                                   cur_palette = palettes$colors[3:4]) + 
+                                  geom_line(aes(group = case_id), alpha = 0.5) + 
+                                  theme(legend.position = "none")
+print(p)
+
+fn <- paste0(paste(today, "MyeloidExpression_ICI_IDI_Violin_Myeloid_3", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+extfig9b <- p
+saveRDS(extfig9b, file.path(paths$home_git, "figures", "extfig9b.rds"))
+```
+
+
+# A9: Stats EXPRESSIOn with PROGRESSION
+
+## A9.1: Expression progression for ICIs (CELL_TYPES)
+-> Partly already did in the upper part of the script.
+-> Difference: use only ICIs!!
+
+-> This is to get a global overview.
+
+First, cell types.
+```{r lmms-progression}
+## Run MM-models for each cell type, channel and donor_type 
+## Run only for mAAb+ and RecentOnset ICIs
+full_res_exp <- ici_idi_df |> 
+  filter(islet_type == "ICI") |>
+  filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset")) |>
+  mutate(age_group = ifelse(age < 13, "<13", ">= 13")) |> 
+  mutate(donor_type = factor(donor_type, levels = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"))) |>
+  tidyr::pivot_longer(cols = all_of(channels_imm), names_to = "channel", values_to = "MeanExprs") |>
+  tidyr::nest(data = -c(channel, cell_type)) |>
+  dplyr::mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(data = ., MeanExprs ~ donor_type + age_group + (1 | case_id))))) |>
+  tidyr::unnest(test) |> 
+  filter(effect == "fixed", term != "(Intercept)") |> 
+  # mutate donor_type (remove the "donor_type" prefix)
+  mutate(donor_type = stringr::str_remove(term, "donor_type"))  |> 
+  mutate(donor_type = factor(donor_type, levels = c("sAAb+", "mAAb+", "RecentOnset"))) |> 
+  select(-c(df, group, effect))
+
+## Separate per Cell Type.
+celltypes_oi <- unique(full_res_exp$cell_type)
+purrr::map(celltypes_oi, \(cur_celltype) {
+  p <- full_res_exp  |> 
+    filter(cell_type == !!cur_celltype) |> 
+    arrange(desc(statistic)) |> 
+    filter(p.value < 0.1)  |> 
+    filter(channel %in% metadata(spe)$channels[[cur_celltype]]) |>
+    filter(grepl("donor_type", term)) |> 
+    ggplot(aes(x = channel, y = statistic, fill = donor_type)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    labs(x = "Donor Type", y = "Statistic", fill = "Stage", title = paste(cur_celltype)) +
+    scale_fill_manual(values = palettes[["stages"]]) +
+    mytheme$standard() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  print(p)
+  fn <- paste0(paste(today, "Expression_progression", cur_celltype, sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param))
+})
+```
+
+Checks for beta-cells.
+```{r}
+full_res_exp |> 
+  filter(cell_type == "Beta") |> 
+  filter(channel %in% metadata(spe)$channels[["Beta"]]) |> 
+  print(n = "all")
+
+## LIneage down: SYP, NKX6.1, INS, PDX1 down; IFN up: HLA-DR + CD54 up.
+## All metabolic markers0 (non-significantly) upregulated.
+tt2 <- ici_idi_df |> 
+  filter(islet_type == "ICI") |>
+  filter(cell_type == "Beta") |>
+  filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset")) |>
+  mutate(donor_type = factor(donor_type, levels = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"))) |>
+  tidyr::pivot_longer(cols = all_of(channels_imm), names_to = "channel", values_to = "MeanExprs") |>
+  tidyr::nest(data = -c(channel, cell_type)) |>
+  dplyr::mutate(test = purrr::map(data, \(.x) {
+    tt <- lmerTest::lmer(data = .x, MeanExprs ~ donor_type + (1 | case_id))
+    emmeans::emmeans(tt, specs = "donor_type", pbkrtest.limit = 10000) |>
+      emmeans::contrast("pairwise") |>
+      broom.mixed::tidy()
+  }))  |> 
+  tidyr::unnest(test)
+
+tt2 |> 
+  filter(channel %in% c("SYP", "HLA_DR", "ATP5A", "LDHA", "CD73", "HK1", "CS", "INS")) |> 
+  mutate(estimate = estimate*-1) |> 
+  print(n = "all")
+```
+
+```{r}
+## CD54.
+exprs_vals_full |> 
+  filter(cell_type == "Beta") |> 
+  select(image_id, case_id, donor_type, CD54) |>
+  arrange(desc(CD54))
+```
+
+## A9.2: Cell Cluster Expression Differences
+
+Join with ICI data for other cluster data.
+```{r ici-cl-exprs}
+## by cluster
+gc()
+exprs_vals_full <- as_tibble(scuttle::makePerCellDF(spe, features = channels_imm, 
+                                                    assay.type = "exprs", use.dimred = FALSE)) |> 
+  select(all_of(channels_imm), case_id, donor_type, image_id, cell_type, cell_cluster_scaled) |>
+  filter(cell_type %in% c("T_CD4", "T_CD8", "B", "NK", "Neutrophil", "Myeloid", 
+                          "Beta", "Alpha", "Ductal", "Endothelial"))
+
+exprs_vals_cl <- exprs_vals_full |> 
+  group_by(image_id, case_id, donor_type, cell_cluster_scaled) |> 
+  summarize(across(all_of(channels_imm), \(x) mean(x, na.rm = TRUE)))
+
+ici_idi_df_cl <- exprs_vals_cl |> 
+  left_join(ici_idi, by = c("image_id", "donor_type", "case_id")) |> 
+  tidyr::drop_na() |> 
+  mutate(islet_type = factor(islet_type, levels = c("ICI", "IDI")))
+```
+
+## A9.3: Linear Mixed-Effects Models for Cell Clusters
+Now, cell-clusters. Only between ICIs along progression. 
+used for overview of changes in expression along progression.
+
+```{r lmmsprogression-ct}
+full_res_exp_cl <- ici_idi_df_cl |> 
+  filter(islet_type == "ICI") |>
+  filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset")) |>
+  mutate(donor_type = factor(donor_type, levels = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"))) |>
+  tidyr::pivot_longer(cols = all_of(channels_imm), names_to = "channel", values_to = "MeanExprs") |>
+  tidyr::nest(data = -c(channel, cell_cluster_scaled)) |>
+  dplyr::mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(data = ., MeanExprs ~ donor_type + (1 | case_id))))) |>
+  tidyr::unnest(test) |> 
+  filter(effect == "fixed", term != "(Intercept)") |> 
+  # mutate donor_type (remove the "donor_type" prefix)
+  mutate(donor_type = stringr::str_remove(term, "donor_type"))  |> 
+  mutate(donor_type = factor(donor_type, levels = c("sAAb+", "mAAb+", "RecentOnset"))) |> 
+  select(-c(df, group, effect)) |> 
+  filter(!cell_cluster_scaled %in% c("0", "B1", "B2"))
+
+## Separate per Cell Type.
+clusters_oi <- unique(full_res_exp_cl$cell_cluster_scaled)
+purrr::map(clusters_oi, \(cur_cluster) {
+  cur_celltype <- stringr::str_remove(cur_cluster, "_[0-9]+$")
+  ifelse(cur_celltype == "T-naive", cur_celltype <- "T_CD8", cur_celltype)
+  ifelse(cur_celltype == "T-EMRA", cur_celltype <- "T_CD8", cur_celltype)
+  p <- full_res_exp_cl  |> 
+    filter(cell_cluster_scaled == !!cur_cluster) |> 
+    arrange(desc(statistic)) |> 
+    filter(p.value < 0.1)  |> 
+    filter(channel %in% metadata(spe)$channels[[cur_celltype]]) |>
+    ggplot(aes(x = channel, y = statistic, fill = donor_type)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    labs(x = "Donor Type", y = "Statistic", fill = "Stage", title = paste(cur_cluster)) +
+    scale_fill_manual(values = palettes[["stages"]]) +
+    mytheme$standard() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  print(p)
+  fn <- paste0(paste(today, "Expression_progression", cur_cluster, sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param))
+})
+```
+
+## A9.3: Plot changes for specific cell clusters across progression
+### A9.3.1: T-CD4-5
+Plot changes for T-CD4-5 across progression.
+```{r tcd4-5-progression}
+library(emmeans)
+channels_to_plot <- c("GranB", "PD1", "TIM3", "CD103")
+
+t_cd4_5_df <- ici_idi_df_cl |> 
+  filter(islet_type == "ICI") |>
+  filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset")) |>
+  mutate(donor_type = factor(donor_type, levels = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"))) |> 
+  filter(cell_cluster_scaled == "T_CD4_5") |> 
+  mutate(cell_type = "T_CD4") |> 
+  pivot_longer(cols = all_of(channels_imm), names_to = "channel", values_to = "exprs")
+
+t_cd4_5_df <- t_cd4_5_df |>
+  left_join(colData(spe) |> as_tibble() |> distinct(case_id, age_group.y, ICU_time_days.y), by = "case_id") |> 
+  as_tibble() |> 
+  filter(image_id %in% icis) |>
+  filter(!(case_id %in% to_del))
+
+p <- plot_expression_violin(exprs_dat = t_cd4_5_df, 
+                            channels_oi = channels_to_plot, 
+                            cell_types = "T_CD4", 
+                            facet_by = "channel", 
+                            y_label = "CD4+ PD1+ act. expression",
+                            immune_adjustment = TRUE)
+print(p)
+  
+fn <- paste0(paste(today, "T_CD4_5", "Progression", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+extfig6f <- p
+saveRDS(extfig6f, file.path(paths$home_git, "figures", "extfig6f.rds"))
+```
+
+### A9.3.2: T-CD8-7
+Plot changes for T-CD8-7 across progression.
+```{r tcd87-progression}
+channels_to_plot <- c("GranB", "TIM3", "PD1", "CD103")
+
+t_cd8_7_df <- ici_idi_df_cl |> 
+  filter(islet_type == "ICI") |>
+  filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset")) |>
+  mutate(donor_type = factor(donor_type, levels = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"))) |> 
+  filter(cell_cluster_scaled == "T_CD8_7") |> 
+  mutate(cell_type = "T_CD8") |> 
+  pivot_longer(cols = all_of(channels_imm), names_to = "channel", values_to = "exprs")
+
+t_cd8_7_df <- t_cd8_7_df |>
+  left_join(colData(spe) |> as_tibble() |> distinct(case_id, age_group.y, ICU_time_days.y), by = "case_id") |> 
+  as_tibble() |> 
+  filter(image_id %in% icis) |>
+  filter(!(case_id %in% to_del))
+
+p <- plot_expression_violin(exprs_dat = t_cd8_7_df, 
+                            channels_oi = channels_to_plot, 
+                            cell_types = "T_CD8", 
+                            facet_by = "channel", 
+                            y_label = "PD1+,CD27+ expression",
+                            immune_adjustment = TRUE) + 
+          facet_wrap(~channel, scales = "free_y", nrow = 3, ncol = 2)
+print(p)
+  
+fn <- paste0(paste(today, "T_CD8_7", "Progression", sep = "_"), ".png")
+plotsave_param_large2 <- plotsave_param_large
+plotsave_param_large2$width <- 400
+plotsave_param_large2$height <- 600
+do.call(ggsave, c(list(fn, p), plotsave_param_large2))
+
+extfig6g <- p
+saveRDS(extfig6g, file.path(paths$home_git, "figures", "extfig6g.rds"))
+```
+
+### A9.3.3: T-regs
+Plot changes for T-regs across progression.
+```{r tregs-progression}
+channels_to_plot <- c("TIM3", "FoxP3", "PD1", 
+                      "CS", "HK1", "CD45RO")
+
+treg_df <- ici_idi_df_cl |> 
+  filter(islet_type == "ICI") |>
+  filter(donor_type %in% c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset")) |>
+  mutate(donor_type = factor(donor_type, levels = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"))) |> 
+  filter(cell_cluster_scaled == "T_CD4_10") |> 
+  mutate(cell_type = "T_CD4") |> 
+  pivot_longer(cols = all_of(channels_imm), names_to = "channel", values_to = "exprs")
+
+treg_df <- treg_df |>
+  left_join(colData(spe) |> as_tibble() |> distinct(case_id, age_group.y, ICU_time_days.y), by = "case_id") |> 
+  as_tibble() |> 
+  filter(image_id %in% icis) |>
+  filter(!(case_id %in% to_del))
+  
+p <- plot_expression_violin(exprs_dat = treg_df, 
+                            channels_oi = channels_to_plot, 
+                            cell_types = "T_CD4", 
+                            facet_by = "channel", 
+                            y_label = "Treg expression",
+                            immune_adjustment = TRUE)
+print(p)
+  
+fn <- paste0(paste(today, "T_regs", "Progression", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+
+# A10: Visualization of Cell Clusters and Cell Types
+## Load images and masks
+
+```{r viz-cDC-clust-select}
+all_channels <- rownames(sce_imm)
+
+viz_clust <- NULL # c(22, 21, 9) # c(21, 9, 11, 12, 2, 20, 1, 5, 3, 4)
+viz_method <- "cell_type"
+viz_assay <- "scaled"
+```
+
+```{r viz-lympho-cluster-load}
+viz_clust <- TRUE
+if (!is.null(viz_clust)) {
+  nb_images <- 14
+  image_extension <- ".tiff"
+  clust_name <- viz_method
+  
+  # Subset the SCE
+  sce_viz <- spe
+
+  set.seed(seed)
+
+  image_sub <- sort(sample(
+    unique(sce_viz$image_fullname),
+    min(length(unique(sce_viz$image_fullname)), nb_images)))
+  
+  image_sub <- unique(c(image_sub, images <- 
+    c("6228_Immune_ROI_082.tiff", "6551_Immune_ROI_069.tiff", 
+      "6362_Immune_ROI_019.tiff", "6178_Immune_ROI_029.tiff",
+      # CD54:
+      "6550_Immune_ROI_024.tiff", "6534_Immune_ROI_040.tiff",
+      # Myeloid-4:
+      "6509_Immune_ROI_026.tiff", "6447_Immune_ROI_009.tiff", "6533_Immune_ROI_051.tiff", "6551_Immune_ROI_069.tiff", 
+      "6551_Immune_ROI_050.tiff",
+      # Myeloid-11:
+      "6458_Immune_ROI_077.tiff", "6458_Immune_ROI_046.tiff", "6044_Immune_ROI_049.tiff", "6367_Immune_ROI_076.tiff",
+      # Myeloid-12:
+      "6429_Immune_ROI_008.tiff", "6449_Immune_ROI_072.tiff", "6534_Immune_ROI_066.tiff",
+      # Myeloid-7:
+      "6520_Immune_ROI_067.tiff", "6324_Immune_ROI_016.tiff", "6526_Immune_ROI_009.tiff",
+      # Myeloid-10:
+      "6228_Immune_ROI_023.tiff", "6534_Immune_ROI_076.tiff"
+      )))
+
+  # Folders
+  folder_images <- file.path(paths$folder_in, "img", paths$panel_type)
+  folder_masks <- file.path(paths$folder_in, "masks_cells",
+                            paths$panel_type, "whole-cell")
+  
+  images <- cytomapper::loadImages(file.path(folder_images, image_sub))
+  cytomapper::channelNames(images) <- all_channels
+  # Add image names to metadata
+  mcols(images)$ImageName <- names(images)
+  mcols(images)$ImageName <- paste0(mcols(images)$ImageName)
+
+  # Load images and masks
+  #images <- yoloader(
+  #  x = sce_viz,
+  #  image_dir = folder_images,
+  #  image_names = image_sub,
+  #  type = "stacks"
+  #)
+
+  masks <- yoloader(
+    x = sce_viz,
+    image_dir = folder_masks,
+    image_names = image_sub,
+    as.is = TRUE,
+    type = "masks"
+  )
+  
+  sce_viz <- sce_viz[, sce_viz$image_fullname %in% image_sub]
+  sce_viz$ImageName <- gsub(image_extension, "", sce_viz$image_fullname)
+}
+```
+
+### Cytoviewer app.
+```{r cytoviewer}
+library(cytoviewer)
+sce_viz[[clust_name]] <- as.factor(sce_viz[[clust_name]])
+app <- cytoviewer(image = images, 
+                  mask = masks, 
+                  object = sce_viz,
+                  img_id = "ImageName", 
+                  cell_id = "cell_number")
+
+if (interactive()) {
+  shiny::runApp(app)
+}
+```
+
+
+
+
+# A11: Umap and Heatmap for Panel Immune.
+## A11.1: UMAP full
+
+Run UMAP for all cells in the immune panel.
+
+```{r umap_full}
+channels <- rownames(spe)
+spe_sub <- spe[, spe$cell_id %in% metadata(spe)[["subset"]]]
+cur_dat <- scuttle::makePerCellDF(spe_sub, features = channels, 
+                                  assay.type = "exprs", use.dimred = TRUE) |> 
+  as_tibble() |> 
+  select(all_of(channels), starts_with("UMAP"), cell_type, cell_category, donor_type, case_id, image_id) |> 
+  mutate(cell_type_cat = if_else(cell_category == "immune", "Immune", cell_type)) |> 
+  filter(!cell_type_cat %in% c("Other", "Ambiguous"))
+
+palettes$celltype <- (c(
+  Beta = palettes$colors[1], Alpha = palettes$colors[2],
+  Delta = palettes$colors[3], IsletOther = palettes$colors[4],
+  Ductal = palettes$colors[5], Acinar = palettes$colors[6],
+  Endothelial = palettes$colors[7], Mesenchymal = palettes$colors[8],
+  SmoothMuscle = palettes$colors[9], Nerves = palettes$colors[10],
+  Immune = palettes$colors[11]
+))
+
+palette_ct <- c(palettes$colors[seq_len(length(celltypes))])
+p <- plot_dim_red(cur_dat, "UMAP_exprs", "cell_type_cat", palette = palettes$celltype) + 
+  labs(title = "", x = "", y = "") + 
+  theme(
+    legend.title = element_text(size = 25),  # Adjust the legend title font size
+    legend.text = element_text(size = 22)    # Adjust the legend text font size
+  ) + 
+  guides(color = guide_legend(title = "Cell Type", override.aes = list(size = 5)))
+  
+fn <- paste0(paste(today, "UMAP", "full", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+## A11.2: Full Heatmap
+All non-immune Cell Types.
+```{r heatmap_full}
+hmlist <- list()
+channels <- c("SYP", "INS", "SST", "GCG", "CAV1", "SMA", "LDHA", "VIM", "CD73", 
+              "PDX1", "NKX6_1", "CD57", "CD56", "CD54", "TMEM173")
+
+spe_sub2 <- spe_sub[, (spe_sub$cell_type %in% c("Beta", "Alpha", "Delta", "Endothelial", 
+                                                "Ductal", "Acinar", "Mesenchymal",
+                                                "SmoothMuscle", "Nerves"))]
+# Summarize the data
+hm <- summarize_heatmap(spe_sub2,
+                        expr_values = "scaled",
+                        cluster_by = "cell_type",
+                        channels = channels)
+
+# Counts
+ct_anno <- as.data.frame(table(spe_sub$cell_type))
+rownames(ct_anno) <- ct_anno$Var1
+ct_anno <- ct_anno[rownames(hm), ]
+cell_type_counts <- ct_anno$Freq
+names(cell_type_counts) <- ct_anno$Var1
+
+# Create row annotation for cell type counts
+breaks <- c(0, 0.5, 0.7, 1)  # Define custom breaks for the color scale
+colors <- viridis::viridis(4) 
+# Create a color function with more emphasis on the lower values
+col_fun <- circlize::colorRamp2(breaks, colors)
+
+# Create row annotation for cell type counts
+row_anno <- ComplexHeatmap::rowAnnotation(
+  Counts = ComplexHeatmap::anno_barplot(cell_type_counts, 
+                         gp = grid::gpar(fill = "skyblue", col = "black"),
+                         border = TRUE,
+                         width = grid::unit(4, "cm"),
+      axis_param = list(gp = grid::gpar(fontsize = 25)),
+),       show_annotation_name = FALSE
+)
+
+# Display the heatmap
+fn <- file.path(paths$folder_script, paste0(paste(today, "cell_type_full", "Heatmap",
+                   sep = "_"), ".png"))
+png(fn, width = 1200, height = 800)
+p <- ComplexHeatmap::Heatmap(heatmaply::normalize(hm), name = "Scaled expression", 
+                              col= col_fun,
+                              show_row_names = TRUE, show_column_names = TRUE,
+                              cluster_rows = TRUE, cluster_columns = TRUE,
+                              row_names_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"),
+                              column_names_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"), 
+                              heatmap_legend_param = list(legend_direction = "horizontal",
+                                                          title_position = "topcenter",
+                                                          title_gp = grid::gpar(fontsize = 40, fontfamily = "Arial"),
+                                                          labels_gp = grid::gpar(fontsize = 40, fontfamily = "Arial")),                             
+                            row_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for rows
+                            column_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for columns
+                            row_names_side = "left",
+                            row_dend_side = "right") + 
+      row_anno
+ComplexHeatmap::draw(p, heatmap_legend_side = "top", 
+                      padding = unit(c(12, 20, 2, 2), "mm"))   # right and bottom padding
+
+dev.off()
+```

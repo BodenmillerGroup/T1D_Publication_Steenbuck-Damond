@@ -1,0 +1,2871 @@
+---
+title: "09_CellTypeCompo_cells_Immune"
+author: "Nicolas Damond, Nathan Steenbuck"
+date: "Created: 25 May, 2022; Compiled: `r format(Sys.time(), '%d %b, %Y')`"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+if (rstudioapi::isAvailable()) {
+  script_name <- basename(rstudioapi::getSourceEditorContext()$path)
+} else {
+  script_name <- knitr::current_input()
+}
+
+cur_user <- Sys.info()[["user"]]
+script_name <- "09_CellTypeCompo_cells_Immune.Rmd"
+
+if (cur_user == "ubuntu") {
+  source(file.path("/", "mnt", "central_nas", "projects", 
+    "type1_diabetes", "nathan", "T1D_Vol", "T1D_analysis", 
+    "analysis", "helpers.R"))  #n_cores <- future::availableCores() - 1
+  n_cores <- 4
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  knitr::opts_knit$set(root_dir = paths$home_data)
+} else {
+  source(file.path("/", "home", "nsteen", "scripts", "T1D_analysis", "analysis", "helpers.R"))
+  n_cores <- 8
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  paths$folder_script <- paths$cluster_folder_script
+  paths$folder_in <- paths$cluster_folder_in
+  paths$folder_out <- paths$cluster_home 
+  knitr::opts_knit$set(root_dir = paths$cluster_home)
+}
+
+do_print <- FALSE
+seed <- 123456
+set.seed(seed)
+options <- furrr::furrr_options(seed = seed)
+paths$prev <- paste("08_CellTypesIslet", paths$object_type, paths$panel_type, sep = "_")
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# **A0: Goal**
+
+Calculate and plot immune cell type and cluster composition across cases and 
+stages.  
+
+Analyses are applied only to immune cells, which should be defined as `immune` 
+in the `spe$cell_category` column. Calculations and plots are performed at both
+the immune cell types and at the immune cluster levels.
+
+After calculating compositions, the following plots are generated:
+
++ **Individual image composition**: composition for every single image.
+  - Absolute: total immune cell number per image.
+  - Relative: relative immune cell number per image (0 to 1).
+
++ **Aggregated composition** - Absolute: boxplots showing absolute composition by 
+patient.
+  - Density: cell number / image area.
+  - Fraction: cell number / total cell number on the image.
+
++ **Aggregated composition** - Relative: bar plots showing relative composition.
+  - Normalized by cell type or by cluster.
+  - Normalized by patient or by stage.
+  
++ **Differential abundance tests!**
+
+# A1: Settings
+
+## A1.1: Load packages
+
+```{r packages, results='hide'}
+suppressPackageStartupMessages(c(
+  library(dplyr),
+  library(tidyr),
+  library(data.table),
+  library(SpatialExperiment),
+  library(ggplot2),
+  library(ggpubr),
+  library(edgeR)
+))
+```
+
+## A1.2: Paths and settings
+
+```{r settings}
+# Paths
+if (!dir.exists(paths$folder_script)) dir.create(paths$folder_script)
+plotsave_param$path <- paths$folder_script
+plotsave_param_large$path <- paths$folder_script
+
+# Misc settings
+today <- gsub("-", "", Sys.Date())
+```
+
+## A1.3: Read in the SPE data
+
+Load the SpatialExperiment (SPE) object saved at the previous step.
+
+```{r load-data}
+fn_spe <- file.path(paths$folder_out, paths$prev, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+spe <- readRDS(fn_spe)
+print(spe)
+```
+
+
+## A1.4: Calculate image area
+
+```{r image-area}
+spe$image_area <- spe$width_px * spe$height_px / 10^6
+```
+
+## A1.5: Subset immune cells
+
+```{r subset-immune}
+spe_imm <- spe[, spe$cell_category == "immune" & 
+                 spe$cell_type != "Ambiguous"]
+print(spe_imm)
+```
+
+## A1.6: Define the analysis parameters
+
+```{r parameters}
+# List of cell types
+celltypes <- c("T_CD4", "T_CD8", "B", "NK", "Myeloid", "Neutrophil", "CD303_VIM", "T_DN", "Other")
+names(celltypes) <- celltypes
+cat("Immune cell types\n", celltypes)
+
+# Color palette for plotting
+palette_ct <- c(palettes$colors[seq_len(length(celltypes))])
+names(palette_ct) <- celltypes
+
+# List of clusters and associated color palettes
+cluster_cols <- c("cell_cluster_scaled") #, "cell_cluster_fastMNN_case_id")
+names(cluster_cols) <- c("scaled") #, "fastMNN_case_id")
+
+clusters <- palettes_clust <- vector(mode = "list")
+for (i in seq_along(cluster_cols)) {
+  clusters[[i]] <- sort(unique(spe_imm[[cluster_cols[i]]]))
+  palettes_clust[[i]] <- c(palettes$colors50[seq_len(length(clusters[[i]]))])
+}
+names(clusters) <- names(palettes_clust) <- cluster_cols
+print(c("Immune cell clusters", clusters))
+
+# Variables to plot
+plot_variables <- c("donor_type", "case_id")
+names(plot_variables) <- c("Stage", "Donor")
+```
+
+
+
+# **A2: Calculate cell type composition**
+
+Here, we calculate the immune cell type (`image_compo_ct`) and immune clusters 
+(`image_compo_clust`) composition per image.
+
+
+## A2.1: Define IMMUNE cell type composition per image
+
+The following values are computed, first by cell type, then by cluster:
+- Number of immune cells per image.
+- Immune cell fraction, over the total number of **immune** cells on the image.
+- Immune cell density: number of immune cells / image size.
+
+### A2.1.1: List image IDs
+
+Calculations of cell numbers and cell fractions are performed at the image 
+level rather than at the islet level. This means that all islets from the same 
+image are considered as a single islet. Most images contain only one islet and
+the composition of neighboring islets should be similar.
+
+```{r image-ids}
+image_ids <- unique(spe_imm$image_id)
+```
+
+### A2.1.2: Calculate image size and cell number per image
+
+The image area is calculated in square millimeters.
+
+```{r calculate-image-stats}
+# Total number of cells per image
+total_cells <- as_tibble(colData(spe)) |>
+  filter(image_id %in% image_ids) |>
+  dplyr::add_count(image_id, name = "CellsPerImage") |>
+  select(c("image_id", "CellsPerImage")) |>
+  distinct()
+
+# Number of immune cells per image
+total_immune_cells <- as_tibble(colData(spe_imm)) |>
+  dplyr::add_count(image_id, name = "ImmuneCellsPerImage") |>
+  select(c("image_id", "ImmuneCellsPerImage")) |>
+  distinct()
+
+# Image area (note: every image contains immune cells, so this works.)
+image_area <- colData(spe_imm) |>
+  as_tibble() |>
+  select(c("image_id", "width_px", "height_px")) |>
+  distinct() |>
+  mutate(image_area = (width_px * height_px) / 1e6) |>
+  select(c("image_id", "image_area"))
+
+image_stats <- inner_join(total_cells, total_immune_cells, by = "image_id") |>
+  inner_join(image_area, by = "image_id")
+```
+
+### A2.1.3: Calculate immune cell type composition (image)
+
+```{r composition-celltype}
+# Number of cells of each cell type
+image_compo_ct <- as_tibble(colData(spe_imm)) |>
+  group_by(image_id, cell_type) |>
+  dplyr::count(name = "CellNb") |>
+  ungroup() |>
+  complete(image_id, cell_type,
+           fill = list(CellNb = 0))
+
+# Merge with image stats and calculate fractions and densities
+image_compo_ct <- image_compo_ct |>
+  inner_join(image_stats, by = "image_id") |>
+  mutate(fraction_total = CellNb / CellsPerImage,
+         fraction_immune = CellNb / ImmuneCellsPerImage,
+         density = CellNb / image_area)
+
+# Import relevant metadata (e.g., disease stage and patient ids)
+cn_keep <- c("image_id", plot_variables)
+
+image_compo_ct <- as_tibble(colData(spe_imm))[, cn_keep] |>
+  distinct() |>
+  inner_join(image_compo_ct, by = "image_id") |>
+  mutate(cell_type = factor(cell_type, levels = celltypes),
+         image_id = factor(image_id, levels = image_ids)) |>
+  arrange(image_id, cell_type)
+
+# Reorder the dataset by CD4 T cell fraction (for plotting)
+image_compo_ct_wide <- image_compo_ct |>
+  pivot_wider(
+    id_cols = image_id,
+    values_from = c(CellNb, fraction_total, fraction_immune, density),
+    names_from = c(cell_type))
+
+ordcols <- c(paste0("fraction_total_", celltypes))
+image_compo_ct <- image_compo_ct_wide |>
+  select(all_of(c("image_id", ordcols))) |>
+  inner_join(image_compo_ct, by = "image_id") |>
+  arrange(fraction_total_T_CD4) |>
+  select(-all_of(ordcols)) |>
+  mutate(ord = nrow(image_compo_ct):1)
+
+image_compo_ct_wide <- DataFrame(image_compo_ct_wide)
+```
+
+### A2.1.4: Calculate immune cluster composition
+
+```{r composition-cluster}
+image_compo_clust <- image_compo_clust_wide <- vector(mode = "list")
+  
+# Number of cells of each cluster
+for (i in seq_along(cluster_cols)) {
+  spe_imm[["immune_cluster"]] <- spe_imm[[cluster_cols[[i]]]]
+  
+  image_compo_clust[[i]] <- as_tibble(colData(spe_imm)) |>
+    group_by(image_id, immune_cluster) |>
+    dplyr::count(name = "CellNb") |>
+    ungroup() |>
+    complete(image_id, immune_cluster,
+             fill = list(CellNb = 0)) 
+  
+  # Merge with image stats and calculate fractions and densities
+  image_compo_clust[[i]] <- image_compo_clust[[i]] |>
+    inner_join(image_stats, by = "image_id") |>
+    mutate(fraction_total = CellNb / CellsPerImage,
+           fraction_immune = CellNb / ImmuneCellsPerImage,
+           density = CellNb / image_area)
+
+  # Import relevant metadata and re-order the dataset
+  cn_keep <- c("image_id", plot_variables)
+  
+  image_compo_clust[[i]] <- as_tibble(colData(spe_imm))[, cn_keep] |>
+    distinct() |>
+    inner_join(image_compo_clust[[i]], by = "image_id") |>
+    mutate(immune_cluster = factor(immune_cluster,
+                                   levels = clusters[[i]]),
+           image_id = factor(image_id, levels = image_ids)) |>
+    arrange(image_id, immune_cluster)
+
+  # Reorder the dataset by fraction of the first T CD4 cluster (for plotting)
+  image_compo_clust_wide[[i]] <- image_compo_clust[[i]] |>
+    pivot_wider(
+      id_cols = image_id,
+      values_from = c(CellNb, fraction_total, fraction_immune, density),
+      names_from = c(immune_cluster))
+  
+  ordcols <- c(paste0("fraction_total_", clusters[[i]]))
+  image_compo_clust[[i]] <- image_compo_clust_wide[[i]] |>
+    select(all_of(c("image_id", ordcols))) |>
+    inner_join(image_compo_clust[[i]], by = "image_id") |>
+    arrange(fraction_total_T_CD4_1) |>
+    select(-all_of(ordcols)) |>
+    mutate(ord = nrow(image_compo_clust[[i]]):1)
+  
+  image_compo_clust_wide[[i]] <- DataFrame(image_compo_clust_wide[[i]])
+  spe_imm[["cell_cluster"]] <- NULL
+}
+names(image_compo_clust) <- names(image_compo_clust_wide) <- cluster_cols
+```
+
+## A2.2: Define TOTAL cell type composition per image
+
+### A2.2.1: List all cell types
+```{r celltype-composition}
+celltypes2 <- c("Beta", "Alpha", "Delta", "IsletOther", # Islet
+                "Ductal", "Acinar", # Exo
+                "Endothelial", "Mesenchymal", "SmoothMuscle", "Nerves", # Stroma.
+                "Other", "Ambiguous", # Other
+                "Neutrophil", "T_CD4", "T_CD8", "B", "NK", "Myeloid", "CD303_VIM", "T_DN") # Immune)
+
+# Number of cells of each cell type
+image_compo_ct_all <- as_tibble(colData(spe)) |>
+  filter(cell_type %in% celltypes2, donor_type != "Pancreatitis") |> 
+  group_by(image_id, cell_type) |>
+  dplyr::count(name = "CellNb") |>
+  ungroup() |>
+  complete(image_id, cell_type,
+           fill = list(CellNb = 0))
+
+# Merge with image stats and calculate fractions and densities
+image_compo_ct_all <- image_compo_ct_all |>
+  inner_join(image_stats, by = "image_id") |>
+  mutate(fraction_total = CellNb / CellsPerImage,
+         fraction_immune = CellNb / ImmuneCellsPerImage,
+         density = CellNb / image_area)
+
+# Import relevant metadata (e.g., disease stage and patient ids)
+cn_keep <- c("image_id", plot_variables)
+
+image_compo_ct_all <- as_tibble(colData(spe))[, cn_keep] |>
+  filter(donor_type != "Pancreatitis") |> 
+  distinct() |>
+  inner_join(image_compo_ct_all, by = "image_id") |>
+  mutate(cell_type = factor(cell_type, levels = celltypes2),
+         image_id = factor(image_id, levels = image_ids)) |>
+  arrange(image_id, cell_type)
+
+# Reorder the dataset by CD4 T cell fraction (for plotting)
+image_compo_ct_all_wide <- image_compo_ct_all |>
+  pivot_wider(
+    id_cols = image_id,
+    values_from = c(CellNb, fraction_total, fraction_immune, density),
+    names_from = c(cell_type))
+
+ordcols <- c(paste0("fraction_total_", celltypes2))
+image_compo_ct_all <- image_compo_ct_all_wide |>
+  select(all_of(c("image_id", ordcols))) |>
+  inner_join(image_compo_ct_all, by = "image_id") |>
+  arrange(fraction_total_T_CD4) |>
+  select(-all_of(ordcols)) |>
+  mutate(ord = nrow(image_compo_ct_all):1)
+
+image_compo_ct_all_wide <- DataFrame(image_compo_ct_all_wide)
+```
+
+```{r case-all}
+case_compo_all <- image_compo_ct_all |>
+  dplyr::group_by(donor_type, case_id, cell_type) |> 
+  dplyr::summarize(across(c(CellNb, CellsPerImage), sum)) |>
+  dplyr::rename(CellsPerCase = "CellsPerImage") |>
+  dplyr::mutate(fraction = CellNb / CellsPerCase) |>
+  dplyr::arrange(donor_type, case_id, cell_type)
+```
+
+## A2.3: Joint composition of Immune CC + ALL cell types.
+### A2.3.1: By ROI.
+```{r combine-compo}
+sub_compo_clust <- image_compo_clust[[1]] |> 
+  filter(donor_type != "Pancreatitis") |>
+  select(image_id, image_area, donor_type, case_id, CellNb, immune_cluster, density, CellsPerImage) |> 
+  mutate(cell_type = stringr::str_remove(immune_cluster, "_[0-9]+$")) |>
+  mutate(cell_type = ifelse(immune_cluster == "Treg", "T_CD4", cell_type)) |>
+  mutate(cell_type = ifelse(immune_cluster %in% c("T-naive", "T-EMRA"), "T_CD8", cell_type)) |>
+  filter(cell_type %in% c("Myeloid", "Neutrophil", "T_CD8", "T_CD4", "NK"))
+
+sub_image_compo_all <- image_compo_ct_all |> 
+  filter(!cell_type %in% c("Myeloid", "Neutrophil", "T_CD8", "T_CD4", "NK")) |> 
+  select(image_id, donor_type, image_area, case_id, CellNb, cell_type, density, CellsPerImage) |> 
+  mutate(immune_cluster = cell_type)
+
+joint_all <- bind_rows(sub_image_compo_all, sub_compo_clust)
+
+## Delete clusters with 0-counts.
+clusters_to_remove <- joint_all |> group_by(immune_cluster) |> summarise(mu = mean(density)) |> filter(mu == 0) |> pull(immune_cluster)
+clusters[[1]] <- clusters[[1]][!clusters[[1]] %in% clusters_to_remove]
+```
+
+### A2.3.2: By CASE.
+
+```{r}
+case_joint_all <- joint_all |>
+  group_by(donor_type, case_id, immune_cluster, cell_type) |>
+  summarize(cell_nb = sum(CellNb),
+            total_area = sum(image_area), .groups = "keep") |>
+  dplyr::rename("CellsPerCase" = cell_nb) |>
+  mutate(mean_density = CellsPerCase / total_area) |>
+  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages),
+         case_id = factor(case_id, levels = metadata(spe)$cases)) |>
+  arrange(case_id, donor_type) |> 
+  ungroup()
+```
+
+# A3: Add cell type compo to SCE and save
+
+The cell type and cluster composition are added to the metadata of the SCE
+
+```{r add-compo-spe}
+if (is.null(metadata(spe)$celltype_compo) ||
+    is.null(metadata(spe)$cluster_compo)) {
+  metadata(spe)$celltype_compo <- image_compo_ct_wide
+  metadata(spe)$cluster_compo  <- image_compo_clust_wide
+  print(spe)
+  saveRDS(spe, fn_spe)
+}
+```
+
+## A3.1: Remove pancreatitis cases
+
+*OPTIONAL* Should pancreatitis cases be removed before plotting?
+
+```{r remove-pancreatitis}
+remove_pancreatitis <- TRUE
+
+if (remove_pancreatitis) {
+  spe_imm <- spe_imm[, spe_imm$donor_type != "Pancreatitis"]
+  
+  metadata(spe)$stages <- metadata(spe)$stages[
+    metadata(spe)$stages != "Pancreatitis"]
+  palettes$stages <- palettes$stages[names(palettes$stages) != "Pancreatitis"]
+
+  metadata(spe)$cases <- metadata(spe)$cases[!metadata(spe)$cases %in% c("6036", "6043", "6061", "6150", "6225", "6506", "6522", "8005", "8008")]
+  palettes$cases <- palettes$cases[!names(palettes$cases) %in% c("6036", "6043", "6061", "6150", "6225", "6506", "6522", "8005", "8008")]
+  
+  image_compo_ct <- image_compo_ct[
+    image_compo_ct$donor_type != "Pancreatitis", ]
+  
+  for (i in seq_along(cluster_cols)) {
+    image_compo_clust[[i]] <- image_compo_clust[[i]][
+      image_compo_clust[[i]]$donor_type != "Pancreatitis", ]
+  }
+}
+```
+
+# A4: Plot cell type composition
+The absolute immune composition is plotted for every single image.
+-> Fractions and Absolute numbers of immune cells. 
+
+## A4.1: Add cell type to the cluster composition
+```{r}
+image_compo_clust[["cell_cluster_scaled"]] <- image_compo_clust[["cell_cluster_scaled"]] |> 
+  mutate(cell_type = stringr::str_remove(immune_cluster, "_[0-9]+$")) |> 
+  mutate(cell_type = ifelse(immune_cluster == "Treg", "T_CD4", cell_type)) |> 
+  mutate(cell_type = ifelse(immune_cluster == "T-naive", "T_CD8", cell_type)) |> 
+  mutate(cell_type = ifelse(immune_cluster == "T-EMRA", "T_CD8", cell_type))
+```
+
+## A4.2: Stacked Barplot
+Overview of immune cell type composition across all images.
+
+```{r stacked-barplot}
+temp <- scuttle::makePerCellDF(spe_imm, use_dimred = FALSE) |>
+  filter(!cell_type %in% c("Ambiguous", "IsletLike")) |>
+  dplyr::count(cell_type)
+# 
+p <- temp |> 
+  # mutate(cell_type = factor(cell_type, levels = names(palettes$celltype))) |>
+  ggplot(aes(x = "", y = n, fill = cell_type)) +
+  geom_bar(stat = "identity", width = 0.8) +
+  labs(x = "", y = "Cell number") +
+  mytheme$large() +
+  scale_fill_manual("Cell Type",
+                    values = palettes$colors) +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45))
+print(p)
+fn <- paste0(paste(today, "CellType", "StackedBarplot", "byStage",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+
+## A4.3: Absolute composition
+
+### A4.3.1: By immune cell type
+
+```{r individual-absolute-celltype}
+# All cells
+p <- image_compo_ct |>
+  ggplot(aes(x = reorder(image_id, ImmuneCellsPerImage),
+             y = CellNb)) +
+  geom_bar(stat = "identity", aes(fill = cell_type), width = 1) +
+  scale_fill_manual("Cell type",
+                    labels = names(celltypes),
+                    values = palette_ct) +
+  labs(title = "Absolute composition - All islets",
+       x = "Individual islet sections",
+       y = "Number of cells per islet section") +
+  mytheme$standard() +
+  theme(
+    axis.title.x = element_text(margin = margin(t = -6)),
+    axis.text.x = element_blank(),
+    axis.line.x = element_blank(),
+    axis.ticks.x = element_blank(),
+  )
+
+if (do_print) print(p)
+fn <- paste0(paste(today, "Individual", "Absolute", "CellType", "Ungrouped",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# By stage
+p1 <- p + facet_grid(~factor(donor_type, levels = metadata(spe)$stages),
+                     scales = "free_x")
+if (do_print) p1
+
+fn <- paste0(paste(today, "Individual", "Absolute", "CellType", "byStage",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p1), plotsave_param))
+
+# By case
+p2 <- p + facet_grid(~factor(case_id, levels = metadata(spe)$cases),
+                     scales = "free_x") +
+  theme(strip.text.x = element_text(angle = 90))
+if (do_print) p2
+
+fn <- paste0(paste(today, "Individual", "Absolute", "CellType", "byCase",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p2), plotsave_param))
+```
+
+### A4.3.1: By immune cluster
+
+```{r individual-absolute-cluster}
+for (i in seq_along(cluster_cols)) {
+  
+  # All cells
+  p <- image_compo_clust[[i]] |>
+    filter(!immune_cluster %in% clusters_to_remove) |>
+    ggplot(aes(x = reorder(image_id, ImmuneCellsPerImage),
+               y = CellNb)) +
+    geom_bar(stat = "identity", aes(fill = immune_cluster), width = 1) +
+    scale_fill_manual("Immune cluster",
+                      labels = clusters[[i]],
+                      values = palettes_clust[[i]]) +
+    labs(title = "Absolute composition - All islets",
+         x = "Individual islet sections",
+         y = "Number of cells per islet section") +
+    mytheme$standard() +
+    theme(
+      axis.title.x = element_text(margin = margin(t = -6)),
+      axis.text.x = element_blank(),
+      axis.line.x = element_blank(),
+      axis.ticks.x = element_blank(),
+    ) + facet_wrap(~cell_type, scale = "free")
+  if (do_print) print(p)
+  fn <- paste0(paste(today, "Individual", "Absolute", "Cluster", "Ungrouped",
+                     names(cluster_cols)[i], sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param_large))
+  
+  # By stage
+  p1 <- p + facet_grid(~factor(donor_type, levels = metadata(spe)$stages),
+                       scales = "free_x")
+  if (do_print) print(p1)
+  
+  fn <- paste0(paste(today, "Individual", "Absolute", "Cluster", "byStage",
+                     names(cluster_cols)[i], sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p1), plotsave_param))
+  
+  # By case
+  p2 <- p + facet_grid(~factor(case_id, levels = metadata(spe)$cases),
+                       scales = "free_x") +
+    theme(strip.text.x = element_text(angle = 90))
+  if (do_print) print(p2)
+  
+  fn <- paste0(paste(today, "Individual", "Absolute", "Cluster", "byCase",
+                     names(cluster_cols)[i], sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p2), plotsave_param_large))
+}
+```
+
+
+## A4.4: Relative composition
+
+### A4.4.1: By cell type
+
+```{r individual-relative-celltype}
+p <- image_compo_ct |>
+  ggplot(aes(x = reorder(image_id, rev(ord)),
+             y = fraction_immune)) +
+  geom_bar(stat = "identity", aes(fill = cell_type), width = 1) +
+  scale_fill_manual("Cell Type",
+                    labels = names(celltypes),
+                    values = palette_ct) +
+  labs(title = "Relative composition - All islets",
+       x = "Individual islet sections",
+       y = "Cell type fraction") +
+  mytheme$standard() +
+  theme(
+    axis.title.x = element_text(margin = margin(t = -6)),
+    axis.text.x = element_blank(),
+    axis.line.x = element_blank(),
+    axis.ticks.x = element_blank(),
+  )
+if (do_print) print(p)
+
+fn <- paste0(paste(today, "Individual", "Relative", "CellType", "Ungrouped",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# By stage
+p1 <- p + facet_grid(~factor(donor_type, levels = metadata(spe)$stages),
+                     scales = "free_x")
+if (do_print) print(p1)
+
+fn <- paste0(paste(today, "Individual", "Relative", "CellType", "byStage",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p1), plotsave_param))
+
+# By case
+p2 <- p + facet_grid(~factor(case_id, levels = metadata(spe)$cases),
+                     scales = "free_x") +
+  theme(strip.text.x = element_text(angle = 90))
+if (do_print) print(p2)
+
+fn <- paste0(paste(today, "Individual", "Relative", "CellType", "byCase",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p2), plotsave_param))
+```
+
+### A4.4.2: By cluster
+
+```{r individual-relative-cluster}
+for (i in seq_along(cluster_cols)) {
+  
+  p <- image_compo_clust[[i]] |>
+    filter(!immune_cluster %in% clusters_to_remove) |>
+    ggplot(aes(x = reorder(image_id, rev(ord)),
+               y = fraction_immune)) +
+    geom_bar(stat = "identity", aes(fill = immune_cluster), width = 1) +
+    scale_fill_manual("Immune cluster",
+                      labels = clusters[[i]],
+                      values = palettes_clust[[i]]) +
+    labs(title = "Relative composition - All islets",
+         x = "Individual islet sections",
+         y = "Immune cluster fraction") +
+    mytheme$standard() +
+    theme(
+      axis.title.x = element_text(margin = margin(t = -6)),
+      axis.text.x = element_blank(),
+      axis.line.x = element_blank(),
+      axis.ticks.x = element_blank(),
+    ) + facet_wrap(~ cell_type, scale = "free")
+  if (do_print) print(p)
+  
+  fn <- paste0(paste(today, "Individual", "Relative", "Cluster", "Ungrouped",
+                     names(cluster_cols)[i], sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param))
+  
+  # By stage
+  p1 <- p + facet_grid(~factor(donor_type, levels = metadata(spe)$stages),
+                       scales = "free_x")
+  if (do_print) print(p1)
+  
+  fn <- paste0(paste(today, "Individual", "Relative", "Cluster", "byStage",
+                     names(cluster_cols)[i], sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p1), plotsave_param))
+  
+  # By case
+  p2 <- p + facet_grid(~factor(case_id, levels = metadata(spe)$cases),
+                       scales = "free_x") +
+    theme(strip.text.x = element_text(angle = 90))
+  if (do_print) print(p2)
+  
+  fn <- paste0(paste(today, "Individual", "Relative", "Cluster", "byCase",
+                     names(cluster_cols)[i], sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p2), plotsave_param))
+}
+```
+
+
+
+
+# **A5: Aggregated composition - Absolute**
+
+The immune cell type / immune cluster composition is aggregated by patient.
+
+## A5.1: Immune cell density
+
+Number of cells per square millimeter.
+
+### A5.1.1: All immune cells (by case)
+Boxplots of (log)-total densities by case + stage.
+```{r aggregated-density-all}
+# Calculate immune densities by donor
+cur_dat <- image_compo_ct |>
+  group_by(donor_type, case_id) |>
+  summarize(cell_nb = sum(CellNb),
+            total_area = sum(image_area), .groups = "keep") |>
+  mutate(mean_density = cell_nb / total_area) |>
+  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages),
+         case_id = factor(case_id, levels = metadata(spe)$cases)) |>
+  arrange(case_id, donor_type) |>
+  as.data.frame()
+
+# Plot density
+p <- cur_dat |>
+  ggplot(aes(x = donor_type, y = mean_density, fill = donor_type)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.1) +
+  scale_fill_manual("Cell Type",
+                    labels = metadata(spe)$stages,
+                    values = palettes$stages) +
+  labs(title = paste("Mean immune cell density"),
+       x = "Stage",
+       y = "Cell density (cells / mm^2)") +
+  mytheme$large() +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45))
+if (do_print) print(p)
+
+fn <- paste0(paste(today, "Density", "byCase", "AllCells", 
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# Plot log of density
+p <- cur_dat |>
+  ggplot(aes(x = donor_type, y = log(mean_density), fill = donor_type)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.1) +
+  scale_fill_manual("Cell Type",
+                    labels = metadata(spe)$stages,
+                    values = palettes$stages) +
+  labs(title = paste("Mean immune cell density (log)"),
+       x = "Stage",
+       y = "log of cell density (cells / mm^2)") +
+  mytheme$large() +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45))
+
+if (do_print) print(p)
+
+fn <- paste0(paste(today, "Density", "byCase", "AllCells", "Log",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+
+## Immune cell fraction
+
+Number of immune cells divided by total cell number on the image.
+
+### All immune cells
+
+```{r aggregated-fraction-all}
+# Calculate immune densities by donor
+cur_dat <- image_compo_ct |>
+  group_by(donor_type, case_id) |>
+  summarize(cell_nb = sum(CellNb),
+            total_cell_nb = sum(CellsPerImage), .groups = "keep") |>
+  mutate(mean_fraction = cell_nb / total_cell_nb) |>
+  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages),
+         case_id = factor(case_id, levels = metadata(spe)$cases)) |>
+  arrange(case_id, donor_type) |>
+  as.data.frame()
+
+# Plot density
+p <- cur_dat |>
+  ggplot(aes(x = donor_type, y = mean_fraction, fill = donor_type)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.1) +
+  scale_fill_manual("Cell Type",
+                    labels = metadata(spe)$stages,
+                    values = palettes$stages) +
+  labs(title = paste("Mean cell fraction"),
+       x = "Stage",
+       y = "Cell fraction (of total cell number)") +
+  mytheme$large() +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45))
+if (do_print) print(p)
+
+fn <- paste0(paste(today, "Fraction", "byCase", "AllCells", 
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# Log of density
+p <- cur_dat |>
+  ggplot(aes(x = donor_type, y = log(mean_fraction), fill = donor_type)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.1) +
+  scale_fill_manual("Cell Type",
+                    labels = metadata(spe)$stages,
+                    values = palettes$stages) +
+  labs(title = paste("Mean cell fraction (log) per patient"),
+       x = "Stage",
+       y = "Cell fraction (of total cell number)") +
+  mytheme$large() +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45))
+
+if (do_print) print(p)
+
+fn <- paste0(paste(today, "Fraction", "byCase", "AllCells", "Log",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+### By cell type
+
+```{r aggregated-fraction-celltype}
+# Calculate immune densities by donor and cell type
+cur_dat <- image_compo_ct |>
+  group_by(donor_type, case_id, cell_type) |>
+  summarize(cell_nb = sum(CellNb),
+            total_cell_nb = sum(CellsPerImage), .groups = "keep") |>
+  mutate(mean_fraction = cell_nb / total_cell_nb) |>
+  mutate(cell_type = factor(cell_type, levels = celltypes),
+         donor_type = factor(donor_type, levels = metadata(spe)$stages),
+         case_id = factor(case_id, levels = metadata(spe)$cases)) |>
+  arrange(cell_type, case_id, donor_type) |>
+  as.data.frame()
+
+# Density
+for (j in seq_along(celltypes)) {
+  p <- cur_dat[cur_dat$cell_type == celltypes[j], ] |>
+    ggplot(aes(x = donor_type, y = mean_fraction, fill = donor_type)) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_jitter(width = 0.1) +
+    scale_fill_manual("Cell Type",
+                      labels = metadata(spe)$stages,
+                      values = palettes$stages) +
+    labs(title = paste("Mean cell fraction per patient -", celltypes[j]),
+         x = "Stage",
+         y = "Cell fraction (of total cell number)") +
+    mytheme$large() +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45))
+  if (do_print) print(p)
+  
+  fn <- paste0(paste(today, "Fraction", "byCase", "CellType", celltypes[j],
+                     sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param))
+}
+```
+
+### By cluster.  
+
+Not run as this yields too many plots, these data will be easier to visualize 
+with plotting approaches taken below.
+
+```{r aggregated-fraction-cluster}
+# for (i in seq_along(cluster_cols)) {
+#   # Calculate immune densities by donor and cell type
+#   cur_dat <- image_compo_clust[[i]] |>
+#     group_by(donor_type, case_id, immune_cluster) |>
+#     summarize(cell_nb = sum(CellNb),
+#               total_cell_nb = sum(CellsPerImage), .groups = "keep") |>
+#     mutate(mean_density = cell_nb / total_cell_nb) |>
+#     mutate(immune_cluster = factor(immune_cluster, levels = clusters[[i]]),
+#            donor_type = factor(donor_type, levels = metadata(spe)$stages),
+#            case_id = factor(case_id, levels = metadata(spe)$cases)) |>
+#     arrange(immune_cluster, case_id, donor_type) |>
+#     as.data.frame()
+# 
+#   # Density
+#   for (j in seq_along(clusters[[i]])) {
+#     p <- cur_dat[cur_dat$immune_cluster == clusters[[i]][j], ] |>
+#       ggplot(aes(x = donor_type, y = mean_fraction, fill = donor_type)) +
+#       geom_boxplot(outlier.shape = NA) +
+#       geom_jitter(width = 0.1) +
+#       scale_fill_manual("Cluster",
+#                         labels = metadata(spe)$stages,
+#                         values = palettes$stages) +
+#       labs(title = paste("Mean cell density per patient -", clusters[[i]][j]),
+#            x = "Stage",
+#            y = "Cell fraction (of total cell number)") +
+#       mytheme$large() +
+#       theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45))
+#     print(p)
+# 
+#     fn <- paste0(paste(today, "Fraction", "byCase", "Cluster",
+#                        cluster_cols[j], clusters[[i]][j], sep = "_"), ".png")
+#     do.call(ggsave, c(list(fn, p), plotsave_param))
+#   }
+# }
+```
+
+
+
+# A6: **Aggregated composition - Relative**
+
+Here, the cell type composition is aggregated and normalized from 0 to 1 to 
+compare cell type compositions at different stages of the disease and in 
+different patients. 
+
+## A6.1: Aggregating function
+
+The `aggregate_compo` function calculates the number of cells (`CellNb`) by
+cluster and group, and then computes the relative value for each cluster.
+
+For instance, to calculate relative cell type densities by case and stage:
+- `aggreg_val`: value to aggregate by (`image_area`).
+- `cluster`: cell type (`cell_type`).
+- `group1`: disease stage (`donor_type`).
+- `orderclust` and `order1` are used to order the dataset.
+
+=> The function will first calculate the average cell type density, which is 
+the  number of cells of a given cell type in the selected groups (here, 
+`donor_type`) divided by the total aggregating value (here, `image_area`).  
+
+It will then compute the total density (sum of cell type densities for all 
+groups). Finally it will normalize the cell type densities, i.e., 
+divide individual cell type densities by the total density (so that the sum of 
+relative densities for one cell type is equal to 1).
+
+```{r aggregate_compo-function}
+aggregate_compo <- function(x, aggreg_val, cluster, orderclust, group1, order1) {
+  
+  # Average value by group1
+  compo <- as_tibble(x) |>
+    group_by(Group1 = get(group1), Cluster = get(cluster)) |>
+    summarize(cell_nb = sum(CellNb),
+              total_aggreg_val = sum(get(aggreg_val)),
+              .groups = "keep") |>
+    mutate(mean_value = cell_nb / total_aggreg_val) |>
+    
+    # Calculate relative value
+    group_by(Cluster) |>
+    mutate(total_value = sum(mean_value)) |>
+    mutate(relative_value = mean_value / total_value) |>
+    
+    # Arrange
+    mutate(Cluster = factor(Cluster, levels = orderclust),
+           Group1 = factor(Group1, levels = order1)) |>
+    arrange(Cluster, Group1)
+  
+  return(compo |>
+           filter(!is.na(Cluster) & !is.na(Group1)))
+}
+```
+
+
+## A6.2: Normalized by cell type/cluster
+
+Cell type fractions and densities by case or patient, normalized by cell type.
+
+### A6.2.1: Cell types
+
+Cell type fractions and cell type densities.
+
+```{r aggregated-normalized-celltype}
+# Cell type fraction X stage
+p <- aggregate_compo(
+  image_compo_ct, aggreg_val = "CellsPerImage",
+  cluster = "cell_type", orderclust = celltypes,
+  group1 = "donor_type", order1 = rev(metadata(spe)$stages)) |>
+  ggplot(aes(x = Cluster, y = relative_value, fill = as.factor(Group1))) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = palettes$stages) +
+  labs(x = "Cell type", y = "Relative cell type fraction",
+       title = "Relative cell type fraction by stage", fill = "Stage") +
+  mytheme$large() +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 90))
+if (do_print) print(p)
+
+fn <- paste0(paste(today, "Aggregated", "byCellType", "Fraction", "Stage",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# Cell type density X stage
+p <- aggregate_compo(
+  image_compo_ct, aggreg_val = "image_area",
+  cluster = "cell_type", orderclust = celltypes,
+  group1 = "donor_type", order1 = rev(metadata(spe)$stages)) |>
+  
+  ggplot(aes(x = Cluster, y = relative_value, fill = as.factor(Group1))) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = palettes$stages) +
+  labs(x = "Cell type", y = "Relative cell type density",
+       title = "Relative cell type density by stage", fill = "Stage") +
+  mytheme$large() +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 90))
+if (do_print) print(p)
+
+fn <- paste0(paste(today, "Aggregated", "byCellType", "Density",  "Stage",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# Cell type fraction X case
+p <- aggregate_compo(
+  image_compo_ct, aggreg_val = "CellsPerImage",
+  cluster = "cell_type", orderclust = celltypes,
+  group1 = "case_id", order1 = rev(metadata(spe)$cases))  |>
+  
+  ggplot(aes(x = Cluster, y = relative_value, fill = as.factor(Group1))) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = palettes$cases) +
+  labs(x = "Cell type", y = "Relative cell type fraction",
+       title = "Relative cell type fraction by case", fill = "Case") +
+  mytheme$large() +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 90))
+if (do_print) print(p)
+
+fn <- paste0(paste(today, "Aggregated", "byCellType", "Fraction", "Case",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+# Cell type density X case
+p <- aggregate_compo(
+  image_compo_ct, aggreg_val = "image_area",
+  cluster = "cell_type", orderclust = celltypes,
+  group1 = "case_id", order1 = rev(metadata(spe)$cases))  |>
+  
+  ggplot(aes(x = Cluster, y = relative_value, fill = as.factor(Group1))) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = palettes$cases) +
+  labs(x = "Cell type", y = "Relative cell type density",
+       title = "Relative cell type density by case", fill = "Case") +
+  mytheme$large() +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 90))
+if (do_print) print(p)
+
+fn <- paste0(paste(today, "Aggregated", "byCellType", "Density", "Case",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+
+### A6.2.2: Cluster
+
+Immune cluster fractions and densities.
+
+```{r aggregated-normalized-cluster}
+for (i in seq_along(cluster_cols)) {
+  # Cell type fraction X stage
+  p <- aggregate_compo(
+    image_compo_clust[[i]], aggreg_val = "CellsPerImage",
+    cluster = "immune_cluster", orderclust = clusters[[i]],
+    group1 = "donor_type", order1 = rev(metadata(spe)$stages)) |>
+    
+    ggplot(aes(x = Cluster, y = relative_value, fill = as.factor(Group1))) +
+    geom_bar(stat = "identity") +
+    scale_fill_manual(values = palettes$stages) +
+    labs(x = "Immune cluster", y = "Relative cluster fraction",
+         title = "Relative cluster fraction by stage", fill = "Stage") +
+    mytheme$large() +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 90))
+  if (do_print) print(p)
+  
+  fn <- paste0(paste(today, "Aggregated", "byCluster", "Fraction", "Stage",
+                     cluster_cols[[i]], sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param))
+  
+  # Cell type density X stage
+  p <- aggregate_compo(
+    image_compo_clust[[i]], aggreg_val = "image_area",
+    cluster = "immune_cluster", orderclust = clusters[[i]],
+    group1 = "donor_type", order1 = rev(metadata(spe)$stages)) |>
+    
+    ggplot(aes(x = Cluster, y = relative_value, fill = as.factor(Group1))) +
+    geom_bar(stat = "identity") +
+    scale_fill_manual(values = palettes$stages) +
+    labs(x = "Immune cluster", y = "Relative cluster fraction",
+         title = "Relative cluster density by stage", fill = "Stage") +
+    mytheme$large() +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 90))
+  if (do_print) print(p)
+  
+  fn <- paste0(paste(today, "Aggregated", "byCluster", "Density", "Stage",
+                     cluster_cols[[i]], sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param))
+  
+  # Cell type fraction X case
+  p <- aggregate_compo(
+    image_compo_clust[[i]], aggreg_val = "CellsPerImage",
+    cluster = "immune_cluster", orderclust = clusters[[i]],
+    group1 = "case_id", order1 = rev(metadata(spe)$cases))  |>
+    
+    ggplot(aes(x = Cluster, y = relative_value, fill = as.factor(Group1))) +
+    geom_bar(stat = "identity") +
+    scale_fill_manual(values = palettes$cases) +
+    labs(x = "Immune cluster", y = "Relative cluster fraction",
+         title = "Relative cluster fraction by case", fill = "Case") +
+    mytheme$large() +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 90))
+  if (do_print) print(p)
+  
+  fn <- paste0(paste(today, "Aggregated", "byCluster", "Fraction", "Case",
+                     cluster_cols[[i]], sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param_large))
+  
+  # Cell type density X case
+  p <- aggregate_compo(
+    image_compo_clust[[i]], aggreg_val = "image_area",
+    cluster = "immune_cluster", orderclust = clusters[[i]],
+    group1 = "case_id", order1 = rev(metadata(spe)$cases))  |>
+    ungroup() |> 
+    ggplot(aes(x = Cluster, y = relative_value, fill = as.factor(Group1))) +
+    geom_bar(stat = "identity") +
+    scale_fill_manual(values = palettes$cases) +
+    labs(x = "Immune cluster", y = "Relative cluster fraction",
+         title = "Relative cluster density by case", fill = "Case") +
+    mytheme$large() +
+    theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 90))
+  if (do_print) print(p)
+  
+  fn <- paste0(paste(today, "Aggregated", "byCluster", "Density", "Case",
+                     cluster_cols[[i]], sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param_large))
+}
+```
+
+
+## A6.3: Normalized by stage or patient
+
+Cell type fractions and densities normalized by stage or by patient.
+
+### A6.3.1: Cell types
+
+Cell type fractions and cell type densities.
+
+```{r aggregated-normalized-group-celltype}
+# Cell type fraction X stage
+p <- aggregate_compo(
+  image_compo_ct, aggreg_val = "CellsPerImage",
+  cluster = "donor_type", orderclust = metadata(spe)$stages,
+  group1 = "cell_type", order1 = rev(celltypes)) |>
+  
+  ggplot(aes(x = Cluster, y = relative_value, fill = as.factor(Group1))) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = palette_ct) +
+  labs(x = "Cell type", y = "Relative cell type fraction",
+       title = "Relative cell type fraction by stage", fill = "Stage") +
+  mytheme$large() +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 90))
+if (do_print) print(p)
+
+fn <- paste0(paste(today, "Aggregated", "byStage", "Fraction", "CellType",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# Cell type density X stage
+p <- aggregate_compo(
+  image_compo_ct, aggreg_val = "image_area",
+  cluster = "donor_type", orderclust = metadata(spe)$stages,
+  group1 = "cell_type", order1 = rev(celltypes)) |>
+  
+  ggplot(aes(x = Cluster, y = relative_value, fill = as.factor(Group1))) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = palette_ct) +
+  labs(x = "Cell type", y = "Relative cell type density",
+       title = "Relative cell type density by stage", fill = "Stage") +
+  mytheme$large() +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 90))
+if (do_print) print(p)
+
+fn <- paste0(paste(today, "Aggregated", "byStage", "Density",  "CellType",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# Cell type fraction X case
+p <- aggregate_compo(
+  image_compo_ct, aggreg_val = "CellsPerImage",
+  cluster = "case_id", orderclust = metadata(spe)$cases,
+  group1 = "cell_type", order1 = rev(celltypes)) |>
+
+  ggplot(aes(x = Cluster, y = relative_value, fill = as.factor(Group1))) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = palette_ct) +
+  labs(x = "Cell type", y = "Relative cell type fraction",
+       title = "Relative cell type fraction by case", fill = "Case") +
+  mytheme$large() +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 90))
+if (do_print) print(p)
+
+fn <- paste0(paste(today, "Aggregated", "byCase", "Fraction", "CellType",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+# Cell type density X case
+p <- aggregate_compo(
+  image_compo_ct, aggreg_val = "image_area",
+  cluster = "case_id", orderclust = metadata(spe)$cases,
+  group1 = "cell_type", order1 = rev(celltypes)) |>
+  
+  ggplot(aes(x = Cluster, y = relative_value, fill = as.factor(Group1))) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = palette_ct) +
+  labs(x = "Cell type", y = "Relative cell type density",
+       title = "Relative cell type density by case", fill = "Case") +
+  mytheme$large() +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 90))
+if (do_print) print(p)
+
+fn <- paste0(paste(today, "Aggregated", "byCase", "Density", "CellType",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+
+### A6.3.2: Cluster
+
+Immune cluster fractions and densities.
+
+```{r aggregated-normalized-group-cluster}
+for (i in seq_along(cluster_cols)) {
+
+    # Cell type fraction X case
+    p <- aggregate_compo(
+      image_compo_clust[[i]], aggreg_val = "CellsPerImage",
+      cluster = "case_id", orderclust = metadata(spe)$cases,
+      group1 = "immune_cluster", order1 = rev(clusters[[i]])) |>
+      
+      ggplot(aes(x = Cluster, y = relative_value, fill = as.factor(Group1))) +
+      geom_bar(stat = "identity") +
+      scale_fill_manual(values = palettes_clust[[i]]) +
+      labs(x = "Immune cluster", y = "Relative cluster fraction",
+          title = "Relative cluster fraction by case", fill = "Case") +
+      mytheme$large() +
+      theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 90))
+    if (do_print) print(p)
+    
+    fn <- paste0(paste(today, "Aggregated", "byCase", "Fraction", "Cluster",
+                      cluster_cols[[i]], sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+      # Cell type density X case
+    p <- aggregate_compo(
+      image_compo_clust[[i]], aggreg_val = "image_area",
+      cluster = "case_id", orderclust = metadata(spe)$cases,
+      group1 = "immune_cluster", order1 = rev(clusters[[i]])) |>
+      
+      ggplot(aes(x = Cluster, y = relative_value, fill = as.factor(Group1))) +
+      geom_bar(stat = "identity") +
+      scale_fill_manual(values = palettes_clust[[i]]) +
+      labs(x = "Immune cluster", y = "Relative cluster density",
+          title = "Relative cluster density by case", fill = "Case") +
+      mytheme$large() +
+      theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 90))
+    if (do_print) print(p)
+    
+    fn <- paste0(paste(today, "Aggregated", "byCase", "Density", "Cluster",
+                      cluster_cols[[i]], sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param_large))
+  
+  ## Do Stage by Cell Types
+  for (j in seq_along(celltypes)) {
+      data <- image_compo_clust[[i]] |> filter(cell_type == celltypes[j])
+      # Cluster fraction X stage
+      p <- aggregate_compo(
+        data, aggreg_val = "CellsPerImage",
+        cluster = "donor_type", orderclust = metadata(spe)$stages,
+        group1 = "immune_cluster", order1 = rev(clusters[[i]])) |>
+        mutate(cell_type = stringr::str_remove(Cluster, "_[0-9]+$")) |> 
+        ggplot(aes(x = Cluster, y = relative_value, fill = as.factor(Group1))) +
+        geom_bar(stat = "identity") +
+        scale_fill_manual(values = palettes_clust[[i]]) +
+        labs(x = "Immune cluster", y = "Relative cluster fraction",
+            title = "Relative cluster fraction by stage", fill = "Stage") +
+        mytheme$large() +
+        theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 90))
+        if (do_print) print(p)
+  
+    fn <- paste0(paste(today, "Aggregated", "byStage", "Fraction", "Cluster",
+                      cluster_cols[[i]], celltypes[j], sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param))
+
+      # Cell type density X stage
+    p <- aggregate_compo(
+      data, aggreg_val = "image_area",
+      cluster = "donor_type", orderclust = metadata(spe)$stages,
+      group1 = "immune_cluster", order1 = rev(clusters[[i]])) |>
+      mutate(cell_type = stringr::str_remove(Cluster, "_[0-9]+$")) |> 
+      ggplot(aes(x = Cluster, y = relative_value, fill = as.factor(Group1))) +
+      geom_bar(stat = "identity") +
+      scale_fill_manual(values = palettes_clust[[i]]) +
+      labs(x = "Immune cluster", y = "Relative cluster density",
+          title = "Relative cell type density by stage", fill = "Stage") +
+      mytheme$large() +
+      theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 90))
+    if (do_print) print(p)
+    
+    fn <- paste0(paste(today, "Aggregated", "byStage", "Density",  "Cluster",
+                      cluster_cols[[i]], celltypes[j], sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param))
+  }
+}
+```
+
+# A7: edgeR with age-adjustment (**CELL TYPES**)
+
+## A7.1: Prepare Data.
+
+EXPLORATIVE ANALYSIS.
+```{r aggregated-density-celltype}
+t1d_duration <- colData(spe_imm)[, c("case_id", "donor_type", "age", "diabetes_duration", "C_peptide")] |> as_tibble()
+temp_dur <- t1d_duration |> distinct(case_id, donor_type, age, diabetes_duration, C_peptide)
+
+# By cell type
+cur_dat <- image_compo_ct |>
+  # factor to character
+  mutate(cell_type = as.character(cell_type)) |> 
+  group_by(donor_type, case_id, image_id, cell_type) |>
+  summarize(cell_nb = CellNb,
+            total_area = image_area, .groups = "keep") |>
+  mutate(mean_density = cell_nb / total_area) |>
+  mutate(case_id = factor(case_id, levels = metadata(spe)$cases)) |>
+  arrange(cell_type, case_id, donor_type) |> 
+  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages)) |>
+  left_join(temp_dur, by = c("case_id", "donor_type")) |>
+  ungroup()
+cur_dat
+
+# By immune cell cluster.
+cur_dat_cl <- image_compo_clust[[1]] |>
+  # factor to character
+  mutate(immune_cluster = as.character(immune_cluster)) |> 
+  group_by(donor_type, case_id, image_id, immune_cluster) |>
+  summarize(cell_nb = CellNb,
+            total_area = image_area, .groups = "keep") |>
+  mutate(mean_density = cell_nb / total_area) |>
+  mutate(case_id = factor(case_id, levels = metadata(spe)$cases)) |>
+  arrange(immune_cluster, case_id, donor_type) |> 
+  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages)) |>
+  left_join(temp_dur, by = c("case_id", "donor_type")) |>
+  ungroup()
+cur_dat_cl
+
+# Calculate immune densities by donor and cell type
+cur_dat_case <- image_compo_ct |>
+  group_by(donor_type, case_id, cell_type) |>
+  summarize(cell_nb = sum(CellNb),
+            total_area = sum(image_area), .groups = "keep") |>
+  mutate(mean_density = cell_nb / total_area) |>
+  mutate(cell_type = factor(cell_type, levels = celltypes),
+         donor_type = factor(donor_type, levels = metadata(spe)$stages),
+         case_id = factor(case_id, levels = metadata(spe)$cases)) |>
+  arrange(cell_type, case_id, donor_type) |>
+  left_join(temp_dur, by = c("case_id", "donor_type")) |>
+  as.data.frame()
+cur_dat_case
+gc()
+```
+
+```{r prepare-edgeR}
+case_stages <- colData(spe)[, c("donor_type", "case_id", "age")] |> 
+  as_tibble() |>
+  distinct() |> 
+  mutate(age_group = ifelse(age < 13, "young", "older")) |>
+  mutate(age_group = factor(age_group, levels = c("young", "older"))) |> 
+  filter(donor_type != "Pancreatitis") |> 
+  mutate(donor_type = stringr::str_remove(donor_type, "\\+"))
+
+fn_cases_full <- file.path(paths$folder_in, "cases_full.xlsx")
+cases_full <- readxl::read_excel(fn_cases_full) |> 
+  mutate(case_id = as.character(case_id)) |> 
+  select(case_id, ICU_time_days) |> 
+  mutate(ICU_time_days = abs(as.numeric(stringr::str_remove(ICU_time_days, " days"))))
+
+df_input <- case_compo_all |> 
+  dplyr::ungroup() |> 
+  inner_join(case_stages, by = c("case_id")) |> 
+  left_join(cases_full, by = c("case_id"))
+
+df_input <- df_input |> dplyr::rename("donor_type" = donor_type.y)
+```
+
+## A7.2: Define edgeR input
+```{r edgeR-input}
+# COUNT MATRIX.
+edge <- df_input |>
+  dplyr::select(c(case_id, cell_type, CellNb)) |>
+  tidyr::pivot_wider(id_cols = cell_type,
+                     names_from = case_id, values_from = CellNb) |>
+  as.data.frame()
+
+rownames(edge) <- edge$cell_type
+edge$cell_type <- NULL
+edge <- as.matrix(edge)
+
+# GROUP INFORMATION
+coldata <- unique(df_input[, c("donor_type", "case_id", "age_group", "ICU_time_days")]) |> as.data.frame()
+coldata$ICU_time_days <- log1p(coldata$ICU_time_days)
+coldata$donor_type = factor(coldata$donor_type, levels = c("NoDiabetes", "sAAb", "mAAb", "RecentOnset", "LongDuration"))
+coldata$age_group = factor(coldata$age_group, levels = c("young", "older"))
+```
+
+Filter Cell types + Create Design Matrix.
+```{r edge-design-matrix}
+# Create DGEList (main object)
+y_ab <- edgeR::DGEList(edge, samples = coldata)
+y_ab
+
+# Filter cell types. Add group information (donor-type).
+keep <- edgeR::filterByExpr(y_ab, group = y_ab$samples$donor_type)
+y_ab <- y_ab[keep, ]
+summary(keep)
+
+# Create design matrix. Adjust now for age + ICU-time.
+y_ab$samples$ICU_time_days[is.na(y_ab$samples$ICU_time_days)] <-
+  mean(y_ab$samples$ICU_time_days, na.rm = TRUE)
+  
+design <- model.matrix(~ donor_type + age_group + ICU_time_days, y_ab$samples) 
+```
+
+Estimate NB-dispersion. Common-dispersion.
+```{r estimate-dispersion}
+# y_ab <- edgeR::estimateDisp(y_ab, design, trend = "none")
+y_ab <- edgeR::estimateDisp(y_ab, design)
+
+summary(y_ab$common.dispersion)
+edgeR::plotBCV(y_ab, cex=1)
+```
+
+Fit the NB-model. Turn off trend. 
+```{r fit-ql-model}
+fit_ab <- edgeR::glmQLFit(y_ab, design, robust = TRUE, abundance.trend = TRUE, legacy = FALSE)
+summary(fit_ab$var.prior)
+summary(fit_ab$df.prior)
+edgeR::plotQLDisp(fit_ab, cex = 1)
+```
+
+## A7.3: Run edgeR tests and extract contrast of interest.
+
+Run Tests between ND and distinct biological groups.
+```{r test-diff-abundance}
+my_contrasts <- limma::makeContrasts(
+  NoDiabetes_sAAb = -donor_typesAAb,
+  NoDiabetes_mAAb = -donor_typemAAb,
+  NoDiabetes_RecentOnset = -donor_typeRecentOnset,
+  NoDiabetes_LongDuration = -donor_typeLongDuration,
+  sAAb_mAAb = donor_typesAAb - donor_typemAAb,
+  mAAb_RecentOnset = donor_typemAAb - donor_typeRecentOnset,
+  RecentOnset_LongDuration = donor_typeRecentOnset - donor_typeLongDuration,
+  age_group = -age_groupolder,
+  ICU_time_days = -ICU_time_days,
+  levels = design
+)
+
+## Extract contrasts of interest. Either vs baseline; or between consecutive stages.
+qlf_list <- lapply(colnames(my_contrasts), function(cn) {
+  topTags(glmQLFTest(fit_ab, contrast = my_contrasts[, cn]), n = "all")$table |> 
+    as_tibble(rownames = "cell_type") |> 
+    mutate(contrast = cn)
+}) |> 
+  bind_rows() |> 
+  # select Immune-cell types only!
+  filter(cell_type %in% c("T_CD8", "T_CD4", "Myeloid", "Neutrophil", 
+                          "T_DN", "B", "NK", "CD303_VIM"))
+
+## Clearning.
+edgeR_output <- qlf_list |> 
+  filter(contrast != "ICU_time_days") |> 
+  tidyr::separate_wider_delim(contrast, names = c("group1", "group2"), delim = "_") |> 
+  mutate(group1 = ifelse(group1 == "sAAb", "sAAb+", 
+                         ifelse(group1 == "mAAb", "mAAb+", group1))) |> 
+  mutate(group2 = ifelse(group2 == "sAAb", "sAAb+", 
+                         ifelse(group2 == "mAAb", "mAAb+", group2)))
+
+case_stages2 <- case_stages |> 
+  mutate(donor_type = ifelse(donor_type == "sAAb", "sAAb+",
+                         ifelse(donor_type == "mAAb", "mAAb+", donor_type))) |> 
+  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages))
+```
+
+## A7.4: Plot results.
+
+Plot stats.
+This is Fig3C and ExtFig5b.
+
+```{r fig2c_suppfig6b}
+library(ggpubr); library(rstatix)
+
+edgeR_non_age <- edgeR_output |> filter(group1 != "age")
+
+### Major immune cell types.
+p <- plot_abundance_stages(stats = edgeR_non_age, 
+          dat = cur_dat_case, 
+          cur_celltypes = c("Myeloid", "Neutrophil", "T_CD4", "T_CD8"),
+          x = "donor_type", y = "mean_density", facet_by = "cell_type", 
+          fill_by = "donor_type", ct_type = "cell_type",
+          title = "") + 
+    facet_wrap(~cell_type, scales = "free_y", axes = "all") + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 0.5, vjust = 0.5)) + 
+  theme(panel.spacing = unit(1, "cm"))
+        
+print(p)
+fn <- paste0(paste(today, "Density", "byCase", "CellType", "Major",
+                    sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+saveRDS(p, file.path(paths$home_git, "figures", "fig3c.rds"))
+
+### Minor immune cell types.
+p <- plot_abundance_stages(stats = edgeR_non_age, 
+          dat = cur_dat_case, 
+          cur_celltypes = c("B", "NK", "CD303_VIM", "T_DN"),
+          x = "donor_type", y = "mean_density", facet_by = "cell_type", 
+          fill_by = "donor_type", 
+          title = "")
+
+print(p)
+fn <- paste0(paste(today, "Density", "byCase", "CellType", "Minor",
+                    sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+saveRDS(p, file.path(paths$home_git, "figures", "extfig5b.rds"))
+```
+
+# A8: Immune Cluster; across disease stages
+
+## A8.1: edgeR for Clusters.
+
+Input: again all Immune Clusters + other Cell types to get correct fractions.
+Output: Cell types of interest: only Myeloid, T-CD4, T-CD8 clusters.
+
+- Prepare data.
+
+```{r edge-r-clusters}
+case_join2 <- case_joint_all |>
+  tidyr::drop_na()  |> 
+  mutate(donor_type = stringr::str_remove(donor_type, "\\+")) |> 
+  inner_join(case_stages, by = c("case_id", "donor_type"))  |> 
+  left_join(cases_full, by = c("case_id"))
+
+edge <- case_join2 |> 
+  dplyr::filter(!immune_cluster %in% c("Myeloid", "Neutrophil", "T_CD4", "T_CD8", "NK")) |> 
+  dplyr::select(c(case_id, immune_cluster, CellsPerCase)) |>
+  tidyr::pivot_wider(id_cols = immune_cluster,
+                     names_from = case_id, values_from = CellsPerCase) |>
+  as.data.frame()
+
+rownames(edge) <- edge$immune_cluster
+edge$immune_cluster <- NULL
+edge <- as.matrix(edge)
+
+coldata <- unique(case_join2[, c("donor_type", "case_id", "age_group", "ICU_time_days")])
+coldata$ICU_time_days <- log1p(coldata$ICU_time_days)
+coldata$donor_type = factor(coldata$donor_type, levels = c("NoDiabetes", "sAAb", "mAAb", "RecentOnset", "LongDuration"))
+coldata$age_group = factor(coldata$age_group, levels = c("young", "older"))
+```
+
+Create DGEList (main object) + Filter Cell types + Create Design Matrix.
+Removes T-CD4-12, T-CD4-9, T-CD8-5 (which do not exist) and T-regs.
+```{r edge-design-matrix-clusters}
+# Create DGEList (main object)
+y_ab <- edgeR::DGEList(edge, samples = coldata)
+y_ab
+
+# remove very rare cell types.
+keep <- edgeR::filterByExpr(y_ab, group = y_ab$samples$donor_type,
+                            min.count = 5, min.total.count = 10)
+y_ab <- y_ab[keep, ]
+summary(keep)
+print(keep[!keep])
+# Create design matrix
+y_ab$samples$ICU_time_days[is.na(y_ab$samples$ICU_time_days)] <-
+  mean(y_ab$samples$ICU_time_days, na.rm = TRUE)
+design <- model.matrix(~donor_type + age_group + ICU_time_days, y_ab$samples)
+```
+
+Estimate NB-dispersion.
+```{r estimate-dispersion-clusters}
+y_ab <- edgeR::estimateDisp(y_ab, design, trend = "none")
+summary(y_ab$common.dispersion)
+plotBCV(y_ab, cex=1)
+```
+
+Fit the NB-model. Turn off trend. 
+```{r fit-ql-model-clusters}
+fit_ab <- edgeR::glmQLFit(y_ab, design, robust = TRUE, abundance.trend = TRUE, legacy = FALSE)
+
+summary(fit_ab$var.prior)
+summary(fit_ab$df.prior)
+edgeR::plotQLDisp(fit_ab, cex = 1)
+```
+
+## A8.2: Run Tests between ND and distinct biological groups.
+
+Run Tests between ND and distinct biological groups.
+```{r test-diff-abundance}
+my_contrasts <- limma::makeContrasts(
+  NoDiabetes_sAAb = -donor_typesAAb,
+  NoDiabetes_mAAb = -donor_typemAAb,
+  NoDiabetes_RecentOnset = -donor_typeRecentOnset,
+  NoDiabetes_LongDuration = -donor_typeLongDuration,
+  sAAb_mAAb = donor_typesAAb - donor_typemAAb,
+  mAAb_RecentOnset = donor_typemAAb - donor_typeRecentOnset,
+  RecentOnset_LongDuration = donor_typeRecentOnset - donor_typeLongDuration,
+  age_group = -age_groupolder,
+  ICU_time_days = -ICU_time_days,
+  levels = design
+)
+
+## Extract contrasts of interest. Either vs baseline; or between consecutive stages.
+qlf_list <- lapply(colnames(my_contrasts), function(cn) {
+  topTags(glmQLFTest(fit_ab, contrast = my_contrasts[, cn]), n = "all")$table |> 
+    as_tibble(rownames = "cell_type") |> 
+    mutate(contrast = cn)
+}) |> 
+  bind_rows() |> 
+  filter(grepl(("Myeloid|T_CD4|T_CD8|NK|Neutrophil|T-naive|T-EMRA"), cell_type))
+
+## Cleaning.
+edgeR_output <- qlf_list |> 
+  filter(contrast != "ICU_time_days") |>
+  tidyr::separate_wider_delim(contrast, names = c("group1", "group2"), delim = "_") |> 
+  mutate(group1 = ifelse(group1 == "sAAb", "sAAb+", 
+                         ifelse(group1 == "mAAb", "mAAb+", group1))) |> 
+  mutate(group2 = ifelse(group2 == "sAAb", "sAAb+", 
+                         ifelse(group2 == "mAAb", "mAAb+", group2)))
+```
+
+## A8.3: Plot results.
+
+```{r myeloid-subtypes}
+library(ggpubr); library(rstatix)
+
+edgeR_non_age <- edgeR_output |> filter(group1 != "age")
+input_df <- case_join2 |> mutate(donor_type = ifelse(donor_type == "sAAb", "sAAb+", 
+                         ifelse(donor_type == "mAAb", "mAAb+", donor_type)))
+
+### Myeloid subtypes
+p <- plot_abundance_stages(stats = edgeR_non_age, 
+          dat = input_df, 
+          ct_type = "cluster",
+          cur_celltypes = c("Myeloid_1", "Myeloid_2", "Myeloid_3", "Myeloid_4",
+                             "Myeloid_5", "Myeloid_6", "Myeloid_7", "Myeloid_8"),
+          x = "donor_type", y = "mean_density", facet_by = "cell_type", 
+          fill_by = "donor_type", 
+          title = "")
+print(p)
+fn <- paste0(paste(today, "Density", "byCase", "Cluster", "Myeloid", 
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+### NK-cell subtypes
+p <- plot_abundance_stages(stats = edgeR_non_age, 
+          dat = input_df, 
+          ct_type = "cluster",
+            cur_celltypes = c("NK_1", "NK_2", "NK_3"),
+          x = "donor_type", y = "mean_density", facet_by = "cell_type", 
+          fill_by = "donor_type", 
+          title = "")
+
+fn <- paste0(paste(today, "Density", "byCase", "Cluster", "NK", 
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+### T-CD4 subtypes
+p <- plot_abundance_stages(stats = edgeR_non_age,
+          dat = input_df, 
+          ct_type = "cluster",
+          cur_celltypes = c("T_CD4_1", "T_CD4_2", "T_CD4_3", "T_CD4_4",
+                             "T_CD4_5", "T_CD4_6", "T_CD4_7", "T_CD4_8", 
+                             "T_CD4_9", "T_CD4_10"),
+          x = "donor_type", y = "mean_density", facet_by = "cell_type", 
+          fill_by = "donor_type", 
+          title = "")
+fn <- paste0(paste(today, "Density", "byCase", "Cluster", "T_CD4", 
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+### T-CD8 subtypes
+p <- plot_abundance_stages(stats = edgeR_non_age,
+          dat = input_df, 
+          ct_type = "cluster",
+          cur_celltypes = c("T_CD8_1", "T_CD8_2", "T_CD8_3", "T_CD8_4",
+                             "T-naive", "T-EMRA", "T_CD8_6", "T_CD8_7"),
+          x = "donor_type", y = "mean_density", facet_by = "cell_type",
+          fill_by = "donor_type",
+          title = "")
+fn <- paste0(paste(today, "Density", "byCase", "Cluster", "T_CD8", 
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+
+# A9: ICIs CellTypes.
+
+## A9.1: Prepare Data.
+
+```{r prepare-edgeR}
+library(edgeR)
+## Use ICIs only.
+icis <- image_compo_ct_all |> filter(cell_type == "Beta") |> filter(density > 0) |> pull(image_id)
+
+ici_all <- image_compo_ct_all |> 
+  filter(image_id %in% icis) |> 
+  group_by(donor_type, case_id, cell_type) |>
+  summarize(CellNb = sum(CellNb), image_area = sum(image_area), .groups = "keep") |>
+  mutate(density = CellNb / image_area) |> 
+  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages)) |>
+  mutate(case_id = factor(case_id, levels = metadata(spe)$cases)) |> 
+  filter(donor_type != "LongDuration")
+
+df_input <- ici_all |> 
+  dplyr::ungroup() |> 
+  inner_join(case_stages, by = c("case_id")) |> 
+  left_join(cases_full, by = c("case_id"))
+
+df_input <- df_input |> dplyr::rename("donor_type" = donor_type.y)
+```
+
+## A9.2: Define edgeR input
+```{r edgeR-input}
+# COUNT MATRIX.
+edge <- df_input |>
+  dplyr::select(c(case_id, cell_type, CellNb)) |>
+  tidyr::pivot_wider(id_cols = cell_type,
+                     names_from = case_id, values_from = CellNb) |>
+  as.data.frame()
+
+rownames(edge) <- edge$cell_type
+edge$cell_type <- NULL
+edge <- as.matrix(edge)
+
+# GROUP INFORMATION
+coldata <- unique(df_input[, c("donor_type", "case_id", "age_group", "ICU_time_days")])
+coldata$ICU_time_days <- log1p(coldata$ICU_time_days)
+coldata$donor_type = factor(coldata$donor_type, levels = c("NoDiabetes", "sAAb", "mAAb", "RecentOnset"))
+coldata$age_group = factor(coldata$age_group, levels = c("young", "older"))
+```
+
+Filter Cell types + Create Design Matrix.
+```{r edge-design-matrix}
+# Create DGEList (main object)
+y_ab <- edgeR::DGEList(edge, samples = coldata)
+y_ab
+
+# Filter cell types. Add group information (donor-type).
+keep <- edgeR::filterByExpr(y_ab, group = y_ab$samples$donor_type)
+y_ab <- y_ab[keep, ]
+summary(keep)
+
+# Create design matrix. Adjust now for age.
+y_ab$samples$ICU_time_days[is.na(y_ab$samples$ICU_time_days)] <-
+  mean(y_ab$samples$ICU_time_days, na.rm = TRUE)
+design <- model.matrix(~ donor_type + age_group + ICU_time_days, y_ab$samples)
+```
+
+Estimate NB-dispersion. Common-dispersion.
+```{r estimate-dispersion}
+# y_ab <- edgeR::estimateDisp(y_ab, design, trend = "none")
+y_ab <- edgeR::estimateDisp(y_ab, design)
+
+summary(y_ab$common.dispersion)
+edgeR::plotBCV(y_ab, cex=1)
+```
+
+Fit the NB-model. 
+```{r fit-ql-model}
+fit_ab <- edgeR::glmQLFit(y_ab, design, robust = TRUE, abundance.trend = TRUE, legacy = FALSE)
+summary(fit_ab$var.prior)
+summary(fit_ab$df.prior)
+edgeR::plotQLDisp(fit_ab, cex = 1)
+```
+
+## A9.3: Run edgeR tests and extract contrast of interest.
+
+Run Tests between ND and distinct biological groups.
+```{r test-diff-abundance}
+my_contrasts <- limma::makeContrasts(
+  NoDiabetes_sAAb = -donor_typesAAb,
+  NoDiabetes_mAAb = -donor_typemAAb,
+  NoDiabetes_RecentOnset = -donor_typeRecentOnset,
+  sAAb_mAAb = donor_typesAAb - donor_typemAAb,
+  mAAb_RecentOnset = donor_typemAAb - donor_typeRecentOnset,
+  age_group = -age_groupolder,
+  ICU_time_days = -ICU_time_days,
+  levels = design
+)
+
+## Extract contrasts of itnerest. Either vs baseline; or between consecutive stages.
+qlf_list <- lapply(colnames(my_contrasts), function(cn) {
+  topTags(glmQLFTest(fit_ab, contrast = my_contrasts[, cn]), n = "all")$table |> 
+    as_tibble(rownames = "cell_type") |> 
+    mutate(contrast = cn)
+}) |> 
+  bind_rows() |> 
+  # select Immune-cell types only!
+  filter(cell_type %in% c("T_CD8", "T_CD4", "Myeloid", "Neutrophil", 
+                          "T_DN", "B", "NK", "CD303_VIM"))
+
+## Clearning.
+edgeR_output <- qlf_list |> 
+  filter(contrast != "ICU_time_days") |>
+  tidyr::separate_wider_delim(contrast, names = c("group1", "group2"), delim = "_") |> 
+  mutate(group1 = ifelse(group1 == "sAAb", "sAAb+", 
+                         ifelse(group1 == "mAAb", "mAAb+", group1))) |> 
+  mutate(group2 = ifelse(group2 == "sAAb", "sAAb+", 
+                         ifelse(group2 == "mAAb", "mAAb+", group2)))
+```
+
+## A9.4: Plot results.
+```{r ici-celltypes}
+library(ggpubr); library(rstatix)
+edgeR_non_age <- edgeR_output |> filter(group1 != "age") |> 
+  mutate(group1 = factor(group1, levels = metadata(spe)$stages[1:4])) |> 
+  mutate(group2 = factor(group2, levels = metadata(spe)$stages[1:4]))
+
+plot_df <- df_input |> 
+  mutate(donor_type = ifelse(donor_type == "sAAb", "sAAb+", 
+                         ifelse(donor_type == "mAAb", "mAAb+", donor_type))) |> 
+  dplyr::rename("mean_density" = density) |> 
+  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages[1:4]))
+
+### Major immune cell types.
+p <- plot_abundance_stages(stats = edgeR_non_age,
+          dat = plot_df, 
+          cur_celltypes = c("Myeloid", "Neutrophil", "T_CD4", "T_CD8"),
+          x = "donor_type", y = "mean_density", facet_by = "cell_type", 
+          fill_by = "donor_type", ct_type = "cell_type",
+          title = "") + 
+  facet_wrap(~cell_type, scales = "free_y", axes = "all") + 
+  scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"), 
+                   labels = c("Control", "sAAb+", "mAAb+", "Onset")) +
+    scale_fill_manual(name = "Stage", 
+                     values = palettes$stages[1:4], 
+                     breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"),
+                    labels = c("Control", "sAAb+", "mAAb+", "Onset")) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 0.5, vjust = 0.5)) + 
+  theme(panel.spacing = unit(1, "cm"))
+    
+print(p)
+fn <- paste0(paste(today, "Density", "byCase", "CellType", "Major", "ICI",
+                    sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+### Minor immune cell types.
+p <- plot_abundance_stages(stats = edgeR_non_age,
+          dat = plot_df, 
+          cur_celltypes = c("B", "NK", "CD303_VIM", "T_DN"),
+          x = "donor_type", y = "mean_density", facet_by = "cell_type", 
+          fill_by = "donor_type",
+        title = "")
+print(p)
+fn <- paste0(paste(today, "Density", "byCase", "CellType", "Minor", "ICI",
+                    sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+
+## A9.5: AGE!
+
+```{r ici-age}
+edgeR_age <- edgeR_output |> 
+  filter(group1 == "age")
+
+# get max-y-value PER cell type.
+cur_celltypes <- c("Myeloid", "T_CD4", "T_CD8", "Neutrophil", "B", "NK", "CD303_VIM", "T_DN")
+p_vals <- edgeR_age
+```
+
+
+```{r}
+# Violin-Plot of AGE-association.
+df <- plot_df |> 
+  filter(cell_type %in% cur_celltypes) |> 
+  mutate(age_groups2 = ifelse(age_group == "young", "< 13", ">= 13")) |> 
+  mutate(mean_density = log1p(mean_density)) |> 
+  mutate(age_groups2 = factor(age_groups2, levels = c("< 13", ">= 13")))
+
+p_vals <- df |> 
+  group_by(cell_type) |> 
+  summarise(max = max(mean_density), .groups = "drop") |>
+  dplyr::right_join(p_vals, by = c("cell_type")) |> 
+  mutate(.y. = "mean_density",
+          group1 = "< 13", group2 = ">= 13",
+          p = PValue,
+          p.adj = FDR,
+           p.signif = cut(p.adj, breaks = c(-Inf, 0.001, 0.01, 0.05, 0.1, Inf), labels = c("***", "**", "*", "•", ""))
+          )
+
+cur_formula2 <- formula(paste("mean_density ~ age_groups2"))
+stat.test <- df |> 
+  group_by(cell_type) |> 
+  t_test(cur_formula2, ref.group = "< 13") |> 
+  add_xy_position(x = "age_groups2", step.increase = 0.07)
+stat.test
+
+# Combine formatting + P-value dataframe.
+stat.test.test <- p_vals |> 
+    left_join(stat.test, by = c("cell_type", ".y.", "group1", "group2"))
+
+stat.test.test
+
+p <- ggviolin(df, x = "age_groups2", y = "mean_density", fill = "age_groups2",
+          facet.by = "cell_type",
+          draw_quantiles = c(0.25, 0.5, 0.75), palette = NULL) + 
+    geom_jitter(width = 0.2, size = 5, alpha = 0.8, aes(color = donor_type)) +
+    stat_pvalue_manual(stat.test.test, label = "p.signif", tip.length = 0.1,
+                      size = 10, label.size = 10) + 
+    facet_wrap(~cell_type, scales = "free_y") +
+    scale_fill_manual("Age Groups", values = palettes$colors50[c(9, 12)])  + 
+    scale_color_manual("Donor Type",
+                     values = palettes$stages) +
+    labs(x = "Age Groups (years)", y = "log1p: Cell density (cells / mm^2)") + 
+    mytheme$large_new() + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+    guides(fill = "none")
+
+print(p)
+fn <- paste0(paste(today, "CellTypes", "Age", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+extfig5c <- p
+saveRDS(extfig5c, file.path(paths$home_git, "figures", "extfig5c.rds"))
+```
+
+# A10: ICI Clusters.
+
+## A10.1: edgeR for Clusters.
+```{r edge-r-clusters-ici}
+ici_all <- joint_all |> 
+  filter(image_id %in% icis) |> 
+  group_by(donor_type, case_id, immune_cluster) |> 
+  summarize(CellsPerCase = sum(CellNb), image_area = sum(image_area), .groups = "keep") |> 
+  mutate(density = CellsPerCase / image_area) |> 
+  filter(donor_type != "LongDuration") |> 
+  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages[1:4])) |> 
+  ungroup()
+
+case_join2 <- ici_all |>
+  mutate(donor_type = stringr::str_remove(donor_type, "\\+")) |> 
+  inner_join(case_stages, by = c("case_id", "donor_type")) |> 
+  left_join(cases_full, by = c("case_id"))
+```
+
+```{r edge-r-clusters}
+edge <- case_join2 |> 
+  dplyr::filter(!immune_cluster %in% c("Myeloid", "Neutrophil", "T_CD4", "T_CD8", "NK")) |> 
+  dplyr::select(c(case_id, immune_cluster, CellsPerCase)) |>
+  tidyr::pivot_wider(id_cols = immune_cluster,
+                     names_from = case_id, values_from = CellsPerCase) |>
+  as.data.frame()
+
+rownames(edge) <- edge$immune_cluster
+edge$immune_cluster <- NULL
+edge <- as.matrix(edge)
+
+coldata <- unique(case_join2[, c("donor_type", "case_id", "age_group", "ICU_time_days")])
+coldata$ICU_time_days <- log1p(coldata$ICU_time_days)
+coldata$donor_type = factor(coldata$donor_type, levels = c("NoDiabetes", "sAAb", "mAAb", "RecentOnset"))
+coldata$age_group = factor(coldata$age_group, levels = c("young", "older"))
+```
+
+Create DGEList (main object) + Filter Cell types + Create Design Matrix.
+Removes T-CD4-12, T-CD4-9, T-CD8-5 (which do not exist) and T-regs.
+```{r edge-design-matrix-clusters}
+# Create DGEList (main object)
+y_ab <- edgeR::DGEList(edge, samples = coldata)
+y_ab
+
+# remove very rare cell types.
+keep <- edgeR::filterByExpr(y_ab, group = y_ab$samples$donor_type,
+                            min.count = 5, min.total.count = 10)
+y_ab <- y_ab[keep, ]
+summary(keep)
+print(keep[!keep])
+# Create design matrix
+y_ab$samples$ICU_time_days[is.na(y_ab$samples$ICU_time_days)] <-
+  mean(y_ab$samples$ICU_time_days, na.rm = TRUE)
+design <- model.matrix(~donor_type + age_group + ICU_time_days, y_ab$samples)
+```
+
+Estimate NB-dispersion.
+```{r estimate-dispersion-clusters}
+y_ab <- edgeR::estimateDisp(y_ab, design, trend = "none")
+summary(y_ab$common.dispersion)
+plotBCV(y_ab, cex=1)
+```
+
+Fit the NB-model. Turn off trend. 
+```{r fit-ql-model-clusters}
+fit_ab <- edgeR::glmQLFit(y_ab, design, robust = TRUE, abundance.trend = TRUE, legacy = FALSE)
+
+summary(fit_ab$var.prior)
+summary(fit_ab$df.prior)
+edgeR::plotQLDisp(fit_ab, cex = 1)
+```
+
+## A10.2: Run Tests between disease stages.
+
+Run Tests between disease stages. 
+```{r test-diff-abundance}
+my_contrasts <- limma::makeContrasts(
+  NoDiabetes_sAAb = -donor_typesAAb,
+  NoDiabetes_mAAb = -donor_typemAAb,
+  NoDiabetes_RecentOnset = -donor_typeRecentOnset,
+  sAAb_mAAb = donor_typesAAb - donor_typemAAb,
+  mAAb_RecentOnset = donor_typemAAb - donor_typeRecentOnset,
+  age_group = -age_groupolder,
+  ICU_time_days = -ICU_time_days,
+  levels = design
+)
+
+## Extract contrasts of interest. Either vs baseline; or between consecutive stages.
+qlf_list <- lapply(colnames(my_contrasts), function(cn) {
+  topTags(glmQLFTest(fit_ab, contrast = my_contrasts[, cn]), n = "all")$table |> 
+    as_tibble(rownames = "cell_type") |> 
+    mutate(contrast = cn)
+}) |> 
+  bind_rows() |> 
+  filter(grepl(("Myeloid|T_CD4|T_CD8|NK|Neutrophil|T-naive|T-EMRA"), cell_type))
+
+## Cleaning.
+edgeR_output <- qlf_list |> 
+  filter(contrast != "ICU_time_days") |>
+  tidyr::separate_wider_delim(contrast, names = c("group1", "group2"), delim = "_") |> 
+  mutate(group1 = ifelse(group1 == "sAAb", "sAAb+", 
+                         ifelse(group1 == "mAAb", "mAAb+", group1))) |> 
+  mutate(group2 = ifelse(group2 == "sAAb", "sAAb+", 
+                         ifelse(group2 == "mAAb", "mAAb+", group2)))
+```
+
+## A10.3: Plot results.
+```{r ici-clusters-plot}
+edgeR_non_age <- edgeR_output |> filter(group1 != "age")
+input_df <- case_join2 |> mutate(donor_type = ifelse(donor_type == "sAAb", "sAAb+", 
+                         ifelse(donor_type == "mAAb", "mAAb+", donor_type))) |> 
+                  mutate(mean_density = density) |> 
+                  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages[1:4]))
+
+### Myeloid subtypes
+p <- plot_abundance_stages(stats = edgeR_non_age, 
+          dat = input_df, 
+          ct_type = "cluster",
+          cur_celltypes = c("Myeloid_1", "Myeloid_2", "Myeloid_3", "Myeloid_4",
+                             "Myeloid_5", "Myeloid_6", "Myeloid_7", "Myeloid_8"),
+          x = "donor_type", y = "mean_density", facet_by = "cell_type", 
+          fill_by = "donor_type", 
+          title = "") + 
+  facet_wrap(~cell_type, labeller = as_labeller(myeloid_labels), scales = "free_y", axes = "all") + 
+  scale_x_discrete(breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"), 
+                   labels = c("Control", "sAAb+", "mAAb+", "Onset")) +
+    scale_fill_manual(name = "Stage", 
+                     values = palettes$stages[1:4], 
+                     breaks = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"),
+                    labels = c("Control", "sAAb+", "mAAb+", "Onset")) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 0.5, vjust = 0.5)) + 
+  theme(panel.spacing = unit(1, "cm"))
+
+print(p)
+fn <- paste0(paste(today, "Density", "byCase", "Cluster", "Myeloid", "ICI",
+                   sep = "_"), ".png")
+plotsave_param_large2 <- plotsave_param_large
+plotsave_param_large2$height <- 600
+do.call(ggsave, c(list(fn, p), plotsave_param_large2))
+
+### NK-cell subtypes
+p <- plot_abundance_stages(stats = edgeR_non_age, 
+          dat = input_df, 
+          ct_type = "cluster",
+            cur_celltypes = c("NK_1", "NK_2", "NK_3"),
+          x = "donor_type", y = "mean_density", facet_by = "cell_type", 
+          fill_by = "donor_type", 
+          title = "") + 
+          mytheme$standard_new()
+print(p)
+fn <- paste0(paste(today, "Density", "byCase", "Cluster", "NK", "ICI",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+### T-CD4 subtypes
+p <- plot_abundance_stages(stats = edgeR_non_age,
+      dat = input_df |> filter(!immune_cluster %in% c("T_CD4_Other")), 
+      ct_type = "cluster",
+      cur_celltypes = c("T_CD4_1", "T_CD4_2", "T_CD4_3", "T_CD4_4",
+                        "T_CD4_5", "T_CD4_6", "T_CD4_7", "T_CD4_8", 
+                        "T_CD4_9", "T_CD4_10"),
+      x = "donor_type", y = "mean_density", facet_by = "cell_type", 
+      fill_by = "donor_type", 
+      title = "") + 
+  facet_wrap(~cell_type, labeller = as_labeller(tcd4_labels3), scales = "free_y", axes = "all") + 
+  mytheme$standard_new()
+print(p)
+fn <- paste0(paste(today, "Density", "byCase", "Cluster", "T_CD4", "ICI",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+### T-CD8 subtypes
+p <- plot_abundance_stages(stats = edgeR_non_age,
+          dat = input_df, 
+          ct_type = "cluster",
+          cur_celltypes = c("T_CD8_1", "T_CD8_2", "T_CD8_3", "T_CD8_4",
+                             "T-naive", "T-EMRA", "T_CD8_6", "T_CD8_7"),
+          x = "donor_type", y = "mean_density", facet_by = "cell_type",
+          fill_by = "donor_type",
+          title = "") + mytheme$standard_new()
+
+fn <- paste0(paste(today, "Density", "byCase", "Cluster", "T_CD8", "ICI",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+### Neutrophil subtypes.
+p <- plot_abundance_stages(stats = edgeR_non_age,
+          dat = input_df, 
+          ct_type = "cluster",
+          cur_celltypes = c("Neutrophil_1", "Neutrophil_2", "Neutrophil_3", "Neutrophil_4"),
+          x = "donor_type", y = "mean_density", facet_by = "cell_type",
+          fill_by = "donor_type",
+          title = "") + mytheme$standard_new()
+fn <- paste0(paste(today, "Density", "byCase", "Cluster", "Neutrophil", "ICI",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+
+
+**Myeloid-cells**
+
+Plot Myeloid-3 and Myeloid-4 jointly. Main Figure on Figure 5.
+```{r}
+library(patchwork)
+edgeR_na <- edgeR_non_age |> 
+  mutate(cell_type = recode(cell_type, !!!myeloid_labels))
+
+input_df_x <- input_df  |> 
+  mutate(immune_cluster = recode(immune_cluster, !!!myeloid_labels))
+
+p <- plot_abundance_stages(stats = edgeR_na |> mutate(cell_type = factor(cell_type, levels = c("M1/M2-like act.", "cDC"))),
+          dat = input_df_x |> mutate(immune_cluster = factor(immune_cluster, levels = c("M1/M2-like act.", "cDC"))),
+          ct_type = "cluster",
+          cur_celltypes = c("M1/M2-like act.", "cDC"),
+          x = "donor_type", y = "mean_density", facet_by = "cell_type",
+          fill_by = "donor_type", nrow = 2,
+          title = "")  + 
+          mytheme$standard_new()
+print(p)
+fn <- paste0(paste(today, "Density", "byCase", "Cluster", "Myeloid_3_4", "Vertical",
+                    sep = "_"), ".png")
+plotsave_param2 <- plotsave_param
+plotsave_param2$height <- 400
+do.call(ggsave, c(list(fn, p), plotsave_param2))
+
+fig5d <- p
+saveRDS(fig5d, file.path(paths$home_git, "figures", "fig5d.rds"))
+```
+
+Myeloid-Cells: Plot all besides 3 and 4.
+```{r myeloid-states}
+p <- plot_abundance_stages(stats = edgeR_na  |> 
+    mutate(cell_type = factor(cell_type, levels = myeloid_labels[c(1, 2, 5, 6, 7, 8)])),
+          dat = input_df_x  |> mutate(immune_cluster = factor(immune_cluster, levels = myeloid_labels[c(1, 2, 5, 6, 7, 8)])),
+          ct_type = "cluster",
+          cur_celltypes = myeloid_labels[c(1, 2, 5, 6, 7, 8)],
+          x = "donor_type", y = "mean_density", facet_by = "cell_type",
+          fill_by = "donor_type", nrow = 2,
+          title = "") + 
+          mytheme$large_new()
+print(p)
+fn <- paste0(paste(today, "Density", "byCase", "Cluster", "Myeloid_1_2_5_6_7_8",
+                    sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+# EDIT NAMES!
+extfig8a <- p
+saveRDS(extfig8a, file.path(paths$home_git, "figures", "extfig8a.rds"))
+```
+
+**T-CD4-cells**
+Plot T-CD4-5
+```{r t-cd4-5-differential-abundance}
+edgeR_na <- edgeR_non_age |> 
+  mutate(cell_type = recode(cell_type, !!!tcd4_labels))
+
+input_df_x <- input_df  |> 
+  mutate(immune_cluster = recode(immune_cluster, !!!tcd4_labels))
+
+p <- plot_abundance_stages(stats = edgeR_na,
+          dat = input_df_x, 
+          ct_type = "cluster",
+          cur_celltypes = tcd4_labels["T_CD4_5"],
+          x = "donor_type", y = "mean_density", facet_by = "cell_type",
+          fill_by = "donor_type", nrow = 1, step.increase = 0.07,
+          title = "") + mytheme$standard_new()
+
+fn <- paste0(paste(today, "Density", "byCase", "Cluster", "TCD4_5_v2",
+                    sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+fig4e <- p
+saveRDS(fig4e, file.path(paths$home_git, "figures", "fig4e.rds"))
+```
+
+
+Plot T-CD4-1, 2, 3, 4, 6, 7, 8, 9, 10
+```{r differential-abundance-tcd4-states}
+edgeR_na <- edgeR_non_age |> 
+  mutate(cell_type = recode(cell_type, !!!tcd4_labels))
+
+input_df_x <- input_df  |> 
+  mutate(immune_cluster = recode(immune_cluster, !!!tcd4_labels))
+
+p <- plot_abundance_stages(stats = edgeR_na,
+          dat = input_df_x,
+          ct_type = "cluster",
+          cur_celltypes = tcd4_labels[c(1,2,3,4,6,7,8,9,10)],
+          x = "donor_type", 
+          y = "mean_density", 
+          facet_by = "cell_type",
+          fill_by = "donor_type", 
+          nrow = 3, 
+          parse_labels = FALSE,  
+          step.increase = 0.15,
+          title = "") + mytheme$large_new()
+print(p)
+fn <- paste0(paste(today, "Density", "byCase", "Cluster", "TCD4_1_2_3_4_6_7_8_9_10",
+                    sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+# Edit names:
+extfig6a <- p
+saveRDS(extfig6a, file.path(paths$home_git, "figures", "extfig6a.rds"))
+```
+
+Plot T-CD8-1, 3, 4, 6, 7, 8, 
+```{r tcd8-states-da}
+edgeR_na <- edgeR_non_age |> 
+  mutate(cell_type = recode(cell_type, !!!tcd8_labels))
+input_df_x <- input_df  |>
+  mutate(immune_cluster = recode(immune_cluster, !!!tcd8_labels))
+
+p <- plot_abundance_stages(stats = edgeR_na,
+          dat = input_df_x,
+          ct_type = "cluster",
+          cur_celltypes = tcd8_labels[c(1,2, 3, 4, 5, 6, 8)],
+          x = "donor_type", 
+          y = "mean_density", 
+          facet_by = "cell_type",
+          fill_by = "donor_type", 
+          nrow = 3, 
+          parse_labels = FALSE,  
+          step.increase = 0.15,
+          title = "") + mytheme$large_new()
+
+fn <- paste0(paste(today, "Density", "byCase", "Cluster", "TCD8_1_2_3_naive_6_emra",
+                    sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+# EDIT NAMES.
+extfig6b <- p
+saveRDS(extfig6b, file.path(paths$home_git, "figures", "extfig6b.rds"))
+```
+
+Plot T-CD8-7.
+
+```{r t-cd8-7-differential-abundance}
+p <- plot_abundance_stages(stats = edgeR_non_age,
+          dat = input_df,
+          ct_type = "cluster",
+          cur_celltypes = c("T_CD8_7"),
+          x = "donor_type", y = "mean_density", facet_by = "cell_type",
+          fill_by = "donor_type",
+          title = "") + mytheme$standard_new()
+
+p1 <- p + facet_wrap(~ cell_type, labeller = as_labeller(c("T_CD8_7" = 
+  "PD1+,CD27+")), scales = "free_y")
+
+fn <- paste0(paste(today, "Density", "byCase", "Cluster", "TCD8_7_v2",
+                    sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p1), plotsave_param))
+
+## 
+fig4f <- p1
+saveRDS(fig4f, file.path(paths$home_git, "figures", "fig4f.rds"))
+```
+
+
+## A10.5: Association with AGE.
+
+### 10.5.1: Prepare data.
+```{r ici-age}
+edgeR_age <- edgeR_output |> filter(group1 == "age")
+
+# get max-y-value PER cell type.
+cur_celltypes <- unique(edgeR_age$cell_type)
+cur_celltypes <- cur_celltypes[!grepl("NK|Neutrophil", cur_celltypes)]
+
+plot_df <- case_join2 |> 
+  mutate(donor_type = ifelse(donor_type == "sAAb", "sAAb+", 
+                         ifelse(donor_type == "mAAb", "mAAb+", donor_type))) |> 
+  dplyr::rename("mean_density" = density) |> 
+  mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages[1:4]))
+
+p_vals <- edgeR_age
+```
+
+### 10.5.2: Formatting for Barplot.
+```{r}
+df <- plot_df |> 
+  dplyr::rename("cell_type" = immune_cluster) |>
+  filter(cell_type %in% cur_celltypes) |> 
+  mutate(age_groups2 = ifelse(age_group == "young", "< 13", ">= 13")) |> 
+  mutate(age_groups2 = factor(age_groups2, levels = c("< 13", ">= 13")))
+
+p_vals <- p_vals |> 
+  filter(cell_type %in% cur_celltypes) |>
+  mutate(.y. = "mean_density",
+          group1 = "< 13", group2 = ">= 13",
+          p = PValue,
+          p.adj = FDR,
+           p.signif = cut(p.adj, breaks = c(-Inf, 0.001, 0.01, 0.05, 0.1, Inf), labels = c("***", "**", "*", "•", ""))
+          )
+```
+
+### 10.5.3: Barplot of significances.
+
+```{r}
+## Barplot overview.
+p <- p_vals |>
+  mutate(estimate = ifelse(logFC > 0, ">= 13 years", "< 13 years")) |>
+  mutate(significance = ifelse(p.adj < 0.05, "signif", "non_signif")) |>
+  filter(p.adj < 0.1) |> 
+  ggplot(aes(x = reorder(cell_type, -log10(p.adj)), y = -log10(p.adj), fill = estimate)) +
+  geom_bar(stat = "identity") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  labs(title = paste("Differential abundance"),
+        x = "Cell Type",
+        y = "-log10(P-value)") +
+  mytheme$large() +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45)) + 
+  theme(legend.position = "none")
+
+print(p)
+fn <- paste0(paste(today, "Density", "byCase", "Cluster", "Age", "Stages",
+                    sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+extfig10a <- p 
+saveRDS(extfig10a, file.path(paths$home_git, "figures", "extfig10a.rds"))
+```
+
+
+```{r}
+## Determine which cell clusters or cell clusters are AGE, STAGE, AGE+STAGE
+age_stage <- edgeR_output |> 
+  mutate(contrast = paste(group1, group2, sep = "_")) |> 
+  select(cell_type, contrast, FDR) |> 
+  pivot_wider(names_from = contrast, values_from = FDR) |> 
+  mutate(AGE = ifelse(age_group < 0.1, TRUE, FALSE)) |> 
+  mutate(STAGE = ifelse(`NoDiabetes_sAAb+` < 0.1 | 
+                        `NoDiabetes_mAAb+` < 0.1 |
+                        `NoDiabetes_RecentOnset` < 0.1 |
+                        `sAAb+_mAAb+` < 0.1 |
+                        `mAAb+_RecentOnset` < 0.1, TRUE, FALSE))
+
+not_age_stage <- age_stage |> 
+  filter(STAGE == FALSE & AGE == FALSE)
+not_age_stage
+
+age_only <- age_stage |> 
+  filter(STAGE == FALSE & AGE == TRUE)
+age_only
+
+stage_only <- age_stage |> 
+  filter(STAGE == TRUE & AGE == FALSE)
+stage_only
+
+age_stage_both <- age_stage |> 
+  filter(STAGE == TRUE & AGE == TRUE) |> arrange(age_group)
+age_stage_both
+
+not_ins_relevant <- c(not_age_stage |> pull(cell_type), age_only |> pull(cell_type))
+
+## These are saved for script 19.
+saveRDS(not_ins_relevant[not_ins_relevant != "Myeloid_4"], file.path(paths$folder_script, "not_ins_relevant_clusters.rds"))
+```
+
+Age-ONLY: NK-1 + Myeloid-4
+For Myeloid-4 we have shown that it shows islet attraction and plays role in motifs.
+-> Just hard to detect.
+
+Neither Age + Stage; multiple non-activated clusters (e.g. Myeloid-1).
+
+### A10.6: LMM ALL STAGES: Boxplot for CD11c+ Macrophages, T-CD8-2 and T-CD8-7.
+
+```{r}
+# Boxplot for CD11c+ Macrophages.
+df_age_plot <- plot_df |> 
+  dplyr::rename("cell_type" = immune_cluster) |>
+  # clusters oi.
+  filter(cell_type %in% c("Myeloid_5", "T_CD8_2")) |>
+  mutate(cell_type = ifelse(cell_type == "Myeloid_5", "CD11c+ Macrophages", "CD8+ T-RM low act.")) |>
+  mutate(log_mean = log1p(mean_density)) |> 
+  mutate(age_groups2 = ifelse(age_group == "young", "< 13", ">= 13")) |> 
+  mutate(age_groups2 = factor(age_groups2, levels = c("< 13", ">= 13"))) |> 
+  mutate(mean_density = log1p(mean_density))
+
+# Already performed P-val adjustment above.
+stats <- p_vals |> 
+  filter(cell_type %in% c("Myeloid_5", "T_CD8_2")) |>
+  mutate(cell_type = ifelse(cell_type == "Myeloid_5", "CD11c+ Macrophages", "CD8+ T-RM low act.")) |>
+  select(.y., group1, group2,p, p.adj, p.signif, logFC, cell_type)
+
+# get max-y-value PER cell type.
+p_vals_max <- df_age_plot  |> 
+  group_by(cell_type) |>
+  summarise(max = max(mean_density), .groups = "drop")
+
+# Get for the layout. 
+cur_formula2 <- formula(paste("mean_density ~ age_groups2"))
+library(rstatix); library(ggpubr)
+stat.test <- df_age_plot |> 
+  group_by(cell_type) |>
+  t_test(cur_formula2, ref.group = "< 13") |> 
+  adjust_pvalue()  |> 
+  add_significance("p.adj") |> 
+  add_xy_position(x = "age_groups2", step.increase = 0.07) |> 
+  select(-c(statistic, p, p.adj))
+stat.test
+
+# Combine formatting + P-value dataframe.
+stat.test.test <- stats |> 
+    left_join(stat.test, by = c("cell_type", ".y.", "group1", "group2"))  |> 
+    left_join(p_vals_max, by = c("cell_type")) |> 
+    mutate(y.position = y.position * 1.2)
+stat.test.test
+
+p <- ggviolin(df_age_plot, x = "age_groups2", y = "mean_density", fill = "age_groups2",
+              palette = NULL, facet.by = "cell_type", 
+              draw_quantiles = c(0.25, 0.5, 0.75)) + 
+    geom_jitter(width = 0.2, size = 3, alpha = 0.8, aes(color = donor_type)) +
+    scale_fill_manual("Age Groups",
+                  values = palettes$colors50[c(9, 12)])  + 
+    scale_color_manual("Stage", values = palettes$stages[1:4]) +
+    facet_wrap(~cell_type, scales = "free_y") +
+    labs(x = "Age Groups (years)", y = "log1p: Cell Density (cells / mm^2)") + 
+    mytheme$standard_new() + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+    guides(fill = "none") + 
+  stat_pvalue_manual(stat.test.test, label = "p.signif", tip.length = 0.1,
+                  size = 10, label.size = 10)
+
+print(p)
+
+fn <- paste0(paste(today, "ImmuneCluster", "AgeAssociation", "Myeloid_5",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+fig6b <- p
+saveRDS(fig6b, file.path(paths$home_git, "figures", "fig6b.rds"))
+```
+
+#-----------------------------------------------------------
+
+# A13: Cell-Clusters - PERI_ISLET.
+
+## A13.1: Cell-Counts peri-islet islet region.
+
+Get Cell-Counts JUST within + immediate surrounding the Islet-mask ~ - 20 µm radius.
+
+```{r spe_isl}
+spe_isl <- spe[, spe$distance_to_islet >= -20 & spe$donor_type != "Pancreatitis"]
+
+# ICIs only.
+spe_isl <- spe_isl[, spe_isl$image_id %in% icis]
+print(spe_isl)
+gc()
+```
+
+### A13.1.2: Islet-level cell type composition.
+
+```{r islet-level}
+celltypes2 <- c("Beta", "Alpha", "Delta", # Islet
+                "Ductal", "Acinar", # Exocrine.
+                "Endothelial", "Mesenchymal", "SmoothMuscle", "Nerves", # Stroma.
+                "Neutrophil", "T_CD4", "T_CD8", "B", "NK", "Myeloid", "CD303_VIM", "T_DN", # Immune.
+                "Other", "IsletOther", "Ambiguous") # Other.
+
+# Number of cells per islet
+total_cells_all <- tibble::as_tibble(colData(spe_isl)) |>
+  dplyr::add_count(image_id, name = "CellsPerIslet") |>
+  dplyr::select(c("image_id", "CellsPerIslet")) |>
+  dplyr::distinct()
+
+# Number of cells of each cell type
+image_compo_all <- as_tibble(colData(spe_isl)) |>
+  filter(cell_type %in% celltypes2) |>
+  dplyr::group_by(image_id, cell_type) |>
+  dplyr::count(name = "CellNb") |>
+  dplyr::ungroup() |>
+  tidyr::complete(image_id, cell_type,
+                  fill = list(CellNb = 0)) 
+
+# Merge both datasets and calculate the fraction of each cell type per islet
+image_compo_all <- image_compo_all |>
+  dplyr::inner_join(total_cells_all, by = "image_id") |>
+  dplyr::filter(CellsPerIslet > 0) |>
+  dplyr::mutate(fraction = CellNb / CellsPerIslet)
+
+image_compo_all <- as_tibble(colData(spe_isl)) |> 
+  filter(cell_type %in% celltypes2) |>
+  dplyr::select(all_of(cn_keep)) |>
+  dplyr::distinct() |>
+  dplyr::inner_join(image_compo_all, by = "image_id") |>
+  dplyr::mutate(cell_type = factor(cell_type, levels = celltypes2),
+                image_id = factor(image_id, levels = image_ids)) |>
+  dplyr::arrange(image_id, cell_type)
+
+# Reorder the dataset by beta-cell fraction
+image_compo_wide_all <- image_compo_all |>
+  tidyr::pivot_wider(id_cols = image_id,
+                     values_from = c(CellNb, fraction),
+                     names_from = c(cell_type))
+
+ordcols2 <- c(paste0("fraction_", celltypes2))
+image_compo_all <- image_compo_wide_all |>
+  dplyr::select(all_of(c("image_id", ordcols2))) |>
+  dplyr::inner_join(image_compo_all, by = "image_id") |>
+  dplyr::arrange(fraction_Beta) |>
+  # dplyr::select(-all_of(ordcols)) |>
+  dplyr::mutate(ord = seq_len(nrow(image_compo_all))) |> 
+  dplyr::rename(case_id = "Donor", donor_type = "Stage") |> 
+  dplyr::mutate(cell_type = factor(cell_type, levels = celltypes2),
+                case_id = factor(case_id, levels = metadata(spe)$cases),
+                donor_type = factor(donor_type, levels = metadata(spe)$stages))
+```
+
+```{r case-all2}
+case_compo_all_islet <- image_compo_all |>
+  dplyr::group_by(donor_type, case_id, cell_type) |> 
+  dplyr::summarize(across(c(CellNb, CellsPerIslet), sum)) |>
+  dplyr::rename(CellsPerCase = "CellsPerIslet") |>
+  dplyr::mutate(fraction = CellNb / CellsPerCase) |>
+  dplyr::arrange(donor_type, case_id, cell_type)
+```
+
+```{r remove-pancreatitis2}
+remove_pancreatitis <- TRUE
+if (remove_pancreatitis) {
+  case_compo_all_islet <- case_compo_all_islet |> dplyr::filter(donor_type != "Pancreatitis")
+}
+```
+
+### A13.1.2: Islet-level cell CLUSTER composition.
+
+Cell Cluster!
+```{r edgeR-cluster-islet1}
+# Number of cells per islet
+spe_isl$immune_cluster <- ifelse(spe_isl$cell_cluster_scaled == "0", spe_isl$cell_type, spe_isl$cell_cluster_scaled)
+immune_cl <- unique(spe_isl$immune_cluster)
+image_ids <- unique(spe_isl$image_id)
+
+total_cells_all <- tibble::as_tibble(colData(spe_isl)) |>
+  dplyr::add_count(image_id, name = "CellsPerIslet") |>
+  dplyr::select(c("image_id", "CellsPerIslet")) |>
+  dplyr::distinct()
+
+# Number of cells of each cell type
+image_compo_all_cl <- as_tibble(colData(spe_isl)) |>
+  filter(immune_cluster %in% immune_cl) |>
+  dplyr::group_by(image_id, immune_cluster) |>
+  dplyr::count(name = "CellNb") |>
+  dplyr::ungroup() |>
+  tidyr::complete(image_id, immune_cluster,
+                  fill = list(CellNb = 0)) 
+
+# Merge both datasets and calculate the fraction of each cell type per islet
+image_compo_all_cl <- image_compo_all_cl |>
+  dplyr::inner_join(total_cells_all, by = "image_id") |>
+  dplyr::filter(CellsPerIslet > 0) |>
+  dplyr::mutate(fraction = CellNb / CellsPerIslet)
+
+# Add Meta-data
+image_compo_all_cl <- as_tibble(colData(spe_isl)) |> 
+  filter(immune_cluster%in% immune_cl) |>
+  dplyr::select(all_of(cn_keep)) |>
+  dplyr::distinct() |>
+  dplyr::inner_join(image_compo_all_cl, by = "image_id") |>
+  dplyr::mutate(image_id = factor(image_id, levels = image_ids)) |>
+  dplyr::arrange(image_id, immune_cluster)
+
+# Reorder the dataset by beta-cell fraction
+image_compo_wide_all_cl <- image_compo_all_cl |>
+  tidyr::pivot_wider(id_cols = image_id,
+                     values_from = c(CellNb, fraction),
+                     names_from = c(immune_cluster))
+
+ordcols2 <- c(paste0("fraction_", immune_cl))
+image_compo_all_cl <- image_compo_wide_all_cl |>
+  dplyr::select(all_of(c("image_id", ordcols2))) |>
+  dplyr::inner_join(image_compo_all_cl, by = "image_id") |>
+  dplyr::arrange(fraction_Beta) |>
+  # dplyr::select(-all_of(ordcols)) |>
+  dplyr::mutate(ord = seq_len(nrow(image_compo_all_cl))) |> 
+  dplyr::rename(case_id = "Donor", donor_type = "Stage") |> 
+  dplyr::mutate(case_id = factor(case_id, levels = metadata(spe_isl)$cases),
+                donor_type = factor(donor_type, levels = metadata(spe_isl)$stages))
+```
+
+```{r case-all3}
+case_compo_all_cl_islet <- image_compo_all_cl |>
+  dplyr::group_by(donor_type, case_id, immune_cluster) |> 
+  dplyr::summarize(across(c(CellNb, CellsPerIslet), sum)) |>
+  dplyr::rename(CellsPerCase = "CellsPerIslet") |>
+  dplyr::mutate(fraction = CellNb / CellsPerCase) |>
+  dplyr::arrange(donor_type, case_id, immune_cluster)
+```
+
+### A13.1.3: Get Insulitic Islet Information.
+```{r}
+## Get Ins. Islets
+fn <- file.path(paths$folder_out, "13_MarkerExpression_cells_Immune", "insulitic_images.rds")
+
+if (file.exists(fn)) {
+  image_ids <- readRDS(fn)
+  image_compo_all_cl <- image_compo_all_cl |> 
+    mutate(insulitic = if_else(image_id %in% image_ids, "insulitis", "non-insulitis"))
+}
+```
+
+### A13.1.4: Input for age-association of immune clusters.
+
+```{r}
+cur_dat_cl <- image_compo_all_cl |>
+  select(-starts_with("fraction_")) |> 
+  # factor to character
+  left_join(temp_dur, by = c("case_id", "donor_type")) |>
+  ungroup() |> 
+  # remove _1, _2, _10, 
+  mutate(cell_type = stringr::str_remove(immune_cluster, pattern = "_[0-9]+$")) |> 
+  mutate(cell_type = ifelse(cell_type %in% c("`T-naive`","`T-EMRA`"), "T_CD8", cell_type))
+
+## Age and immune cluster.
+df_age <- cur_dat_cl |> 
+  mutate(age_groups2 = ifelse(age < 13, "young", "high")) |>
+  mutate(age_groups2 = factor(age_groups2, levels = c("high", "young"))) |> 
+  mutate(immune_cluster = ifelse(immune_cluster %in% c("B_1", "B_2"), "B", immune_cluster)) |>
+  dplyr::filter(stringr::str_detect(immune_cluster, pattern = "(^Myeloid|^T|^B)")) |> 
+  dplyr::filter(!immune_cluster %in% c("T_DN_1", "T_DN_2", "CD303_VIM_1", "CD303_VIM_2", "Lympho_Other", "T_CD4_Other", "Myeloid_Other")) |> 
+  group_by(image_id, donor_type, case_id, insulitic, age, cell_type,  
+           age_groups2, immune_cluster, diabetes_duration) |>
+  summarize(mean_density = mean(CellNb, , na.rm = TRUE), 
+            fraction = mean(fraction, na.rm = TRUE), 
+            CellNb = sum(CellNb), .groups = "drop")
+```
+
+
+## A13.2: Run edgeR for immune clusters in insulitic-islets!
+
+Select only image-ids (mAAb+/RECENT-ONSET) with Insulitis.
+The contrast here is **between age-groups**!
+
+edgeR: CellNb(insulitic) ~ age_group
+
+Aim is to detect differential immune-compositions between age-groups in insulitic islets!
+-> We identified B-cells/T-Naive 
+
+```{r}
+# Select only donors with at least 1 insulitic islet and < 1 y since onset.
+case_ids <-  cur_dat_cl |> 
+  filter(donor_type == "mAAb+" | donor_type == "RecentOnset" & diabetes_duration < 1) |>
+  filter(insulitic == "insulitis") |> 
+  distinct(case_id) |> 
+  pull(case_id)
+
+## Select image-ids with insulitis only.
+insulitic_df <- cur_dat_cl |> 
+  filter(case_id %in% case_ids, insulitic == "insulitis") |> 
+  mutate(age_group2 = ifelse(age < 13, "younger", "older")) |>
+  mutate(age_group2 = factor(age_group2, levels = c("younger", "older"))) |>
+  mutate(immune_cluster = ifelse(immune_cluster %in% c("B_1", "B_2"), "B", immune_cluster)) |>
+  group_by(case_id, donor_type, CellsPerIslet, immune_cluster, age_group2) |>
+  summarize(CellNb = sum(CellNb), .groups = "drop")
+
+insulitic_df
+```
+
+### A13.2.1: Prepare edgeR input for insulitic islets.
+  ```{r}
+## Aggregate by Case-ID!
+case_compo_all_islet <- insulitic_df |>
+  dplyr::group_by(donor_type, case_id, immune_cluster, age_group2) |> 
+  dplyr::summarize(across(c(CellNb, CellsPerIslet), sum)) |>
+  ungroup() |>
+  dplyr::rename(CellsPerCase = "CellsPerIslet") |>
+  dplyr::mutate(fraction = CellNb / CellsPerCase) |>
+  dplyr::arrange(donor_type, case_id, immune_cluster) |> 
+  dplyr::left_join(cases_full, by = "case_id")
+
+edge <- case_compo_all_islet |>
+  dplyr::ungroup() |>
+  dplyr::select(c(case_id, immune_cluster, CellNb, age_group2)) |>
+  tidyr::pivot_wider(id_cols = immune_cluster,
+                     names_from = case_id, values_from = CellNb) |>
+  as.data.frame()
+
+rownames(edge) <- edge$immune_cluster
+edge$immune_cluster <- NULL
+edge <- as.matrix(edge)
+
+# coldata <- unique(case_compo_all_islet[, c("donor_type", "case_id")])
+coldata <- unique(case_compo_all_islet[, c("age_group2", "case_id", "ICU_time_days")]) |> as.data.frame()
+coldata$ICU_time_days <- log1p(coldata$ICU_time_days)
+coldata$age_group = factor(coldata$age_group2, levels = c("younger", "older"))
+```
+
+Filter Cell types + Create Design Matrix.
+```{r edge-design-matrix-islet}
+# Create DGEList (main object)
+y_ab <- edgeR::DGEList(edge, samples = coldata)
+y_ab
+
+# Filter cell types.  Remove NK, B, T-DN and CD303-VIM. Too rare in islets.
+keep <- edgeR::filterByExpr(y_ab, group = y_ab$samples$age_group2)
+keep["Myeloid_4"] <- TRUE
+y_ab <- y_ab[keep, ]
+summary(keep)
+keep[!keep]
+
+# Create design matrix
+y_ab$samples$ICU_time_days[is.na(y_ab$samples$ICU_time_days)] <- mean(y_ab$samples$ICU_time_days, na.rm = TRUE)
+design <- model.matrix(~age_group2 + ICU_time_days, y_ab$samples)
+```
+
+Estimate NB-dispersion.
+```{r estimate-dispersion-islet}
+y_ab <- edgeR::estimateDisp(y_ab, design)
+summary(y_ab$common.dispersion)
+plotBCV(y_ab, cex=1)
+```
+
+Fit the NB-model. 
+
+```{r fit-ql-model-islet}
+fit_ab <- edgeR::glmQLFit(y_ab, design, robust = TRUE, abundance.trend = TRUE, legacy = FALSE)
+summary(fit_ab$var.prior)
+summary(fit_ab$df.prior)
+plotQLDisp(fit_ab, cex = 1)
+```
+
+### A13.2.2: Run edgeR tests and extract contrast of interest.
+```{r}
+my_contrasts <- limma::makeContrasts(
+  age_group = -`age_group2older`,
+  ICU_time_days = -ICU_time_days,
+  levels = design
+)
+
+## Extract contrasts of interest. Either vs baseline; or between consecutive stages.
+qlf_list <- lapply(colnames(my_contrasts), function(cn) {
+  topTags(glmQLFTest(fit_ab, contrast = my_contrasts[, cn]), n = "all")$table |> 
+    as_tibble(rownames = "cell_type") |> 
+    mutate(contrast = cn)
+}) |> 
+  bind_rows() |> 
+  filter(grepl(("Myeloid|T_CD4|T_CD8|NK|Neutrophil|T-naive|T-EMRA|B"), cell_type))
+
+full_results <- tibble::as_tibble(edgeR::glmQLFTest(fit_ab)$table, rownames = "immune_cluster")
+
+p_vals <- qlf_list |> 
+  filter(cell_type %in% 
+    c("Myeloid_3", "Myeloid_4", "Myeloid_5", "T-naive", 
+      "T_CD8_7", "T_CD8_2", "B", "T_CD4_5"), contrast == "age_group") |> 
+  mutate(p.adj = FDR)
+```
+
+## A13.3: Plot results.
+```{r}
+# Peri-insulitic images. B/T_CD4 ratio.
+p <- df_age |> 
+  select(-c(fraction))   |> 
+  #mutate(peri_insulitic = ifelse(image_id %in% peri_insulitic, "peri-insulitis", "non-peri-insulitis")) |>
+  filter(insulitic == "insulitis") |> 
+  # filter(donor_type %in% c("RecentOnset")) |>
+  filter(donor_type %in% c("RecentOnset", "mAAb+")) |>
+  pivot_wider(id_cols = c(image_id, donor_type, case_id, insulitic, age, age_groups2), 
+                names_from = immune_cluster, values_from = CellNb) |>
+  #group_by(case_id, age, age_groups, donor_type) |>
+  # summarize(across(where(is.numeric), ~ mean(.x)), .groups = "drop") |>
+  mutate(T_CD4 = T_CD4_1 + T_CD4_2 + T_CD4_3 + T_CD4_4 + T_CD4_5 + T_CD4_6 + T_CD4_7 + T_CD4_8 + T_CD4_9 + T_CD4_10) |>
+  mutate(frac = B / T_CD4) |>
+  filter(T_CD4 > 0) |>
+#   pivot_longer(cols = c(B, T_CD4, T_CD8_1), names_to = "cell_type", values_to = "CellNb") |>
+  ggplot(aes(x = age, y = frac, color = age_groups2)) +
+  geom_point() + 
+  geom_hline(yintercept = 1, linetype = "dashed") + 
+  scale_y_log10() + 
+  ylab("B / T_CD4 ratio") + 
+  mytheme$standard_new()
+
+fn <- paste(today, "B_TCD4_ratio", "byCase", "Insulitis", "ICI.png", sep = "_")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+
+```{r}
+subtypes_oi <- c("T-naive", "B", 
+                "Myeloid_3", "T_CD8_7", 
+                "Myeloid_5","T_CD8_2", 
+                 "Myeloid_4", "T_CD4_5")
+
+# By Case-ID:
+tt <- df_age |> 
+  select(-c(fraction))   |> 
+  filter(insulitic == "insulitis") |>
+  mutate(age_groups2 = ifelse(age < 13, "< 13", ">= 13")) |>
+  mutate(age_groups2 = factor(age_groups2, levels = c("< 13", ">= 13"))) |>
+  # filter(donor_type %in% c("RecentOnset")) |>
+  filter(donor_type %in% c("mAAb+", "RecentOnset")) |>
+  filter(donor_type == "mAAb+" | diabetes_duration < 1) |>
+  filter(immune_cluster %in% subtypes_oi) |> 
+  mutate(immune_cluster = factor(immune_cluster, levels = subtypes_oi)) |> 
+  group_by(case_id, age, age_groups2, donor_type, 
+           immune_cluster, insulitic) |>
+  summarize(across(where(is.numeric), ~ mean(.x)), .groups = "drop") |> 
+  mutate(CellNb = log1p(CellNb))
+
+tt
+# Already performed P-val adjusted above.
+stats <- p_vals |> 
+  mutate(.y. = "CellNb",
+          immune_cluster = cell_type,
+          group1 = "< 13", group2 = ">= 13",
+           p.signif = cut(p.adj, breaks = c(-Inf, 0.001, 0.01, 0.05, 0.1, Inf), labels = c("***", "**", "*", "•", ""))
+          ) |> 
+  select(.y., group1, group2,
+          p.adj, p.signif, immune_cluster)
+
+# get max-y-value PER cell type.
+p_vals_max <- tt  |> 
+  group_by(immune_cluster) |>
+  summarise(max = max(CellNb), .groups = "drop")
+
+# Get for the layout. 
+cur_formula2 <- formula(paste("CellNb ~ age_groups2"))
+library(rstatix); library(ggpubr)
+stat.test <- tt |> 
+  group_by(immune_cluster) |>
+  t_test(cur_formula2, ref.group = "< 13") |> 
+  add_xy_position(x = "age_groups2", step.increase = 0.07)
+stat.test
+
+# Combine formatting + P-value dataframe.
+stat.test.test <- stats |> 
+    left_join(stat.test, by = c("immune_cluster", ".y.", "group1", "group2"))  |> 
+    left_join(p_vals_max, by = c("immune_cluster")) |>
+    mutate(y.position = max*1.5) |> 
+    mutate(immune_cluster = factor(immune_cluster, levels = subtypes_oi))
+
+stat.test.test
+
+# mAAb+ and RecentOnset (< 1 year duration)
+p <- ggpubr::ggviolin(tt, x = "age_groups2", y = "CellNb", fill = "age_groups2",
+                  palette = palettes$stages, facet.by = "immune_cluster",
+                  draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_jitter(width = 0.2, size = 8, alpha = 0.8, 
+              aes(color = donor_type)) +
+  scale_fill_manual("Age Groups", values = palettes$colors50[c(9, 12)])  + 
+  scale_color_manual("Stage", values = palettes$stages, 
+                      breaks = c("mAAb+", "RecentOnset"),
+                      labels = c("mAAb+", "Onset")) +
+  facet_wrap(~immune_cluster, scales = "free_y", axes = "all") +
+  labs(x = "Age Groups (years)", y = "log1p: CellNb") + 
+  mytheme$large_new() + 
+  stat_pvalue_manual(stat.test.test, label = "p.signif", tip.length = 0.2,
+                    size = 20, label.size = 10) +  # Format as 0.1, 1, 10, ...
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  guides(fill = "none") + 
+  geom_hline(yintercept = 1, linetype = "dashed") + 
+  # extend y-axis a bit.
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1)))
+
+print(p)
+fn <- paste0(paste(today, "Density", "byCase", "CellType", "T_CD8", "B", "T_CD4", "Myeloid", "T_CD8_7", "T_CD8_2", "T-naive",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+fig6f <- p
+saveRDS(fig6f, file.path(paths$home_git, "figures", "fig6f.rds"))
+```

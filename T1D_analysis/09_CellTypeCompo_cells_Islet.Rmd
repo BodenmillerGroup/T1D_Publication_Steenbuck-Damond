@@ -1,0 +1,1517 @@
+---
+title: "09_CellTypeCompo_cells_Islet"
+author: "Nicolas Damond, Nathan Steenbuck"
+date: "Created: 24 May, 2022; Compiled: `r format(Sys.time(), '%d %b, %Y')`"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+if (rstudioapi::isAvailable()) {
+  script_name <- basename(rstudioapi::getSourceEditorContext()$path)
+} else {
+  script_name <- knitr::current_input()
+}
+
+cur_user <- Sys.info()[["user"]]
+script_name <- "09_CellTypeCompos_cells_Islet.Rmd"
+
+if (cur_user == "ubuntu") {
+  source(file.path("/", "mnt", "central_nas", "projects", 
+    "type1_diabetes", "nathan", "T1D_Vol", "T1D_analysis", 
+    "analysis", "helpers.R"))
+  #n_cores <- future::availableCores() - 1
+  n_cores <- 4
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  knitr::opts_knit$set(root_dir = paths$home_data)
+  do_print <- FALSE
+} else {
+  source(file.path("/", "home", "nsteen", "scripts", "T1D_analysis", "analysis", "helpers.R"))
+  n_cores <- 8
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  paths$folder_script <- paths$cluster_folder_script
+  paths$folder_in <- paths$cluster_folder_in
+  paths$folder_out <- paths$cluster_home 
+  knitr::opts_knit$set(root_dir = paths$cluster_home)
+  do_print <- TRUE
+}
+
+seed <- 123456
+set.seed(seed)
+options <- furrr::furrr_options(seed = seed)
+paths$prev <- paste("08_SubclusteringBeta", paths$object_type, paths$panel_type, sep = "_")
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# **Goal**
+
+Measure differences in islet cell type composition across cases and stages.
+
+
+# **Settings**  
+
+## Load packages
+
+```{r packages, results='hide'}
+suppressPackageStartupMessages(c(
+  library(dplyr),
+  library(tidyr),
+  library(data.table),
+  library(SpatialExperiment),
+  library(ggplot2),
+  library(ggpubr),
+  library(scuttle),
+  library(RSpectra)
+))
+```
+
+## Paths and settings
+
+```{r settings}
+# Paths
+if (!dir.exists(paths$folder_script)) dir.create(paths$folder_script)
+plotsave_param$path <- paths$folder_script
+plotsave_param_large$path <- paths$folder_script
+
+# Misc settings
+today <- gsub("-", "", Sys.Date())
+```
+
+##  Read in the data
+
+Load the SpatialExperiment (SPE) object saved at the previous step.
+
+```{r load-data}
+fn_spe <- file.path(paths$folder_out, paths$prev, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+spe <- readRDS(fn_spe)
+print(spe)
+```
+
+## Subset islet cells.
+```{r spe_isl}
+spe_isl <- spe[, spe$cell_category == "islet"]
+print(spe_isl)
+```
+
+## Heatmap Expression Islets
+
+```{r palette-celltypes}
+ct <- c("beta", "alpha", "gamma", "delta", "epsilon")
+names(ct) <- c("Beta", "Alpha", "Gamma", "Delta", "Epsilon")
+palette_ct <- c(palettes$colors[1:(length(ct))])
+names(palette_ct) <- names(ct)
+
+cur_dimred <- "UMAP"
+cur_assay <- c("scaled")
+names(cur_assay) <- c("scaled")
+```
+
+UMAP of only Islet-mask cells.
+```{r reduced-dimensions}
+cur_dat <- scuttle::makePerCellDF(
+  spe[, colnames(spe) %in% metadata(spe)[["subset_islet"]]],
+  use_dimred = TRUE) |>
+  dplyr::mutate(case_id = factor(case_id, levels = metadata(spe)$cases),
+                donor_type = factor(donor_type, levels = metadata(spe)$stages),
+                cell_type = factor(cell_type, levels = names(ct))) |>
+  dplyr::arrange(cell_type, cell_type, case_id, donor_type)
+
+## Plot reduced dimensions
+dimred_name <- paste(cur_dimred, cur_assay, sep = "_")
+    
+p <- plot_dim_red(cur_dat, dimred_name, "cell_type",
+                  sample = TRUE, size = 0.1, alpha = 1,
+                  palette = palette_ct)
+if (do_print) { 
+print(p)
+}
+    
+fn <- paste0(paste(today, "CellType", "Consensus", dimred_name,
+                sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+UMAP of all cells. 
+
+
+```{r palette$celltypes2}
+palettes$celltype <- c(
+  Alpha = palettes$colors[1], Beta = palettes$colors[2],
+  Delta = palettes$colors[3], Gamma = palettes$colors[4],
+  Epsilon = palettes$colors[5], Other = palettes$colors[6],
+  Acinar = palettes$colors[7], Ductal = palettes$colors[8],
+  Endothelial = palettes$colors[9], Mesenchymal = palettes$colors[10],
+  Tcell = palettes$colors[11],
+  Macrophage = palettes$colors[12])
+```
+
+
+Fig1d: UMAP cells.
+```{r reduced-dimensions2}
+cur_dimred <- "UMAP"; cur_assay <- "scaled"
+ct <- names(palettes$celltype)
+cur_dat <- scuttle::makePerCellDF(
+  spe[, colnames(spe) %in% metadata(spe)[["subset"]]],
+  use_dimred = TRUE) |>
+  dplyr::mutate(case_id = factor(case_id, levels = metadata(spe)$cases),
+                donor_type = factor(donor_type, levels = metadata(spe)$stages)) |>
+  dplyr::arrange(cell_type, case_id, donor_type) |> 
+  dplyr::filter(cell_type %in% ct)
+
+cur_dat <- cur_dat |> 
+  dplyr::mutate(cell_type = factor(cell_type, levels = ct))
+
+## Plot reduced dimensions
+dimred_name <- paste(cur_dimred, cur_assay, sep = "_")
+
+p <- plot_dim_red(cur_dat, dimred_name, "cell_type",
+                  sample = TRUE, size = 0.1, alpha = 1, 
+                  palette = palettes$celltype) + 
+                  labs(x = "", y = "", title = "") + 
+  theme(
+    legend.title = element_text(size = 25),  # Adjust the legend title font size
+    legend.text = element_text(size = 22)    # Adjust the legend text font size
+  ) + 
+  guides(color = guide_legend(title = "Cell Type"))
+
+
+if (do_print) { 
+  print(p)
+}
+    
+fn <- paste0(paste(today, "CellType", "Consensus_full", dimred_name,
+                sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+This is Figure 1D.
+```{r fig1d-save}
+fig1d <- p
+saveRDS(fig1d, file.path(paths$home_git, "figures", "fig1d.rds"))
+```
+
+
+## Heatmap
+
+This is Ext Fig 3A.
+```{r consensus-heatmap}
+## Define Assay & Clustering.
+name_cur_assay <- "scaled"
+clust_name <- paste("CellType", cur_assay, sep = "_")
+
+## Define Channels.
+channels_non_islet <- c("HBP", "KRT19", "C3", "CD9", "CFTR", "CAV1", "VIM", "CD3", "CD163", "AMY")
+channels_islets <- c("CHGA", "SYP", "ECad", "NKX2_2", "FoxA2", "PAX6")
+beta <- c("INS", "ProINS", "Cpep", "IAPP", "PCSK1", "PDX1", "NKX6_1")
+alpha <- c("GCG", "ProGCG", "PCSK2", "ARX")
+delta <- c("SST", "PCSK1", "PCSK2", "PDX1")
+others <- c("PPY", "GHRL")
+channels <- unique(c(channels_non_islet, channels_islets, beta, alpha, delta, others))
+all_channels <- rownames(spe)
+all_channels <- all_channels[!all_channels %in% c("DNA1", "DNA3", "Ki67", "H3")]
+
+# Plot Reduced Heatmap.
+## Summarize to heatmap.
+hm <- summarize_heatmap(spe[, !spe$cell_type %in% c("Ambiguous", "IsletLike")],
+                        expr_values = name_cur_assay,
+                        cluster_by = "cell_type",
+                        channels = channels)
+
+# 
+ct_anno <- as.data.frame(table(spe$cell_type)) |> filter(!Var1 %in% c("IsletLike", "Ambiguous"))
+rownames(ct_anno) <- ct_anno$Var1
+# sort as in the heatmap
+ct_anno <- ct_anno[rownames(hm), ]
+cell_type_counts <- ct_anno$Freq
+names(cell_type_counts) <- ct_anno$Var1
+
+breaks <- c(0, 0.5, 0.7, 1)  # Define custom breaks for the color scale
+colors <- viridis::viridis(4) 
+# Create a color function with more emphasis on the higher values
+col_fun <- circlize::colorRamp2(breaks, colors)
+
+# Create row annotation for cell type counts
+row_anno <- ComplexHeatmap::rowAnnotation(
+  "Cell Counts" = ComplexHeatmap::anno_barplot(cell_type_counts, 
+                         gp = grid::gpar(fill = "skyblue", col = "black"),
+                         border = TRUE,
+                         width = grid::unit(4, "cm"),
+      axis_param = list(gp = grid::gpar(fontsize = 25)),
+),       
+  show_annotation_name = TRUE,
+  annotation_name_gp = grid::gpar(fontsize = 30),
+  annotation_name_side = "top",
+  annotation_name_rot = 0,
+  annotation_name_offset = unit(c(0.5, 0.5), "cm")
+    # Adjust title size here
+)
+
+saveRDS(cell_type_counts, file.path(paths$home_git, "figures", "extfig3a_rowanno.rds"))
+saveRDS(hm, file.path(paths$home_git, "figures", "extfig3a_ch.rds"))
+
+# Display the heatmap
+fn <- file.path(paths$folder_script, paste0(paste(today, "CellType", "Consensus", cur_assay,
+                   "Heatmap", sep = "_"), ".png"))
+# plotsave_param
+png(fn, width = 1200, height = 800)
+p <- ComplexHeatmap::Heatmap(heatmaply::normalize(hm), name = "Scaled expression", 
+                              col= col_fun,
+                              show_row_names = TRUE, show_column_names = TRUE,
+                              cluster_rows = TRUE, cluster_columns = TRUE,
+                              row_names_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"),
+                              column_names_gp = grid::gpar(fontsize = 30, fontfamily = "Arial"), 
+                              heatmap_legend_param = list(legend_direction = "horizontal",
+                                                          title_position = "topcenter",
+                                                          title_gp = grid::gpar(fontsize = 40, fontfamily = "Arial"),
+                                                          labels_gp = grid::gpar(fontsize = 40, fontfamily = "Arial")),                             
+                            row_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for rows
+                            column_dend_gp = grid::gpar(lwd = 3),  # Increase dendrogram line width for columns
+                            row_names_side = "left",
+                            row_dend_side = "right") + 
+      row_anno
+
+ComplexHeatmap::draw(p, heatmap_legend_side = "top", 
+                      padding = unit(c(12, 12, 2, 2), "mm"))  # right and bottom padding
+dev.off()
+```
+
+# **Calculate cell type composition**
+
+## Define the analysis parameters
+
+```{r parameters}
+# Define the minimum islet size (cells per islet) to consider for plotting
+minsize <- 10
+
+# List of cell types
+celltypes <- c("Beta", "Alpha", "Delta", "Gamma", "Epsilon")
+names(celltypes) <- celltypes
+print(celltypes)
+
+# Color palette for plotting
+palette_ct <- c(palettes$colors[seq_along(celltypes)])
+names(palette_ct) <- celltypes
+```
+
+
+## Variables to group by
+
+```{r grouping-variables}
+plot_variables <- c("donor_type", "case_id")
+names(plot_variables) <- c("Stage", "Donor")
+```
+
+## Add unique IDs for images
+
+One image may contain more than one islet, but currently all islets from the same image are considered as a single islet.
+FIXME: can edit this here.
+
+```{r imageIDs}
+image_ids <- unique(spe_isl$image_id)
+```
+
+## Define islet cell type composition
+
+Calculate the **number of cells per cell type and per islet**, as well as the **fraction of each cell type per islet**. 
+A new column (`ord`) is also added to be able to sort the islets by beta cell fraction (for visualization purposes).
+
+```{r celltype-composition-islet}
+# Number of cells per islet
+total_cells <- tibble::as_tibble(colData(spe_isl)) |>
+  dplyr::add_count(image_id, name = "CellsPerIslet") |>
+  dplyr::select(c("image_id", "CellsPerIslet")) |>
+  dplyr::distinct()
+
+# Number of cells of each cell type
+image_compo <- as_tibble(colData(spe_isl)) |>
+  dplyr::group_by(image_id, cell_type) |>
+  dplyr::count(name = "CellNb") |>
+  dplyr::ungroup() |>
+  tidyr::complete(image_id, cell_type,
+                  fill = list(CellNb = 0)) 
+
+# Merge both datasets and calculate the fraction of each cell type per islet
+image_compo <- image_compo |>
+  dplyr::inner_join(total_cells, by = "image_id") |>
+  dplyr::filter(CellsPerIslet > 0) |>
+  dplyr::mutate(fraction = CellNb / CellsPerIslet)
+
+# Import relevant metadata and re-order the dataset
+cn_keep <- c("image_id", plot_variables)
+
+image_compo <- as_tibble(colData(spe_isl)) |> 
+  dplyr::select(all_of(cn_keep)) |>
+  dplyr::distinct() |>
+  dplyr::inner_join(image_compo, by = "image_id") |>
+  dplyr::mutate(cell_type = factor(cell_type, levels = celltypes),
+                image_id = factor(image_id, levels = image_ids)) |>
+  dplyr::arrange(image_id, cell_type)
+
+# Reorder the dataset by beta-cell fraction
+image_compo_wide <- image_compo |>
+  tidyr::pivot_wider(id_cols = image_id,
+                     values_from = c(CellNb, fraction),
+                     names_from = c(cell_type))
+
+ordcols <- c(paste0("fraction_", celltypes))
+image_compo <- image_compo_wide |>
+  dplyr::select(all_of(c("image_id", ordcols))) |>
+  dplyr::inner_join(image_compo, by = "image_id") |>
+  dplyr::arrange(fraction_Beta) |>
+  dplyr::select(-all_of(ordcols)) |>
+  dplyr::mutate(ord = seq_len(nrow(image_compo))) |> 
+  dplyr::rename(case_id = "Donor", donor_type = "Stage") |> 
+  dplyr::mutate(cell_type = factor(cell_type, levels = celltypes),
+                case_id = factor(case_id, levels = metadata(spe)$cases),
+                donor_type = factor(donor_type, levels = metadata(spe)$stages))
+```
+
+Calculate cell type composition at the case level
+
+```{r celltype-composition-islets}
+case_compo <- image_compo |>
+  dplyr::group_by(donor_type, case_id, cell_type) |> 
+  dplyr::summarize(across(c(CellNb, CellsPerIslet), sum)) |>
+  dplyr::rename(CellsPerCase = "CellsPerIslet") |>
+  dplyr::mutate(fraction = CellNb / CellsPerCase) |>
+  dplyr::arrange(donor_type, case_id, cell_type)
+```
+
+## Add islet compo to SCE and save
+
+The islet cell type composition is added to the metadata of the SCE object.
+
+```{r add-islet-compo-spe}
+fn_spe <- file.path(paths$folder_out, paths$prev, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+
+if (is.null(metadata(spe)$islet_compo)) {
+  metadata(spe)$islet_compo <- DataFrame(image_compo_wide)
+  saveRDS(spe, fn_spe)
+}
+print(spe)
+# saveRDS(image_compo_wide, file.path(paths$folder_script, "islet_compo.rds"))
+```
+
+## All Cell Types
+
+```{r celltype-composition-all}
+celltypes2 <- c("Beta", "Alpha", "Delta", "Gamma", "Epsilon", "Ductal", "Acinar", "Endothelial", "Mesenchymal")
+
+# Number of cells per islet
+total_cells_all <- tibble::as_tibble(colData(spe)) |>
+  dplyr::add_count(image_id, name = "CellsPerIslet") |>
+  dplyr::select(c("image_id", "CellsPerIslet")) |>
+  dplyr::distinct()
+
+# Number of cells of each cell type
+image_compo_all <- as_tibble(colData(spe)) |>
+  filter(cell_type %in% celltypes2) |>
+  dplyr::group_by(image_id, cell_type) |>
+  dplyr::count(name = "CellNb") |>
+  dplyr::ungroup() |>
+  tidyr::complete(image_id, cell_type,
+                  fill = list(CellNb = 0)) 
+
+# Merge both datasets and calculate the fraction of each cell type per islet
+image_compo_all <- image_compo_all |>
+  dplyr::inner_join(total_cells_all, by = "image_id") |>
+  dplyr::filter(CellsPerIslet > 0) |>
+  dplyr::mutate(fraction = CellNb / CellsPerIslet)
+
+image_compo_all <- as_tibble(colData(spe)) |> 
+  filter(cell_type %in% celltypes2) |>
+  dplyr::select(all_of(cn_keep)) |>
+  dplyr::distinct() |>
+  dplyr::inner_join(image_compo_all, by = "image_id") |>
+  dplyr::mutate(cell_type = factor(cell_type, levels = celltypes2),
+                image_id = factor(image_id, levels = image_ids)) |>
+  dplyr::arrange(image_id, cell_type)
+
+# Reorder the dataset by beta-cell fraction
+image_compo_wide_all <- image_compo_all |>
+  tidyr::pivot_wider(id_cols = image_id,
+                     values_from = c(CellNb, fraction),
+                     names_from = c(cell_type))
+
+ordcols2 <- c(paste0("fraction_", celltypes2))
+image_compo_all <- image_compo_wide_all |>
+  dplyr::select(all_of(c("image_id", ordcols2))) |>
+  dplyr::inner_join(image_compo_all, by = "image_id") |>
+  dplyr::arrange(fraction_Beta) |>
+  dplyr::select(-all_of(ordcols)) |>
+  dplyr::mutate(ord = seq_len(nrow(image_compo_all))) |> 
+  dplyr::rename(case_id = "Donor", donor_type = "Stage") |> 
+  dplyr::mutate(cell_type = factor(cell_type, levels = celltypes2),
+                case_id = factor(case_id, levels = metadata(spe)$cases),
+                donor_type = factor(donor_type, levels = metadata(spe)$stages))
+```
+
+```{r case-all}
+case_compo_all <- image_compo_all |>
+  dplyr::group_by(donor_type, case_id, cell_type) |> 
+  dplyr::summarize(across(c(CellNb, CellsPerIslet), sum)) |>
+  dplyr::rename(CellsPerCase = "CellsPerIslet") |>
+  dplyr::mutate(fraction = CellNb / CellsPerCase) |>
+  dplyr::arrange(donor_type, case_id, cell_type)
+```
+
+
+# **Individual cell type composition**
+
+## Remove Pancreatitis
+
+```{r remove-pancreatitis}
+remove_pancreatitis <- TRUE
+if (remove_pancreatitis) {
+  image_compo <- image_compo |> dplyr::filter(donor_type != "Pancreatitis")
+  case_compo <- case_compo |> dplyr::filter(donor_type != "Pancreatitis")
+}
+```
+
+## Absolute composition
+
+```{r all-absolute}
+# All cells
+p <- image_compo |> 
+  dplyr::filter("CellsPerIslet" >= minsize) |> 
+  ggplot2::ggplot(aes(x = reorder(image_id, CellsPerIslet),
+                      y = CellNb)) +
+  ggplot2::geom_bar(stat = "identity", aes(fill = cell_type), width = 1) +
+  ggplot2::scale_fill_manual("Cell Type",
+                             labels = names(celltypes),
+                             values = palette_ct) +
+  ggplot2::labs(title = "Absolute composition - All islets",
+                x = "Individual islet sections",
+                y = "Number of cells per islet section") +
+  mytheme$standard() +
+  theme(
+    axis.title.x = element_text(margin = margin(t = -6)),
+    axis.text.x = element_blank(),
+    axis.line.x = element_blank(),
+    axis.ticks.x = element_blank(),
+  )
+if (do_print) print(p)
+fn <- paste0(paste(today, "Individual", "Absolute", "CellType", "Ungrouped",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+  
+# By stage
+p1 <- p + facet_grid(~factor(donor_type, levels = metadata(spe)$stages),
+                     scales = "free_x")
+if (do_print) print(p1)
+
+fn <- paste0(paste(today, "Individual", "Absolute", "CellType", "byStage",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p1), plotsave_param))
+
+# By case
+p2 <- p + facet_grid(~factor(case_id, levels = metadata(spe)$cases),
+                     scales = "free_x") +
+  theme(strip.text.x = element_text(angle = 90))
+if (do_print) print(p2)
+
+fn <- paste0(paste(today, "Individual", "Absolute", "CellType", "byCase",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p2), plotsave_param))
+```
+
+## Relative cell type composition
+
+```{r all-relative}
+p <- image_compo["CellsPerIslet" >= minsize, ] |>
+  ggplot(aes(x = reorder(image_id, ord),
+             y = fraction)) +
+  geom_bar(stat = "identity", aes(fill = cell_type), width = 1) +
+  scale_fill_manual("Cell Type",
+                    labels = names(celltypes),
+                    values = palette_ct) +
+  labs(title = "Relative composition - All islets",
+       x = "Individual islet sections",
+       y = "Cell type fraction") +
+  mytheme$standard() +
+  theme(
+    axis.title.x = element_text(margin = margin(t = -6)),
+    axis.text.x = element_blank(),
+    axis.line.x = element_blank(),
+    axis.ticks.x = element_blank(),
+  )
+if (do_print) print(p)
+
+fn <- paste0(paste(today, "Individual", "Relative", "CellType", "Ungrouped",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+  
+# By stage
+p1 <- p + facet_grid(~factor(donor_type, levels = metadata(spe)$stages),
+                     scales = "free_x")
+if (do_print) print(p1)
+
+fn <- paste0(paste(today, "Individual", "Relative", "CellType", "byStage",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p1), plotsave_param))
+
+# By case
+p2 <- p + facet_grid(~factor(case_id, levels = metadata(spe)$cases),
+                     scales = "free_x") +
+  theme(strip.text.x = element_text(angle = 90))
+if (do_print) print(p2)
+
+fn <- paste0(paste(today, "Individual", "Relative", "CellType", "byCase",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p2), plotsave_param))
+```
+
+
+# **Aggregated composition**
+
+## Stacked Barplot
+
+```{r stacked-barplot}
+temp <- scuttle::makePerCellDF(spe, use_dimred = FALSE) |> 
+  filter(donor_type != "Pancreatitis") |> 
+  filter(!cell_type %in% c("Ambiguous", "IsletLike")) |> 
+  dplyr::count(cell_type)
+
+palettes$celltype2 <- c(
+  Alpha = palettes$colors[1], Beta = palettes$colors[2],
+  Delta = palettes$colors[3], Gamma = palettes$colors[4],
+  Epsilon = palettes$colors[5], Other = palettes$colors[6],
+  Acinar = palettes$colors[7], Ductal = palettes$colors[8],
+  Endothelial = palettes$colors[9], Mesenchymal = palettes$colors[10],
+  Tcell = palettes$colors[11],
+  Macrophage = palettes$colors[12])
+
+# 
+p <- temp |> 
+  mutate(cell_type = factor(cell_type, levels = names(palettes$celltype2))) |>
+  ggplot(aes(x = "", y = n, fill = cell_type)) +
+  geom_bar(stat = "identity", width = 0.8) +
+  labs(x = "", y = "Cell number") +
+  mytheme$large() +
+  scale_fill_manual("Cell Type",
+                    labels = names(palettes$celltype2),
+                    values = palettes$celltype2) +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45))
+print(p)
+fn <- paste0(paste(today, "CellType", "StackedBarplot", "byStage",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+
+## Total cell number
+
+```{r aggregated-total}
+# By stage
+p <- case_compo |>
+  ggplot(aes(x = donor_type, y = CellNb, fill = cell_type)) +
+  geom_bar(stat = "identity", width = 0.8) +
+  scale_fill_manual("Cell Type",
+                    labels = names(celltypes),
+                    values = palette_ct) +
+  labs(title = "Total cell number - by stage",
+       x = "Stage",
+       y = "Cell number") +
+  mytheme$large() +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45))
+if (do_print) print(p)
+
+fn <- paste0(paste(today, "TotalCellNb", "CellType", "byStage",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# By case
+p <- case_compo |>
+  ggplot(aes(x = case_id, y = CellNb, fill = cell_type)) +
+  geom_bar(stat = "identity", width = 0.8) +
+  facet_grid(~donor_type, scales = "free", space = "free_x") +
+  scale_fill_manual("Cell Type",
+                    labels = names(celltypes),
+                    values = palette_ct) +
+  labs(title = "Total cell number - by case",
+       x = "Case", y = "Cell number") +
+  mytheme$large() +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 90))
+if (do_print) print(p)
+
+fn <- paste0(paste(today, "TotalCellNb", "CellType", "byCase",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+
+## Relative cell type composition
+
+Reverse order of cell types in `case_compo` data frame.
+
+```{r reverse-celltype-order}
+case_compo <- case_compo |>
+  dplyr::mutate(cell_type = factor(cell_type, levels = celltypes)) |>
+  dplyr::arrange(cell_type)
+```
+
+```{r aggregated-relative}
+# By stage
+p <- case_compo |>
+  ggplot(aes(x = donor_type, y = fraction, fill = as.factor(cell_type))) +
+  geom_bar(stat = "identity", width = 0.8,
+           position = position_fill()) +
+  scale_fill_manual("Cell Type",
+                    labels = names(celltypes),
+                    values = palette_ct) +
+  labs(title = "Relative composition - by stage", x = "Stage",
+       y = "Cell type fraction") +
+  mytheme$large() +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45))
+if (do_print) print(p)
+  
+fn <- paste0(paste(today, "Fraction", "CellType", "byStage", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# By case
+p <- case_compo |>
+  ggplot(aes(x = case_id, y = fraction, fill = as.factor(cell_type))) +
+  geom_bar(stat = "identity", width = 0.8,
+           position = position_fill()) +
+  facet_grid(~donor_type, scales = "free", space = "free_x") +
+  scale_fill_manual("Cell Type",
+                    labels = names(celltypes),
+                    values = palette_ct) +
+  labs(title = "Relative composition - by case",
+       x = "Stage", y = "Cell type fraction") +
+  mytheme$large() +
+  theme(axis.text.x = element_text(hjust = 1, vjust = 1, angle = 90))
+if (do_print) print(p)
+
+fn <- paste0(paste(today, "Fraction", "CellType", "byCase", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+# Stats1
+
+## Linear regression coding stages as numeric.
+```{r poly-lr}
+case_compo2 <- case_compo |>
+  filter(cell_type == "Beta" & donor_type != "Pancreatitis") |> 
+  mutate(donor_type_num = as.numeric(donor_type))
+
+lm(fraction ~ donor_type_num, data = case_compo2) |> summary()
+lm(fraction ~ poly(donor_type, degree = 2), data = case_compo2) |> summary()
+
+# Quadratic relationship has higher adjR.
+# By stage
+p <- case_compo2 |> 
+  ggplot(aes(x = donor_type_num, y = fraction)) +
+  geom_point() +
+  stat_smooth(method='lm', formula = y ~ poly(x, 2), size = 1) +
+  geom_jitter(size = 3, width = 0.2) +
+  labs(title = "Cell type fraction - by stage",
+       x = "Stage", y = "Cell type fraction") +
+  ylim(NA, 1.0) +
+  mytheme$large() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45),
+    panel.grid.major.y = element_line(colour = "grey")
+  )
+  
+if (do_print) print(p)
+fn <- paste0(paste(today, "Boxplots", "BetaCells", "byStage", sep = "_"), ".png")
+
+plotsave_param2 <- plotsave_param
+plotsave_param2$width <- 200
+do.call(ggsave, c(list(fn, p), plotsave_param2))
+```
+
+# **Cell type composition by stage/case**
+
+## Calculate cell type composition
+
+### Function
+
+**Calculate cell fraction and cell densities**. 
+
+Cell density is defined as the number of cells per mm^2. 
+
+Unlike above where areas were calculated based on image sizes, 
+here areas are calculated by summing the area of all the cells in the selected groups and clusters. 
+This because the selected groups and cluster usually represent image subsets.
+
+Below, the `calc_compo` function is used. It returns the following results:  
+
+* **Fraction**:  
+  + *One grouping variable*: out of all the cells in the defined Cluster (`clust`), 
+     what is the fraction of cells that belong to each group (`group1`) ?  
+  + *Two grouping variables*: out of all the cells in the defined Cluster (`clust`), 
+     what is the fraction of cells that belong to each subgroup (`group1` X `group2`) ?  
+
+* **Density**:
+  + *One grouping variable*: In the area defined by `group1`, 
+  what is the number of cells in the defined Cluster (`clust`) ? 
+    The result is expressed in number of cells per mm^2.  
+  + *Two grouping variables*: In the area defined by `group1` X `group2`, 
+    what is the number of cells in the defined Cluster (`clust`) ? 
+    The result is expressed in number of cells per mm^2.  
+
+* The ordering vectors (`orderclust`, `order1` and `order2`) are only used to order the data frame. 
+Clusters/groups that are not in the ordering vectors are not returned.  
+
+### Calculations
+
+```{r composition-calculate}
+# By stage
+compo_celltype_stage <- calc_compo(spe_isl, "cell_type", rev(celltypes),
+                                   "donor_type", metadata(spe)$stages)
+
+# By donor
+compo_celltype_donor <- calc_compo(spe_isl, "cell_type", rev(celltypes),
+                                   "case_id",  metadata(spe)$cases)
+```
+
+## Plot composition by stage/case
+
+### Vertical
+
+```{r composition-plot-vertical}
+# Cell type Number x Stage
+p <- compo_celltype_stage |>
+  ggplot(aes(x = Cluster, y = CellNb, fill = as.factor(Group1))) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = palettes$stages) +
+  labs(x = "Cell type", y = "Cell number", fill = "Stage") +
+  mytheme$large()
+if (do_print) print(p)
+fn <- paste0(paste(today, "Compo", "Vertical", "Number", "cell_type", "byStage",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# Cell type Fraction x Stage
+p <- compo_celltype_stage |>
+  ggplot(aes(x = Cluster, y = fraction, fill = as.factor(Group1))) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = palettes$stages) +
+  labs(x = "Cell type", y = "Cell type fraction", fill = "Stage") +
+  mytheme$large()
+if (do_print) print(p)
+fn <- paste0(paste(today, "Compo", "Vertical", "Fraction", "cell_type", "byStage",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# Cell type Number x Case
+p <- compo_celltype_donor |>
+  ggplot(aes(x = Cluster, y = CellNb, fill = as.factor(Group1))) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = palettes$cases) +
+  labs(x = "Cell type", y = "Cell number", fill = "Case") +
+  mytheme$large()
+if (do_print) print(p)
+fn <- paste0(paste(today, "Compo", "Vertical", "Number", "CellType", "byCase",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+# Cell type Fraction x Case
+p <- compo_celltype_donor |>
+  ggplot(aes(x = Cluster, y = fraction, fill = as.factor(Group1))) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = palettes$cases) +
+  labs(x = "Cell type", y = "Cell type fraction", fill = "Case") +
+  mytheme$large()
+if (do_print) print(p)
+fn <- paste0(paste(today, "Compo", "Vertical", "Fraction", "CellType", "byCase",
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+
+### Horizontal
+
+```{r composition-plot-horizontal}
+# By stage
+compo_celltype_stage <- calc_compo(spe_isl, "cell_type", celltypes,
+                                   "donor_type", metadata(spe)$stages)
+p <- compo_celltype_stage |>
+  ggplot(aes(y = Cluster, x = fraction, fill = as.factor(Group1))) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = palettes$stages) +
+  labs(y = "Cell type", x = "Cell type fraction", fill = "Stage") +
+  mytheme$large()
+if (do_print) print(p)
+fn <- paste0(paste(today, "Compo", "Horizontal", "Fraction", "CellType",
+                   "byStage",  sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# By case
+compo_celltype_donor2 <- as_tibble(colData(spe_isl))[, plot_variables] |>
+  distinct() |>
+  rename(case_id = "Group1") |>
+  mutate(Group1 = as.factor(Group1)) |>
+  inner_join(compo_celltype_donor, by = "Group1") |>
+  mutate(Cluster = factor(Cluster, levels = celltypes),
+         Group1 = factor(Group1, levels = metadata(spe)$cases),
+         donor_type = factor(donor_type, levels = metadata(spe)$stages)) |>
+  arrange(Cluster, Group1, donor_type)
+
+p <- compo_celltype_donor2 |>
+  ggplot(aes(y = Cluster, x = fraction, fill = as.factor(Group1))) +
+  geom_bar(stat = "identity", aes(color = as.factor(donor_type)), size = 2) +
+  scale_fill_manual(values = palettes$cases) +
+  scale_color_manual(values = palettes$stages) +
+  labs(x = "Cell type fraction", y = "Cell type",
+       fill = "Case", color = "Stage") +
+  mytheme$large()
+if (do_print) print(p)
+fn <- paste0(paste(today, "Compo", "Horizontal", "Fraction", "CellType",
+                   "byCase",  sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+```
+
+```{r test-islet-fractions}
+islet_fractions <- case_compo |> 
+  ungroup() |> 
+  group_by(donor_type, case_id) |> 
+  mutate(total = sum(CellNb)) |>
+  ungroup() |>
+  mutate(fraction = CellNb / total) |> 
+  group_by(donor_type, cell_type) |> 
+  summarize(mean = mean(fraction), sd = sd(fraction), n = n(), cv = sd/mean, .groups = "drop")
+
+islet_fractions |> filter(cell_type == "Beta")  |> print(n = "all")
+```
+# **Differential abundance testing**
+
+```{r packages2, results='hide'}
+suppressPackageStartupMessages(c(
+  library(edgeR),
+  library(miloR),
+  library(diffcyt)
+))
+```
+
+## Stats at ISLET-Level 
+
+Use mixed-effect models. Tested e.g. diffcyt and glmmTMB. Used edgeR in the end.
+
+```{r write-case-compo23}
+case_compo2 <- case_compo[case_compo$donor_type != "Pancreatitis", ]
+case_compo3 <- case_compo_all[case_compo_all$donor_type != "Pancreatitis", ]
+```
+
+## edgeR
+
+This was used in the end - as was also used in Immune Panel.
+
+http://bioconductor.org/books/3.13/OSCA.multisample/differential-abundance.html
+https://bioconductor.org/packages/release/bioc/vignettes/edgeR/inst/doc/edgeRUsersGuide.pdf
+
+```{r edge-r}
+edge <- case_compo2 |>
+  filter(cell_type %in% c("Alpha", "Beta", "Delta", "Epsilon", "Gamma")) |>
+  dplyr::ungroup() |>
+  dplyr::select(c(case_id, cell_type, CellNb)) |>
+  tidyr::pivot_wider(id_cols = cell_type,
+                     names_from = case_id, values_from = CellNb) |>
+  as.data.frame()
+
+rownames(edge) <- edge$cell_type
+edge$cell_type <- NULL
+edge <- as.matrix(edge)
+
+coldata <- unique(case_compo2[, c("donor_type", "case_id")]) |> 
+  as_tibble() |> 
+  mutate(donor_type = ifelse(donor_type== "sAAb+", "sAAb", donor_type)) |> 
+  mutate(donor_type = ifelse(donor_type== "mAAb+", "mAAb", donor_type))
+
+coldata$donor_type = factor(coldata$donor_type, levels = c("NoDiabetes", "sAAb", "mAAb", "RecentOnset", "LongDuration"))
+# DGElist object. This is the main object used by edgeR.
+# It contains the count data, the sample information and the library sizes.
+# The groups to test are the donor_types. lib.size is the total number of cells per sample.
+y_ab <- edgeR::DGEList(edge, samples = coldata)
+y_ab
+```
+
+```{r edge-design-matrix}
+## We filter for "lowly-expressed" genes -> that is here lowly present cell types.
+## BUT: all ct are kept.
+keep <- edgeR::filterByExpr(y_ab, group = y_ab$samples$donor_type)
+y_ab <- y_ab[keep, ]
+summary(keep)
+
+design <- model.matrix(~donor_type, y_ab$samples)
+```
+
+Estimate NB-dispersion.
+```{r estimate-dispersion}
+y_ab <- edgeR::estimateDisp(y_ab, design, trend = "none")
+summary(y_ab$common.dispersion)
+plotBCV(y_ab, cex=1)
+```
+
+Fit the model. Turn of trend. 
+```{r fit-ql-model}
+fit_ab <- edgeR::glmQLFit(y_ab, design, robust = TRUE, abundance.trend = FALSE, legacy = TRUE)
+
+my_contrasts <- limma::makeContrasts(
+  NoDiabetes_sAAb = -donor_typesAAb,
+  NoDiabetes_mAAb = -donor_typemAAb,
+  NoDiabetes_RecentOnset = -donor_typeRecentOnset,
+  NoDiabetes_LongDuration = -donor_typeLongDuration,
+  sAAb_mAAb = donor_typesAAb - donor_typemAAb,
+  mAAb_RecentOnset = donor_typemAAb - donor_typeRecentOnset,
+  RecentOnset_LongDuration = donor_typeRecentOnset - donor_typeLongDuration,
+  levels = design
+)
+
+qlf_list <- lapply(colnames(my_contrasts), function(cn) {
+  topTags(glmQLFTest(fit_ab, contrast = my_contrasts[, cn]), n = "all")$table |> 
+    as_tibble(rownames = "cell_type") |> 
+    mutate(contrast = cn)
+}) |> 
+  bind_rows()
+
+## Clearning.
+edgeR_output <- qlf_list |> 
+  tidyr::separate_wider_delim(contrast, names = c("group1", "group2"), delim = "_") |> 
+  mutate(group1 = ifelse(group1 == "sAAb", "sAAb+", 
+                         ifelse(group1 == "mAAb", "mAAb+", group1))) |> 
+  mutate(group2 = ifelse(group2 == "sAAb", "sAAb+", 
+                         ifelse(group2 == "mAAb", "mAAb+", group2)))
+```
+
+## Boxplots relative composition
+
+These plots facilitate the comparison of cell type fraction across experimental conditions for 
+individual cell types.
+
+Add the p-values.
+
+```{r boxplots-beta}
+plot_beta <- case_compo2 |> 
+  filter(cell_type == "Beta") |> 
+  mutate(donor_type = factor(donor_type, levels = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration")))
+
+p_vals2 <- edgeR_output |>
+  filter(cell_type == "Beta") |>
+  mutate(p = PValue, .y. = "fraction",
+         p.signif = cut(FDR, breaks = c(-Inf, 0.001, 0.01, 0.05, 0.1, Inf), labels = c("***", "**", "*", "•", ""))) |>
+  select(.y., group1, group2,
+         p, FDR, p.signif)
+
+case_compo2 |>
+  filter(cell_type == "Beta") |>
+  filter(donor_type == "LongDuration") # Count observations in each group
+
+# get max-y-value PER channel.
+max_val <- plot_beta  |>
+    ungroup() |> 
+    summarise(max = max(fraction)*1.2) |> 
+    pull(max)
+
+# ggpubr:
+## Calculate p-values with ggpubr.
+# Use this for right formatting of DF
+library(ggpubr); library(rstatix)
+stat.test <- plot_beta |>
+  ungroup() |> 
+  tukey_hsd(fraction ~ donor_type)  |> 
+  add_xy_position(x = "donor_type") |> 
+  select(group1, group2, y.position)
+stat.test
+
+# Combine formatting + P-value dataframe.
+  stat.test.test <- p_vals2 |> 
+    left_join(stat.test, by = c("group1", "group2")) |> 
+    mutate(y.position = max_val * 1.1)  |> 
+    filter(FDR < 0.1) |>
+    mutate(y.position = first(y.position) * (1 + (0.05) * (row_number() - 1))) %>%
+    ungroup()
+
+bxp <- ggboxplot(plot_beta, x = "donor_type", y = "fraction", 
+                fill = "donor_type", add = "jitter",
+                add.params = list(size = 3, width = 0.2),
+                palette = palettes$stages, alpha = 1) + 
+      labs(x = "Stage", y = expression(beta ~"-cell fraction"))
+
+p <- bxp + 
+  stat_pvalue_manual(stat.test.test, label = "p.signif", tip.length = 0.01,
+                    size = 7, label.size = 7) + 
+  mytheme$standard_new() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45, size = 22),
+        panel.grid.major.y = element_line(colour = "grey")) + 
+  scale_fill_manual(values = palettes$stages) + 
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1)))
+if (do_print) print(p)
+
+fig1e <- p
+saveRDS(fig1e, file.path(paths$home_git, "figures", "fig1e.rds"))
+
+fn <- paste0(paste(today, "Boxplots", "BetaCells", "byStage", sep = "_"), ".png")
+plotsave_param2 <- plotsave_param
+plotsave_param2$width <- 200
+do.call(ggsave, c(list(fn, fig1d), plotsave_param2))
+```
+
+```{r boxplots-islet-cells}
+p_vals2 <- edgeR_output |>
+  filter(cell_type != "Beta") |>
+  mutate(p = PValue, .y. = "fraction",
+         p.signif = cut(FDR, breaks = c(-Inf, 0.001, 0.01, 0.05, 0.1, Inf), labels = c("***", "**", "*", "•", ""))) |>
+  select(.y., group1, group2,
+         p, FDR, p.signif, cell_type)
+
+# ggpubr:
+## Calculate p-values with ggpubr.
+# Use this for right formatting of DF
+library(ggpubr); library(rstatix)
+
+stat.test <- case_compo2 |>
+  mutate(donor_type = factor(donor_type, levels = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration"))) |>
+  ungroup() |> 
+  filter(cell_type != "Beta") |>
+  group_by(cell_type) |>
+  tukey_hsd(fraction ~ donor_type)  |> 
+  add_xy_position(x = "donor_type") |> 
+  select(group1, group2, cell_type, y.position)  |>
+  inner_join(p_vals2, by = c("group1", "group2", "cell_type")) |>
+  filter(FDR < 0.1)
+
+max_vals <-  case_compo2 |> 
+  group_by(cell_type) |>
+  summarise(max = max(fraction)*1.1)
+
+
+stat.test.test <- stat.test |> 
+  left_join(max_vals, by = "cell_type") |>
+  group_by(cell_type) |> 
+  mutate(y.position = first(max) * (1 + (0.05) * (row_number() - 1))) |> 
+  ungroup()
+
+bxp <- ggboxplot(case_compo2 |> filter(cell_type != "Beta"), x = "donor_type", y = "fraction", 
+                fill = "donor_type", add = "jitter", facet.by = "cell_type", scales = "free_y",
+                add.params = list(size = 3, width = 0.2),
+                palette = palettes$stages, alpha = 1) + 
+      labs(x = "Stage", y = "Cell type fraction")
+
+p <- bxp + 
+  stat_pvalue_manual(stat.test.test, label = "p.signif", tip.length = 0.02,
+                    size = 10, label.size = 10, 
+                    step.increase = 0) + 
+  mytheme$large_new() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(hjust = 1, vjust = 1, angle = 45, size = 22),
+        panel.grid.major.y = element_line(colour = "grey")) + 
+  scale_fill_manual(values = palettes$stages) + 
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.1))) 
+
+print(p)
+
+fn <- paste0(paste(today, "Boxplots", "CellType", "byStage", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+extfig3b <- p
+saveRDS(extfig3b, file.path(paths$home_git, "figures", "extfig3b.rds"))
+```
+
+## Relate Cell Type Composition to further metadata
+
+```{r metadata}
+# All metadata.
+cols_oi <- c("donor_type", "case_id", "mIAA", "ZnT8A", "age",
+             "gender", "race", "BMI", "HbA1c", "C_peptide", "batch", 
+             "number_of_AAbs", "GADA", "IA2A")
+# Continuous metadata.
+cols_test <- c("mIAA", "ZnT8A", "number_of_AAbs", "GADA", "IA2A",
+               "HbA1c", "C_peptide", "age")
+
+case_compo2 <- case_compo |>
+  filter(cell_type == "Beta" & donor_type != "Pancreatitis") |> 
+  mutate(donor_type_num = as.numeric(donor_type))
+
+meta_data_oi <- colData(spe_isl)[, cols_oi]  |> 
+  as_tibble() |>
+  distinct() |>
+  dplyr::inner_join(case_compo2, by = c("case_id", "donor_type")) |>
+  dplyr::mutate(across(c(number_of_AAbs, mIAA, ZnT8A, GADA, IA2A), \(x) as.numeric(x) - 1)) |>
+  dplyr::mutate(donor_type = factor(donor_type, levels = metadata(spe)$stages),
+                case_id = factor(case_id, levels = metadata(spe)$cases))
+```
+
+## Fit LMs for metadata
+
+1) Calculate association of metadata to cell type fraction. -> like correlation. 
+- y = b0 + b1*x + e
+2) Calculate association of metadata to cell type fraction **with donor_type as blocking factor.**
+- y = b0 + b1*donor_type + b2*x + e 
+
+```{r lms-composition-covariates}
+## Observe here that BMI, Age and Race do not add biological information. This is good.
+cat_test_vars <- c("gender", "race", "batch")
+cont_test_vars <- c("BMI", "age", "HbA1c", "C_peptide", 
+                    "number_of_AAbs", "mIAA", "IA2A", "GADA", "ZnT8A")
+test_vars <- c(cat_test_vars, cont_test_vars)
+beta_meta <- meta_data_oi
+# Could remove Long Durations here?
+
+results_no_block <- purrr::map(test_vars, \(cur_var) {
+  print(paste("donor_type_num ~", cur_var))
+  formula_x <- as.formula(paste("donor_type_num ~", cur_var))
+  lm(formula_x, data = beta_meta) |> broom::tidy()  |> mutate(test = !!cur_var)
+}) |> bind_rows()
+
+pvals_no_block <- results_no_block |> arrange(p.value) |> filter(term != "(Intercept)") |> mutate(p.adj = p.adjust(p.value, method = "fdr"))
+pvals_no_block
+```
+
+```{r}
+# Plot HbA1c vs donor_type
+p <- ggplot(meta_data_oi, aes(x = donor_type, y = HbA1c)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2) +
+  mytheme$standard()
+
+rec_metadata <- meta_data_oi |> filter(donor_type == "RecentOnset")
+cor(meta_data_oi$fraction, meta_data_oi$HbA1c, use = "pairwise.complete.obs", method = "spearman")
+cor(rec_metadata$fraction, rec_metadata$HbA1c, use = "pairwise.complete.obs", method = "spearman")
+```
+
+```{r lms-composition}
+## Observe here that BMI, Age and Race do not add biological information. This is good.
+results <- purrr::map(test_vars, \(cur_var) {
+  print(paste("fraction ~ donor_type +", cur_var))
+  formula_x <- as.formula(paste("fraction ~ poly(donor_type, 2) +", cur_var))
+  lm(formula_x, data = beta_meta) |> broom::tidy()  |> mutate(test = !!cur_var)
+}) |> bind_rows()
+
+# For continuous variables only.
+results_cont <- purrr::map(cont_test_vars, \(cur_var) {
+  formula_x <- paste("fraction ~ poly(donor_type_num, 2) +", cur_var)
+  print(formula_x)
+  formula_lm <- as.formula(formula_x)
+  lm(formula_lm, data = beta_meta) |> broom::tidy()  |> mutate(test = !!cur_var)
+})  |> bind_rows()|> arrange(p.value) |> filter(!grepl("donor_", term), term != "(Intercept)")
+
+# For categorical variables only.
+results_cat <- purrr::map(cat_test_vars, \(cur_var) {
+  formula_x <- paste("fraction ~ poly(donor_type_num, 2) +", cur_var)
+  print(formula_x)
+  formula_lm <- as.formula(formula_x)  
+  lm(formula_lm, data = beta_meta) |> broom::tidy()  |> mutate(test = !!cur_var)
+}) |> bind_rows()|> arrange(p.value) |> filter(!grepl("donor_", term), term != "(Intercept)")
+
+results <- bind_rows(results_cont, results_cat)
+pvals_block <- results |> arrange(p.value) |> filter(!grepl("donor_", term), term != "(Intercept)") |> mutate(p.adj = p.adjust(p.value, method = "fdr"))
+pvals_block
+```
+
+## Plot metadata
+
+```{r plot-metadata}
+## I want to plot the results (p.values) as a heatmap. 
+## x-axis: Block or No-block Linear Regression
+## y-axis: Terms (mIAA, GADA, etc.)
+pvals_no_block <- pvals_no_block |> 
+  mutate(signif = cut(pvals_no_block$p.adj, breaks = c(-Inf, 0.001, 0.01, 0.05, Inf), label = c("***", "**", "*", ""))) |>  # Create column of significance labels
+  mutate(method = "No Block")  
+
+pvals_block <- pvals_block |> 
+  mutate(signif = cut(pvals_block$p.adj, breaks = c(-Inf, 0.001, 0.01, 0.05, Inf), label = c("***", "**", "*", "")))  |>  # Create column of significance labels 
+  mutate(method = "Block")
+
+# This is used to define the order in the heatmap.
+order_vars <- c("BMI", "genderMale", "age", "raceCaucasian", "raceHispanic_Latino", "HbA1c", "C_peptide", 
+                "number_of_AAbs", "mIAA", "IA2A", "GADA", "ZnT8A", "batch2", "batch3", "batch4")
+
+full_pvals <- bind_rows(pvals_block, pvals_no_block) |> 
+  mutate(method = factor(method, levels = c("No Block", "Block"))) |> 
+  mutate(term = factor(term, levels = rev(order_vars)))
+
+p <- full_pvals  |> 
+  filter(term != "(Intercept)") |>
+  ggplot(aes(x = method, y = term, fill = p.adj)) +
+  geom_tile() +
+  geom_text(aes(label = signif), color = "black", size = 5) +
+  scale_fill_viridis_c() +
+  theme() +
+  labs(y = "Tested variable", fill = "p.adj") +
+  mytheme$standard()
+print(p)
+fn <- paste0(paste(today, "pvals_block", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+Observation: HbA1c, C_peptide, number of AAbs highly associated -> ofc.
+Good: no other other co-variates are associated. 
+Note: after adding Blocking factor; no metadata add. explains
+beta-cell loss.
+
+# **Plot cell types on reduced dimensions**
+
+```{r packages3, results='hide'}
+suppressPackageStartupMessages(c(
+  library(uwot),
+  library(viridis)
+))
+```
+
+Plot consensus cell types on reduced dimensions
+
+```{r select-dimred-assays}
+assay_sel <- c("fastMNN_case_id", "scaled")
+names(assay_sel) <- c("exprs", "scaled")
+writeLines(c("Assays:", assay_sel[assay_sel %in% assayNames(spe)]))
+
+dimred_sel <- c("UMAP") #, "tSNE")
+writeLines(c("\nReduced dimensions:", dimred_sel))
+```
+
+## All cell types
+
+```{r dimred-allcells}
+nonislet_ct <- c("Ductal", "Acinar", "Mesenchymal", "Tcell",
+                         "Macrophage", "Ambiguous", "Other")
+all_ct <- c(celltypes, nonislet_ct)
+names(all_ct) <- all_ct
+
+palette_all_ct <- palettes$colors[seq_along(all_ct)]
+palette_all_ct <- c(palette_all_ct[1:(length(all_ct) - 2)], "grey60", "grey")
+names(palette_all_ct) <- all_ct
+palette_all_ct["Acinar"] <- "#B2DF8A"
+
+cur_dat <- scuttle::makePerCellDF(
+  spe[, colnames(spe) %in% metadata(spe)$subset &
+        spe$cell_type %in% all_ct],
+  use_dimred = TRUE) |>
+  dplyr::mutate(case_id = factor(case_id, levels = metadata(spe)$cases),
+                donor_type = factor(donor_type, levels = metadata(spe)$stages),
+                cell_type = factor(cell_type, levels = names(all_ct))) |>
+  dplyr::arrange(cell_type, case_id, donor_type)
+
+# Take out Pancreatitis cases.
+cur_dat <- cur_dat[cur_dat$donor_type != "Pancreatitis", ]
+
+purrr::walk(assay_sel, \(cur_assay) {
+  purrr::walk(dimred_sel, \(cur_dimred) {
+    dimred_name <- paste(cur_dimred, cur_assay, sep = "_")
+    
+    p <- plot_dim_red(cur_dat, dimred_name, "cell_type",
+                      sample = TRUE, size = 0.1, alpha = 1,
+                      palette = palette_all_ct)
+    if (do_print) print(p)
+    
+    fn <- paste0(paste(today, "DimRed", "CellType", "AllCells",
+                       dimred_name, sep = "_"), ".png")
+    do.call(ggsave, c(list(fn, p), plotsave_param))
+  })
+})
+remove(cur_dat)
+```
+
+## DimRed based on islet composition
+
+### PCA:
+
+Run PCA on Islet composition.
+```{r pca-compo}
+## Prepare data.
+image_compo_fractions <- image_compo |> 
+  dplyr::filter(donor_type != "Pancreatitis") |> 
+  select(-c(ord, fraction, CellsPerIslet, batch)) |> 
+  tidyr::pivot_wider(names_from = cell_type, values_from = CellNb)
+
+## Run PCA.
+data.pca <- prcomp(image_compo_fractions |> select(-c("donor_type", "case_id", "image_id")), scale = FALSE)
+PC <- as.data.frame(data.pca$x)
+PC$case_id <- image_compo_fractions$case_id
+PC$donor_type <- image_compo_fractions$donor_type
+PC$image_id <- image_compo_fractions$image_id
+prop.var <- summary(data.pca)$importance["Proportion of Variance", c(1, 2)] * 100
+
+## Plot PCA.
+p <- ggplot(PC, aes(x = PC1, y = PC2, color = donor_type)) +
+  geom_point() +
+  scale_color_manual(values = palettes[["stages"]]) +
+  labs(x = paste0("PC1 (", round(prop.var[1], 2), "%)"),
+       y = paste0("PC2 (", round(prop.var[2], 2), "%)")) +
+  theme_bw()
+
+if (do_print) print(p)
+fn <- paste0(paste(today, "PCA_endocrine_samples_fractions", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# Loading-Plot
+factoextra::fviz_pca_var(data.pca,
+             col.var = "contrib", # Color by contributions to the PC
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE     # Avoid text overlapping
+             )
+```
+
+Mean Expression per sample on PCA.
+```{r pca-compo-cases}
+sample_comp <- image_compo_fractions  |> 
+  group_by(case_id, donor_type) |>
+  summarise(across(c("Alpha", "Beta", "Delta", "Epsilon", "Gamma"), mean), .groups = "drop")
+
+## Run PCA.
+data.pca <- prcomp(sample_comp |> select(-c("donor_type", "case_id")), scale = FALSE)
+PC <- as.data.frame(data.pca$x)
+PC$case_id <- sample_comp$case_id
+PC$donor_type <- sample_comp$donor_type
+prop.var <- summary(data.pca)$importance["Proportion of Variance", c(1,2)] * 100
+
+## Plot PCA.
+p <- ggplot(PC, aes(x = PC1, y = PC2, color = donor_type)) +
+  geom_point() +
+  scale_color_manual(values = palettes[["stages"]]) +
+  labs(x = paste0("PC1 (", round(prop.var[1], 2), "%)"),
+       y = paste0("PC2 (", round(prop.var[2], 2), "%)")) +
+  theme_bw()
+
+if (do_print) print(p)
+fn <- paste0(paste(today, "PCA_endocrine_samples_fractions", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# Loading-Plot
+factoextra::fviz_pca_var(data.pca,
+             col.var = "contrib", # Color by contributions to the PC
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE     # Avoid text overlapping
+             )
+```
+
+FIXME: Note: Diffusion maps are calculated later anyways for the expression.
+
+### UMAPs.
+```{r umap-compo}
+cell_nb_cols <- colnames(image_compo_wide)[
+  grep("CellNb_", colnames(image_compo_wide))]
+
+isl_compos <- image_compo_wide[, c("image_id", cell_nb_cols)]
+
+umap_dx <- uwot::umap(as.data.frame(isl_compos), n_neighbors = 5, 
+                      learning_rate = 1, init = "spectral", n_epochs = 20)
+colnames(umap_dx) <- c("UMAP1", "UMAP2")
+umap_dx <- data.frame(umap_dx)
+umap_dx$image_id <- image_compo_wide$image_id
+
+keep_cols <- c("image_id", "donor_type", "case_id", "CellsPerIslet")
+umap_dx <- merge(umap_dx, unique(image_compo[, keep_cols]),
+                 by = "image_id")
+
+umap_dx <- merge(
+  umap_dx,
+  unique(image_compo_wide[, c("image_id", "CellNb_Beta", "fraction_Beta")]),
+  by = "image_id")
+
+## Color by Size and by Stage.
+p <- umap_dx[umap_dx$donor_type != "Pancreatitis", ] |>
+  ggplot(aes(x = UMAP1, y = UMAP2, color = donor_type, size = CellsPerIslet)) +
+  geom_point() +
+  scale_color_manual(values = palettes$stages[
+    names(palettes$stages) != "Pancreatitis"]) +
+  guides(color = guide_legend(override.aes = list(size = 3))) +
+  mytheme$standard()
+if (do_print) print(p)
+
+fn <- paste0(paste(today, "UMAP", "CellType", "byStage",  sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+## Color by b-cell fraction.
+p <- umap_dx[umap_dx$donor_type != "Pancreatitis", ] |>
+  ggplot(aes(x = UMAP1, y = UMAP2, color = fraction_Beta)) +
+  geom_point(size = 3) +
+  scale_color_viridis() +
+  mytheme$standard()
+if (do_print) print(p)
+
+fn <- paste0(paste(today, "UMAP", "CellType", "BetaCellFrac", 
+                   sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+### UMAPs SAMPLE
+This doesnt really work great.
+```{r umap-compo2}
+sample_isl_compos <- isl_compos |> 
+  # case_id = first 4 characters of image_id
+  dplyr::mutate(case_id = substr(image_id, 1, 4)) |> 
+  mutate(case_id = factor(case_id, levels = metadata(spe)$cases)) |> 
+  group_by(case_id) |>
+  summarise(across(starts_with("CellNb"), mean), .groups = "drop")
+
+test_df <- sample_isl_compos  |> select(-c(case_id))
+
+umap_dx <- uwot::umap(as.data.frame(test_df), n_neighbors = 30, 
+                      learning_rate = 10, init = "spectral", n_epochs = 20, seed = seed)
+
+colnames(umap_dx) <- c("UMAP1", "UMAP2")
+umap_dx <- data.frame(umap_dx)
+umap_dx$case_id <- sample_isl_compos$case_id
+
+keep_cols <- c("donor_type", "case_id", "CellsPerIslet")
+cases <- image_compo |> group_by(case_id) |> summarise(donor_type = first(donor_type), CellsPerIslet = mean(CellsPerIslet))
+umap_dx <- dplyr::left_join(umap_dx, cases, by = "case_id")
+
+p <- umap_dx |>
+  dplyr::filter(donor_type != "Pancreatitis") |> 
+  ggplot(aes(x = UMAP1, y = UMAP2, color = donor_type, size = CellsPerIslet)) +
+  geom_point() +
+  scale_color_manual(values = palettes$stages[
+    names(palettes$stages) != "Pancreatitis"]) +
+  guides(color = guide_legend(override.aes = list(size = 3))) +
+  mytheme$standard()
+if (do_print) print(p)
+
+fn <- paste0(paste(today, "UMAP", "CellType", "byStage_sample",  sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+
+
+## Beta-cells per Islet:
+
+```{r beta-cells-per-islet}
+# Beta-cells per islet
+beta_cells <- makePerCellDF(sce_ct_islet, features = channels,
+                             assay.type = "exprs", use.dimred = FALSE)[, c("cell_type", "donor_type", "image_id", channels)] |> 
+              as_tibble()  |> filter(cell_type %in% c("Beta", "Alpha", "Macrophage"), !donor_type %in% c("Pancreatitis", "LongDuration"))
+
+# Beta-cells:
+p <- tibble::as_tibble(metadata(sce_ct_islet)$islet_compo) |>
+  inner_join(beta_cells, by = c("image_id")) |>
+  filter(CellNb_Beta > 0) |>
+  filter(cell_type == "Beta") |> 
+  ggplot(aes(x = CellNb_Beta)) +
+  geom_boxplot(aes(fill = donor_type)) +
+  scale_x_continuous(breaks = c(0, 10, 25, 50, 100, 200, 400, 800), 
+                     labels = c(0, 10, 25, 50, 100, 200, 400, 800),
+         transform = "log1p") + 
+  geom_vline(xintercept = 50, linetype = "dashed", color = "black") +
+  geom_vline(xintercept = 100, linetype = "dashed", color = "black") + 
+  ggtitle("Beta-cells per islet") + 
+  scale_fill_manual(values = palettes[["stages"]]) + 
+  mytheme$standard() + 
+  facet_wrap(~ donor_type, axes = "all")
+  
+fn <- paste0(paste(today, "Boxplot", "BetaCellsPerIslet", paths$object_type, paths$panel_type, sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param_large))
+
+# Alpha-cells:
+tibble::as_tibble(metadata(sce_ct_islet)$islet_compo) |>
+  inner_join(beta_cells, by = c("image_id")) |>
+  filter(CellNb_Alpha > 0) |>
+  filter(cell_type == "Alpha") |> 
+  ggplot(aes(x = CellNb_Alpha)) +
+  geom_boxplot(aes(fill = donor_type)) +
+  scale_x_continuous(breaks = c(0, 10, 25, 50, 100, 200, 400, 800), 
+                     labels = c(0, 10, 25, 50, 100, 200, 400, 800),
+         transform = "log1p") + 
+  geom_vline(xintercept = 50, linetype = "dashed", color = "black") +
+  geom_vline(xintercept = 100, linetype = "dashed", color = "black") + 
+  ggtitle("Alpha-cells per islet") + 
+  scale_fill_manual(values = palettes[["stages"]]) + 
+  mytheme$standard() + 
+  facet_wrap(~ donor_type, axes = "all")
+```
+
+
