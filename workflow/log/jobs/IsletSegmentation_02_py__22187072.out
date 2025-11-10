@@ -1,4 +1,0 @@
-['/home/nsteen/scripts/T1D_analysis/.snakemake/scripts', '/opt/conda/lib/python39.zip', '/opt/conda/lib/python3.9', '/opt/conda/lib/python3.9/lib-dynload', '/opt/conda/lib/python3.9/site-packages', '/mnt/snakemake', '/scratch/nsteen/T1D_preprocessing/processing']
-/opt/conda/bin/python
-{'raw': PosixPath('/home/processing/raw'), 'img': PosixPath('/home/processing/img'), 'seg_cells': PosixPath('/home/processing/seg_cells'), 'seg_islets': PosixPath('/home/processing/seg_islets'), 'masks_cells': PosixPath('/home/processing/masks_cells'), 'masks_islets': PosixPath('/home/processing/masks_islets'), 'data_cells': PosixPath('/home/processing/data_cells'), 'data_islets': PosixPath('/home/processing/data_islets'), 'variables': PosixPath('/home/processing/variables'), 'data': PosixPath('/home/processing'), 'git': PosixPath('/home/nsteen/scripts/T1D_analysis')}
-/home/nsteen/scripts/T1D_analysis

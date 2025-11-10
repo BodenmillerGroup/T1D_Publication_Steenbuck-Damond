@@ -1,6 +1,0 @@
-Fatal Python error: init_sys_streams: can't initialize sys standard streams
-Python runtime state: core initialized
-Traceback (most recent call last):
-  File "/home/nsteen/data/conda/envs/snakemake_cluster/lib/python3.10/io.py", line 52, in <module>
-    import abc
-ModuleNotFoundError: No module named 'abc'

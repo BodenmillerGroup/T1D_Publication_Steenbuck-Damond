@@ -1,9 +1,0 @@
-name: snakemake_cluster
-channels:
-   - conda-forge
-   - bioconda
-   - defaults
-dependencies:
-   - python=3.10.5
-   - snakemake-minimal=7.8.2
-
