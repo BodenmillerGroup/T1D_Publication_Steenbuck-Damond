@@ -13,26 +13,29 @@ Raw and processed data is provided on zenodo (IMC: https://zenodo.org/records/14
 Please follow the respective linked directories containing the raw image data.
 An informative subset of the data is also available on Pancreatlas (https://www.pancreatlas.org/) as a browsable set of annotated images. 
 The processed dataset is currently being uploaded to the *imcdatasets* R/Bioconductor package (https://github.com/BodenmillerGroup/imcdatasets). 
-We are currently adding a vignette to *imcdatasets* showcasing how 
 
-# How can you use this dataset in your work?
+🚨 # How can you use this dataset in your work?
 
 ## T1D scientist:
 The dataset contains imaging data of 79 unique antibodies across 88 donors (incl. 28 sAAb+ and 10 mAAb+) with rich metadata and image annotations. 
 It therefore presents a rich resource for biological discovery and for validating your targets of interest.
 For example, you aim to knock-out a given target or found a potentially interesting transcript of a protein included in this study?
-Use this dataset, to check its protein levels across biological contexts (disease stages, cell types, insulitis, ICIs vs IDIs).
+Use this dataset, to check its protein levels across biological contexts (disease stages, cell types, insulitis, ICIs vs IDIs etc.).
 
 ## Bioinformatician:
-The dataset is highly applicable to benchmarking studies or building methods. Tasks could include:
-- Cell type annotation & subclustering.
-- Cell type domains.
-- Methods to extract biological insights from ordinal cross-sectional spatial atlases
-- Object detection and extraction of biologically informative geometric features (based on islets)
-- Joint Multi-modal analysis of spatial data acquired on two sections, for example in matching similar cells.
-- Scalable spatial methods as the dataset is large (16M cells; > 7,000 paired images (=14,050 IMC images).
+The dataset is highly applicable to benchmarking studies or building methods.
+Please note, data is given on Zenodo and processed by scripts usually per panel (-> Immune panel, Islet panel).
 
--> Check the vignette to be added to imcdatasets; it will cover details of key columns (e.g. cell-type, cell-id, spatial domain etc.).
+Tasks could include:
+- Cell type annotation & subclustering.
+- Tissue domains / niches. 
+- Methods to extract biological insights from *ordinal* cross-sectional spatial atlases
+- Tissue domain detection and extraction of biologically informative geometric features (-> based on islets)
+- Joint Multi-modal analysis of spatial data acquired on two sections, for example by integrating similar cells.
+- Scalable spatial methods as the dataset is large (16M cells; > 7,000 paired images (=14,050 IMC images)).
+
+🚨 Please see our vignette in *imcdatasets* (https://github.com/BodenmillerGroup/imcdatasets) where we will cover details of the data and explain key metadata annotations.
+(e.g. cell-type, cell-id, ICI etc.). (*about to be uploaded*)
 -> For any ideas or queries, feel reach out to me (nathan.steenbuck@uzh.ch) or open an Issue.
 
 # Repository details:
