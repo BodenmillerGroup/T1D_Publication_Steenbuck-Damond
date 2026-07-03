@@ -1,5 +1,7 @@
 # T1D_Publication_Steenbuck-Damond
-This repository contains all code scripts for the type 1 diabetes study from Steenbuck, Damond et al., 2025.  Read the preprint here: https://www.biorxiv.org/content/10.1101/2025.03.05.641526v1.
+This repository contains all code scripts for the type 1 diabetes study from Steenbuck, Damond et al., 2026 published in Nature Metabolism.  
+Read the study here: https://www.nature.com/articles/s42255-026-01559-z
+and an associated commentary here: https://www.nature.com/articles/s42255-026-01547-3.
 
 # Abstract
 The pathogenesis of type 1 diabetes, particularly at autoantibody-positive preclinical stages, remains poorly understood, in part due to limited sample availability. Here, we show imaging mass cytometry data of pancreas samples from 88 organ donors, including 28 single and 10 multiple autoantibody-positive donors. We imaged 16 million single-cells using 79 antibodies to characterize β-cell states and the islet-immune interface, correcting for relevant covariates. We identified interactions between pro-inflammatory macrophages and exhausted-like (PD1+TIM3+) T-cells. These interactions were characteristic of early disease and of insulitic islets, indicating a key role of macrophages in disease development. β-cells showed loss of IAPP in pre-clinical disease, insulitic Interferon signatures, and no increase in three measured ER stress markers in disease samples relative to control. Multiple immune cell subtypes were associated with young age and insulitis, potentially contributing to greater disease severity in younger patients. Our data present a resource describing early type 1 diabetes progression and reveal potentially clinically actionable features before extensive β-cells loss. 
@@ -14,7 +16,7 @@ Please follow the respective linked directories containing the raw image data.
 An informative subset of the data is also available on Pancreatlas (https://www.pancreatlas.org/) as a browsable set of annotated images. 
 The processed dataset is currently being uploaded to the *imcdatasets* R/Bioconductor package (https://github.com/BodenmillerGroup/imcdatasets). 
 
-🚨 # How can you use this dataset in your work?
+# 🚨 How can you use this dataset in your work?
 
 ## T1D scientist:
 The dataset contains imaging data of 79 unique antibodies across 88 donors (incl. 28 sAAb+ and 10 mAAb+) with rich metadata and image annotations. 
@@ -23,20 +25,21 @@ For example, you aim to knock-out a given target or found a potentially interest
 Use this dataset, to check its protein levels across biological contexts (disease stages, cell types, insulitis, ICIs vs IDIs etc.).
 
 ## Bioinformatician:
-The dataset is highly applicable to benchmarking studies or building methods.
-Please note, data is given on Zenodo and processed by scripts usually per panel (-> Immune panel, Islet panel).
+The dataset is highly applicable to benchmarking studies or method development.
+Please note, data is provided on Zenodo. Scripts analyze data by panel (-> Immune panel, Islet panel).
 
 Tasks could include:
 - Cell type annotation & subclustering.
-- Tissue domains / niches. 
-- Methods to extract biological insights from *ordinal* cross-sectional spatial atlases
-- Tissue domain detection and extraction of biologically informative geometric features (-> based on islets)
-- Joint Multi-modal analysis of spatial data acquired on two sections, for example by integrating similar cells.
+- Detection of Tissue domains / niches. 
+- Methods to extract biological insights from *ordinal* cross-sectional spatial atlases.
+- Extraction of biologically informative geometric features from tissue domains (-> based on islets).
+- Joint multi-modal analysis of spatial data acquired on two sections, e.g. by integrating similar cells.
 - Scalable spatial methods as the dataset is large (16M cells; > 7,000 paired images (=14,050 IMC images)).
+- Training of foundation models.
 
 🚨 Please see our vignette in *imcdatasets* (https://github.com/BodenmillerGroup/imcdatasets) where we will cover details of the data and explain key metadata annotations.
 (e.g. cell-type, cell-id, ICI etc.). (*about to be uploaded*)
--> For any ideas or queries, feel reach out to me (nathan.steenbuck@uzh.ch) or open an Issue.
+-> For any ideas or queries, feel free to reach out to me (nathan.steenbuck@uzh.ch) or open an Issue in this GitHub repository.
 
 # Repository details:
 Pre-processing
@@ -51,8 +54,8 @@ The `/T1D_processing/` directory contains all **pre-processing** scripts. This i
 ## Analysis
 The `/T1D_analysis/` directory contains all **analysis** scripts. This includes all cell type annotation and downstream analysis scripts (e.g. spatial + differential abundance analysis).
 
-The `/Snake_pipe/` directory contains Snakefiles and configuration files to reproducibly run the pre-processing (`/T1D_processing/processing/`) including cell type annotation (01-08 scripts in `/T1D_analysis/`). 
-Please note: we provide the full SCE_object generated after this step on Zenodo.
+The `/Snake_pipe/` directory contains Snakefiles and configuration files to reproducibly run the pre-processing (`/T1D_processing/processing/`) including cell type annotation (01-05 scripts in `/T1D_analysis/`). 
+Please note: we provide the full SCE_object generated after this steps on Zenodo.
 
 # Software note
 Most scripts are written in the statistical programming language R and Python. 
