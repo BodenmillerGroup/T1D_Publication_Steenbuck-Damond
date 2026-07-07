@@ -1105,16 +1105,6 @@ p_adj <- matrix(p.adjust(p_values, method = "fdr"),
                             nrow = nrow(p_values), 
                             dimnames = dimnames(p_values))
 p_adj |> as_tibble(row.names = "id")
-
-print("Adjusted P-values:")
-print(sort(p_adj[, "Myeloid_3"]))
-print(sort(p_adj[, "Myeloid_4"]))
-print(sort(p_adj[, "Myeloid_5"]))
-
-print(sort(p_adj["T-cell 1", ]))
-print(sort(p_adj["T-cell 2", ]))
-print(sort(p_adj["T-cell 3", ]))
-print(sort(p_adj["B-cell", ]))
 ```
 
 ## A4.4 T_CD4_full.
@@ -1220,13 +1210,6 @@ set.seed(222)
 
 chisq <- chisq.test(tt$CN_cn_k1070, tt$cell_cluster_scaled)
 
-# Remove for visualization.
-# New rows: Mixed Inf mAAb+ (Myeloid-5), Islet-Other Beta-, Islet-Edge Onset, 
-# Mixed Inf, Islet-Other Beta+, Islet-Edge Onset (+mAAB+/CTRL), 
-# Delta? 
-# Myeloid Inf Onset (Myeloid-5), Myeloid Inf mAAB+ (?)
-
-
 chisq$residuals <- chisq$residuals[!(rownames(chisq$residuals) %in% to_delete_rows), ]
 # change Islet-Rim to Islet-Edge
 rownames(chisq$residuals) <- ifelse(rownames(chisq$residuals) == "Islet-Rim mAAB+", "Islet-Edge mAAb+", rownames(chisq$residuals))
@@ -1252,11 +1235,6 @@ ComplexHeatmap::draw(p, heatmap_legend_side = "right",
 dev.off()
 ```
 
-Chisquared p-values.
-T-CD4-5: Potentially beta-cell specific
-T-CD4-10: T-regs? Beta-cell CN enrichment.
-T-CD4-7: Potentially part of pathogenic T-cell infiltrate.
-
 ```{r t-cd4-chisq}
 # Extract the standardized residuals
 std_residuals <- chisq$stdres
@@ -1266,12 +1244,6 @@ p_adj <- matrix(p.adjust(p_values, method = "fdr"),
                             nrow = nrow(p_values), 
                             dimnames = dimnames(p_values))
 p_adj |> as_tibble(row.names = "id")
-
-print("Adjusted P-values:")
-print(sort(p_adj[, "T_CD4_5"]))
-print(sort(p_adj[, "T_CD4_7"]))
-print(sort(p_adj[, "T_CD4_10"]))
-print(sort(p_adj[, "T_CD4_9"]))
 ```
 
 ## A4.7: T-CD8
@@ -1406,16 +1378,6 @@ p_adj <- matrix(p.adjust(p_values, method = "fdr"),
                             nrow = nrow(p_values), 
                             dimnames = dimnames(p_values))
 p_adj |> as_tibble(row.names = "id")
-
-print("Adjusted P-values:")
-print(sort(p_adj[, "T_CD8_7"]))
-
-print(sort(p_adj[, "T-naive"]))
-print(sort(p_adj[, "T_CD8_1"]))
-print(sort(p_adj[, "T_CD8_3"]))
-print(sort(p_adj[, "T_CD8_2"]))
-print(sort(p_adj[, "T_CD8_6"]))
-print(sort(p_adj[, "T_CD8_4"]))
 ```
 
 ```{r}
@@ -1446,86 +1408,6 @@ p <- ComplexHeatmap::Heatmap(chisq$residuals,
 ComplexHeatmap::draw(p, heatmap_legend_side = "right", 
                       padding = unit(c(10, 15, 5, 15), "mm"))   # right and bottom padding
 dev.off()
-```
-
-Test enrichment in beta-cell CNs vs other ISLET CNs.
-```{r t-cd8-lineplot}
-# Get enrichment of subtypes within CNs.
-# CN ~ counts (subtypes) + ((donor_type|case_id)) 
-# cbind(n_success, n_failure) ~ stage + (1 + stage | patient_id)
-tt <- t_cd8_df |> select(cell_cluster_scaled, donor_type, CN_cn_k1060, image_id, case_id) |> 
-  filter(CN_cn_k1060 %in% c("Beta", "Alpha", "Delta", "Mixed-Islet", "Islet-Edge CTRL", "Islet-Edge mAAb+")) |> 
-  mutate(CN_cn_k1060 = ifelse(CN_cn_k1060 == "Beta", "Beta", "Other")) |> 
-  mutate(islet_type = ifelse(image_id %in% icis, "ICI", "IDI")) |>
-  filter(islet_type == "ICI")
-
-# NoDiabetes
-tt_nd  <- tt  |> filter(donor_type == "NoDiabetes")
-tt_saab <- tt |> filter(donor_type == "sAAb+")
-tt_maab <- tt |> filter(donor_type == "mAAb+")
-tt_rec <- tt |> filter(donor_type == "RecentOnset")
-
-# 
-set.seed(222)
-chisq_nd <- chisq.test(tt_nd$CN_cn_k1060, tt_nd$cell_cluster_scaled)
-std_residuals <- chisq_nd$residuals
-
-p_values <- 2 * pnorm(-abs(std_residuals))
-p_adj_nd <- matrix(p.adjust(p_values, method = "BH"), 
-                            nrow = nrow(p_values), 
-                            dimnames = dimnames(p_values))
-
-# sAAb+:
-chisq_saab <- chisq.test(tt_saab$CN_cn_k1060, tt_saab$cell_cluster_scaled)
-std_residuals <- chisq_saab$residuals
-p_values <- 2 * pnorm(-abs(std_residuals))
-p_adj_saab <- matrix(p.adjust(p_values, method = "BH"), 
-                            nrow = nrow(p_values), 
-                            dimnames = dimnames(p_values))
-
-# mAAb+: 
-chisq_maab <- chisq.test(tt_maab$CN_cn_k1060, tt_maab$cell_cluster_scaled)
-std_residuals <- chisq_maab$residuals
-p_values <- 2 * pnorm(-abs(std_residuals))
-p_adj_maab <- matrix(p.adjust(p_values, method = "BH"), 
-                              nrow = nrow(p_values), 
-                              dimnames = dimnames(p_values))
-
-# REC:
-chisq_rec <- chisq.test(tt_rec$CN_cn_k1060, tt_rec$cell_cluster_scaled)
-std_residuals <- chisq_rec$residuals
-p_values <- 2 * pnorm(-abs(std_residuals))
-p_adj_rec <- matrix(p.adjust(p_values, method = "BH"), 
-                            nrow = nrow(p_values), 
-                            dimnames = dimnames(p_values))
-
-# Combine p-vals
-p_adj_all <- cbind(p_adj_nd["Beta", ], p_adj_saab["Beta", ], 
-                    p_adj_maab["Beta", ], p_adj_rec["Beta", ]) |> tibble::as_tibble(rownames = "cell_cluster_scaled")
-colnames(p_adj_all) <- c("cell_cluster_scaled", "NoDiabetes", "sAAb+", "mAAb+", "RecentOnset")
-p_adj_all 
-
-# Plot that as a graph
-p <- p_adj_all |> 
-  pivot_longer(cols = -cell_cluster_scaled, names_to = "donor_type", values_to = "p_adj") |>
-  mutate(logpadj = -log10(p_adj)) |> 
-  mutate(logpadj = ifelse(logpadj > 16, 16, logpadj)) |>
-  mutate(donor_type = factor(donor_type, levels = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset"))) |>
-  ggplot(aes(x = donor_type, y = logpadj, group = cell_cluster_scaled, color = cell_cluster_scaled)) +
-  geom_line() +  # Connect points with lines
-  geom_point() +  # Add points for each value
-  labs(
-    x = "Stage",
-    y = base::expression("log(p-adj):" ~ beta ~ "-CN enrichment")
-  ) +
-  mytheme$standard_new() + 
-  # rotate
-  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
-  scale_color_manual(values = palettes$colors[1:9], name = "T-CD8 Cluster") + 
-  geom_hline(yintercept = 1.3, linetype = "dashed", color = "black")
-
-fn <- paste0(paste(today, "LinePlot", "CN_Cluster_CellType_TCD8_Beta", sep = "_"), ".png")
-do.call(ggsave, c(list(fn, p), plotsave_param))
 ```
 
 # A5: CN density.
@@ -1714,7 +1596,7 @@ print(p)
 fn <-  paste0(paste(today, "Density", "byAge", "CN", sep = "_"), ".png")
 do.call(ggsave, c(list(fn, p), plotsave_param_large))
 
-saveRDS(p, file.path(paths$home_git, "figures", "extfig10c.rds"))
+saveRDS(p, file.path(paths$home_git, "figures", "extfig10b.rds"))
 ```
 
 ## A5.3: Density across stages (PLOT)

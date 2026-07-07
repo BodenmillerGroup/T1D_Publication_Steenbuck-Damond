@@ -1,0 +1,830 @@
+---
+title: "19_Insulitic_cells_Islet"
+author: "Nathan Steenbuck"
+date: "Created: 24 May, 2025; Compiled: `r format(Sys.time(), '%d %b, %Y')`"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+if (rstudioapi::isAvailable()) {
+  script_name <- basename(rstudioapi::getSourceEditorContext()$path)
+} else {
+  script_name <- knitr::current_input()
+}
+
+cur_user <- Sys.info()[["user"]]
+script_name <- "19_Insulitic_cells_Islet.Rmd"
+
+if (cur_user == "ubuntu") {
+  source(file.path("/", "mnt", "central_nas", "projects", "type1_diabetes", "nathan", 
+                   "T1D_Vol", "T1D_analysis", "analysis", "helpers.R"))
+  #n_cores <- future::availableCores() - 1
+  n_cores <- 4
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  knitr::opts_knit$set(root_dir = paths$home_data)
+  do_print <- FALSE
+} else {
+  source(file.path("/", "home", "nsteen", "scripts", "T1D_analysis", "analysis", "helpers.R"))
+  n_cores <- 8
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  paths$folder_script <- paths$cluster_folder_script
+  paths$folder_in <- paths$cluster_folder_in
+  paths$folder_out <- paths$cluster_home 
+  knitr::opts_knit$set(root_dir = paths$cluster_home)
+  do_print <- TRUE
+}
+
+seed <- 123456
+set.seed(seed)
+options <- furrr::furrr_options(seed = seed)
+paths$prev <- paste("08_SubclusteringBeta", paths$object_type, paths$panel_type, sep = "_")
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+# **Goal**
+
+Examine protein abundance. 
+Compare ICIs (Insulin-containing islets) vs IDIs (Insulin-deficient islets).
+Compare Insulitic ICI vs ICIs.
+
+# **A0: Settings and Data**
+
+## Load packages
+
+```{r packages, results='hide'}
+suppressPackageStartupMessages(c(
+  library(data.table),
+  library(dplyr),
+  library(SpatialExperiment),
+  library(scuttle),
+  library(parallel),
+  library(patchwork),
+  library(tidyr),
+  library(emmeans)
+))
+```
+
+
+```{r packages2, results='hide'}
+suppressPackageStartupMessages(c(
+  library(ggplot2),
+  library(viridis),
+  library(heatmaply),
+  library(dittoSeq),
+  library(ggridges),
+  library(rstatix),
+  library(ggpubr)
+))
+```
+## Paths and settings
+
+```{r settings}
+# Paths
+if (!dir.exists(paths$folder_script)) dir.create(paths$folder_script)
+plotsave_param$path <- paths$folder_script
+plotsave_param_large$path <- paths$folder_script
+
+# Misc settings
+today <- gsub("-", "", Sys.Date())
+emm_options(lmerTest.limit = 10000)
+```
+
+##  Read in the data
+
+Load the SpatialExperiment (SPE) object saved at the previous step.
+
+```{r load-data}
+fn_spe <- file.path(paths$folder_out, paths$prev, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+spe <- readRDS(fn_spe)
+print(spe)
+```
+
+## Parameters
+
+**Note: this step has to be manually adapted**  
+
+- Define the assay(s) of interest.  
+- Define the markers to keep for marker expression analysis.  
+
+```{r parameters}
+# Censor value for counts scaling
+censor_val <- 0.999
+
+# Select assays and reduced dimensions
+assay_sel <- c("exprs", "scaled")
+writeLines(c("Assay:", assay_sel[assay_sel %in% assayNames(spe)]))
+
+# Variables to plot
+plot_variables <- c("donor_type", "case_id")
+names(plot_variables) <- c("stages", "cases")
+cat("\nVariables to plot:", plot_variables)
+plot_variables_stages <- plot_variables["stages"]
+
+# List of cell types to plot
+celltypes <- names(metadata(spe)$channels)
+names(celltypes) <- celltypes
+
+# Color palette
+palette_ct <- palettes$colors[seq_along(celltypes)]
+names(palette_ct) <- celltypes
+
+# All channels to display
+channels <- unique(unlist(metadata(spe)$channels))
+```
+
+## Subset the SCE
+
+Retain only celltypes of interest.
+That is, Beta, Alpha, Delta, Acinar, Ductal, Endothelial and islet.
+```{r subset-spe}
+sce_sub <- as(spe, "SingleCellExperiment")
+sce_sub <- sce_sub[channels, sce_sub$cell_type %in% celltypes]
+remove_panreatitis <- TRUE
+if (remove_panreatitis) {
+  sce_sub <- sce_sub[, sce_sub$donor_type != "Pancreatitis"]
+}
+sce_sub$donor_type <- factor(sce_sub$donor_type, levels = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration")) # , "Pancreatitis"))
+```
+
+
+# A1: ICIs vs IDIs:
+- ICIs: Insulin-containing islets
+- IDIs: Insulin-deficient islets
+Differential Calculations make only sense for Alpha & Delta-cells; not Beta-cells.
+
+## A1.1: Prepare Data.
+Channels, Image, + Islet-composition.
+```{r ICIs-vs-IDIs}
+channels <- unique(c(metadata(spe)$channels$Beta,
+                     metadata(spe)$channels$Alpha, 
+                     metadata(spe)$channels$Delta))
+
+image_ids <- colData(sce_sub)$image_id |> unique()
+
+## Islet CT Composition.
+compositions <- metadata(sce_sub)$islet_compo |> 
+    as_tibble() |> 
+    filter(image_id %in% image_ids) |> 
+    mutate(islet_type = if_else(fraction_Beta > 0, "ICI", "IDI"))
+```
+
+Expression data by ROI + join with compositional data.
+```{r expression-data-ICI-IDI}
+## Get Expression Data for Alpha / Delta / Endothelial / T_cell / Macrophage
+## Aggregate by Image.
+cols_islet <- scuttle::makePerCellDF(spe, features = channels, assay.type = "exprs", use.coldata = TRUE, use.dimred = FALSE) |> 
+  as_tibble() |> 
+  filter(cell_type %in% c("Alpha", "Delta", "Endothelial", "Tcell", "Macrophage")) |> 
+  select(case_id, image_id, cell_type, donor_type, all_of(channels)) |> 
+  # group-by image_id, case_id, cell_type, donor_type
+  group_by(image_id, case_id, cell_type, donor_type) |>
+  summarise(across(all_of(channels), mean), .groups = "drop")
+
+## Join with islet composition.  
+cols_islet <- cols_islet |>
+  left_join(compositions, by = "image_id") |> 
+  filter(islet_type %in% c("ICI", "IDI")) |> 
+  tidyr::drop_na()
+```
+
+## A1.2: ICI vs IDI: Overviews.
+PLOT ISLET TYPE (ICI vs IDI)
+```{r islet_type}
+p <- cols_islet  |> 
+  dplyr::count(islet_type, donor_type) |> 
+  dplyr::group_by(donor_type) |>
+  dplyr::mutate(total = sum(n),
+                frac = n / total) |> 
+  ggplot(aes(x = islet_type, y = frac, fill = donor_type)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = palettes[["stages"]]) +
+  labs(x = "Islet type", y = "Fraction of islets", fill = "Stage") +
+  mytheme$standard()
+
+print(p)
+fn <- paste0(paste(today, "IsletType", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+
+p <- cols_islet  |> 
+  dplyr::count(islet_type, donor_type, case_id) |> 
+  dplyr::group_by(donor_type, case_id) |>
+  dplyr::mutate(total = sum(n),
+                frac = n / total) |> 
+  ggplot(aes(x = islet_type, y = frac, fill = donor_type)) +
+  geom_boxplot() +
+  geom_point(position = position_dodge(width = 0.75)) + 
+  scale_fill_manual(values = palettes[["stages"]]) +
+  labs(x = "Islet type", y = "Fraction of islets", fill = "Stage") +
+  mytheme$standard()
+
+print(p)
+fn <- paste0(paste(today, "IsletType", "Boxplot", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+## A1.3: Compute ICIs vs IDIs via LMM
+
+### A1.3.1: LMM across everything for explorative overview.
+Differential expression between ICIs and IDIs by MM-model.
+Note: few IDIs in mAAb+.
+
+This is mostly explorative.
+```{r diff_exprs-ici-idi}
+## ICI images.
+ici_images <- cols_islet |> 
+  filter(islet_type == "ICI") |>
+  pull(image_id) |> unique()
+
+## Select mAAb+ and RecentOnset
+cols_islet_oi <- cols_islet |> 
+  filter(donor_type %in% c("mAAb+", "RecentOnset")) |> 
+  tidyr::pivot_longer(cols = c(all_of(channels)), names_to = "channel", values_to = "MeanExprs") |>
+  dplyr::mutate(islet_type = factor(islet_type, levels = c("ICI", "IDI"))) |> 
+  dplyr::select(case_id, image_id, cell_type, donor_type, channel, islet_type, MeanExprs)
+
+## Run MM-model (without random slopes)
+results <- cols_islet_oi |>
+  ## nest per donor_type
+  tidyr::nest(data = -c(donor_type, channel, cell_type)) |> 
+  dplyr::mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(data = ., MeanExprs ~ islet_type + (1 | case_id))))) |> 
+  tidyr::unnest(test)  |> 
+  filter(term == "islet_typeIDI") |>
+  # log10 transform p-values
+  dplyr::select(channel, donor_type, p.value, statistic, estimate, cell_type)
+
+## Compare random slope + random intercept vs random intercept only. 
+results2 <- cols_islet_oi |>
+  ## nest per donor_type
+  tidyr::nest(data = -c(donor_type, channel, cell_type)) |> 
+  dplyr::mutate(test = purrr::map(data, ~ 
+    broom.mixed::tidy(lmerTest::lmer(data = ., MeanExprs ~ islet_type + (1 + islet_type | case_id))))) |> 
+  tidyr::unnest(test)  |> 
+  filter(term == "islet_typeIDI") |>
+  # log10 transform p-values
+  dplyr::select(channel, donor_type, p.value, statistic, estimate, cell_type)
+```
+
+-> random slopes should not be included. 
+-> stay with random intercept only model for further analysis.
+
+
+### A1.3.2: Plot results.
+
+Overview.
+Macrophages, Delta, Alpha, Endothelial cells.
+
+```{r ici-idi-diffexp-plot}
+channels_macro <- c("ADAR", "C3", "ATPIF1", "CD155", "CAIX", "CD9", 
+                    "HLA_ABC", "B2M", "NFkB", "Ki67",
+                    "XBP1", "ERN1", "TXNIP", "WFS1")
+metadata(spe)$channels$Macrophage <- channels_macro
+
+purrr::map(c("Macrophage", "Delta", "Alpha", "Endothelial"), \(ct) {
+  p <- results |>
+    filter(cell_type == !!ct) |> 
+    filter(abs(statistic) > 1) |>
+    filter(channel %in% metadata(spe)$channels[[!!ct]]) |> 
+    ## Plot:
+    ggplot(aes(x = channel, y = statistic, fill = donor_type)) +
+    geom_hline(yintercept = 2, linetype = "dashed") +
+    geom_hline(yintercept = -2, linetype = "dashed") +
+    geom_bar(stat = "identity", position = "dodge") +
+    scale_fill_manual(values = palettes[["stages"]]) +
+    labs(x = "Channel", y = "t-statistic", fill = "Stage") +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+    mytheme$standard() + 
+    labs(title = ct)
+  print(p)
+  fn <- paste0(paste(today, ct, "ici_idi_diffexp", sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param))
+})
+
+purrr::map(c("Macrophage", "Delta", "Alpha", "Endothelial"), \(ct) {
+  p <- results2 |>
+    filter(cell_type == !!ct) |> 
+    filter(abs(statistic) > 1) |>
+    filter(channel %in% metadata(spe)$channels[[!!ct]]) |> 
+    ## Plot:
+    ggplot(aes(x = channel, y = statistic, fill = donor_type)) +
+    geom_hline(yintercept = 2, linetype = "dashed") +
+    geom_hline(yintercept = -2, linetype = "dashed") +
+    geom_bar(stat = "identity", position = "dodge") +
+    scale_fill_manual(values = palettes[["stages"]]) +
+    labs(x = "Channel", y = "t-statistic", fill = "Stage") +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+    mytheme$standard() + 
+    labs(title = paste(ct, " (Random Slope)"))
+  print(p)
+  fn <- paste0(paste(today, ct, "ici_idi_diffexp_randomsl", sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param))
+})
+```
+
+Results: 
+Alpha-cells:
+ICI: Inflammation (MHC-I, MX1, SYP).
+IDI: Homeostasis (GCG (!) + ProGCG (!), Islet TFs / all other nuclear markers).
+
+ER-stress: 
+-> *Higher* rates of ERN1 (sig.), TXNIP (sig.); WFS1, XBP1 (ns)!
+-> lower rates of NFkB (ns).
+
+Delta-cells:
+Similar results; but SST loss actually for IDI vs ICI. 
+
+Macrophages:
+- ICI: MHC-I upregulation (p < -26); 
+- Inflammation/Stress: CAIX, CD155, NFkB, TXNIP, XBP1 upregulation (M1-like).
+- IDI: C3 only. -> more homeostatic role?
+
+Plot stress markers + ER-stress markers for Alpha/Delta.
+
+```{r}
+features_oi <- c("ERN1", "XBP1", "WFS1", "TXNIP", "CD155", "NFkB")
+
+purrr::map(c("Macrophage", "Delta", "Alpha", "Endothelial"), \(ct) {
+  p <- results2 |>
+    filter(cell_type == !!ct) |> 
+    filter(abs(statistic) > 1) |>
+    filter(channel %in% metadata(spe)$channels[[!!ct]]) |> 
+    ## Plot:
+    ggplot(aes(x = channel, y = statistic, fill = donor_type)) +
+    geom_hline(yintercept = 2, linetype = "dashed") +
+    geom_hline(yintercept = -2, linetype = "dashed") +
+    geom_bar(stat = "identity", position = "dodge") +
+    scale_fill_manual(values = palettes[["stages"]]) +
+    labs(x = "Channel", y = "t-statistic", fill = "Stage") +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+    mytheme$standard() + 
+    labs(title = paste(ct, " (Random Slope)"))
+  print(p)
+  fn <- paste0(paste(today, ct, "ici_idi_diffexp_randomsl", sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param))
+})
+```
+
+
+
+## A1.4: Plot ICI comparisons (celltype-specific)
+
+### A1.4.1: Alpha-cells LMMs 
+Compare ICI vs IDI for Alpha-cells.
+
+**NOTE: automatically only computes for Recent-onset!**
+-> too few IDIs for mAAb+ cases.
+
+```{r ici-idi-alphas}
+## Homeostatic markers.
+p <- plot_ici_insulitic_expression(df = cols_islet, features_oi = c("HLA_ABC", "ECad", "GCG", "ProGCG"), 
+                                   cell_types = "Alpha",
+                                   cur_var = "islet_type", x_var = "islet_type",
+                                   group1 = "ICI", group2 = "IDI", facet_by = "channel", 
+                                   y_label = "Alpha-cell expression", 
+                                   cur_palette = palettes$colors[3:4]) + 
+                                   geom_line(aes(group = case_id), alpha = 0.5) + 
+                                   theme(legend.position = "none")
+
+fn <- paste0(paste(today, "Boxplot", "Alpha", "ICI_IDI", "HLA_ABC", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+print(p)
+
+## ER-stress + functional markers.
+cols_islet <- cols_islet |> dplyr::rename("IRE1a-P" = ERN1)
+
+p <- plot_ici_insulitic_expression(df = cols_islet, 
+                                  features_oi = c("IRE1a-P", "XBP1", "WFS1", "TXNIP", "CD155", "NFkB", "HLA_ABC", "GCG"), 
+                                   cell_types = "Alpha",
+                                   cur_var = "islet_type", x_var = "islet_type",
+                                   group1 = "ICI", group2 = "IDI", facet_by = "channel", 
+                                   y_label = expression(alpha ~ " -cell normalized counts"),
+                                   cur_palette = palettes$colors[3:4]) + 
+                                   geom_line(aes(group = case_id), alpha = 0.5) +
+                                   theme(legend.position = "none")
+
+fn <- paste0(paste(today, "Boxplot", "Alpha", "ICI_IDI", "ER_stress", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+print(p)
+
+saveRDS(p, file.path(paths$home_git, "figures", "extfig4i.rds"))
+
+q <- cols_islet |> 
+  filter(cell_type == "Alpha") |> 
+  select(image_id, case_id, cell_type, donor_type, islet_type, ProGCG) |> 
+  group_by(donor_type, case_id, islet_type) |>
+  summarise(ProGCG = mean(ProGCG), .groups = "drop") |>
+  filter((donor_type == "NoDiabetes" & islet_type == "ICI") | 
+         (donor_type == "sAAb+" & islet_type == "ICI") |
+         (donor_type == "mAAb+" & islet_type == "ICI") |
+         (donor_type == "RecentOnset" & islet_type == "ICI") |
+         (donor_type == "RecentOnset" & islet_type == "IDI") |
+         (donor_type == "LongDuration" & islet_type == "IDI")) |>
+  mutate(donor_type = factor(donor_type, levels = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration"))) |> 
+
+  ggplot(aes(x = donor_type, y = ProGCG, fill = islet_type)) +
+  geom_boxplot(aes(fill = donor_type), position = position_dodge()) +
+  geom_point() + 
+  labs(x = "Stage", y = "ProGCG expression", color = "Islet type") +
+  mytheme$standard()
+print(q)
+# SST very variable across stages.
+```
+
+### A1.4.2: Delta-cells LMMs.
+
+Unexpectedly, SST higher in ICIs.
+ER-stress markers show same pattern as for Alpha-cells.
+
+```{r delta-cells-icis-lmms}
+p <- plot_ici_insulitic_expression(df = cols_islet, features_oi = c("HLA_ABC", "ECad", "SST", "PCSK1"), 
+                                   cell_types = "Delta",
+                                   cur_var = "islet_type", x_var = "islet_type",
+                                   group1 = "ICI", group2 = "IDI", facet_by = "channel", 
+                                   y_label = "Delta-cell expression", 
+                                   cur_palette = palettes$colors[3:4]) + 
+                                   geom_line(aes(group = case_id), alpha = 0.5) + 
+                                   theme(legend.position = "none")
+
+fn <- paste0(paste(today, "Boxplot", "Delta", "ICI_IDI", "HLA_ABC", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+print(p)
+
+p <- plot_ici_insulitic_expression(df = cols_islet, 
+                                   features_oi = c("IRE1a-P", "XBP1", "WFS1", "TXNIP", "CD155", "NFkB"), 
+                                   cell_types = "Delta",
+                                   cur_var = "islet_type", x_var = "islet_type",
+                                   group1 = "ICI", group2 = "IDI", facet_by = "channel", 
+                                   y_label = "Delta-cell expression", 
+                                   cur_palette = palettes$colors[3:4]) + 
+                                   geom_line(aes(group = case_id), alpha = 0.5) + 
+                                   theme(legend.position = "none")
+
+fn <- paste0(paste(today, "Boxplot", "Delta", "ICI_IDI", "ER_stress", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+print(p)
+
+q <- cols_islet |> 
+  filter(cell_type == "Delta") |> 
+  select(image_id, case_id, cell_type, donor_type, SST) |> 
+  group_by(donor_type, case_id) |>
+  summarise(SST = mean(SST)) |>
+  mutate(donor_type = factor(donor_type, levels = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration"))) |> 
+  ggplot(aes(x = donor_type, y = SST, fill = donor_type)) +
+  geom_boxplot(aes(fill = donor_type)) +
+  geom_point() + 
+  scale_fill_manual(values = palettes[["stages"]][1:5]) +
+  labs(x = "Stage", y = "SST expression", color = "Islet type") +
+  mytheme$standard()
+print(q)
+# SST very variable across stages.
+```
+
+## A1.5: ICI: peri-islet only (Macrophages, Endothelial, T-cells)
+
+### A1.5.1: Prepare Data
+
+Select only intra-islet + peri-islet cells. (p < -20).
+```{r islet-resident-cells}
+channels <- c("B2M", "C3", "CAIX", "CD155", "CD9", "HLA_ABC", "Ki67", "MX1", "NFkB",
+            "PDL1", "XBP1", "TXNIP", "WFS1", "ERN1", "ATPIF1", "ADAR", "VIM", "CD163",
+            "GCG", "ProGCG", "SST", "PCSK1")
+
+cols_islet <- scuttle::makePerCellDF(spe, features = channels, assay.type = "exprs", use.coldata = TRUE, use.dimred = FALSE) |> 
+  as_tibble() |> 
+  filter(cell_type %in% c("Endothelial", "Tcell", "Macrophage", "Alpha")) |> 
+  select(case_id, image_id, cell_type, distance_to_islet, donor_type, all_of(channels)) |> 
+  filter(distance_to_islet < -20) |> 
+  group_by(image_id, case_id, cell_type, donor_type) |>
+  summarise(across(all_of(channels), mean), .groups = "drop")
+
+## Join with islet composition.  
+cols_islet <- cols_islet |>
+  left_join(compositions, by = "image_id") |> 
+  filter(islet_type %in% c("ICI", "IDI")) |> tidyr::drop_na()
+
+## Select mAAb+ and RecentOnset
+test_cols_islet <- cols_islet |> 
+  filter(donor_type %in% c("mAAb+", "RecentOnset")) |> 
+  tidyr::pivot_longer(cols = c(all_of(channels)), names_to = "channel", values_to = "MeanExprs") |>
+  dplyr::mutate(islet_type = factor(islet_type, levels = c("ICI", "IDI"))) |> 
+  dplyr::select(case_id, image_id, cell_type, donor_type, channel, islet_type, MeanExprs)
+```
+
+### A1.5.2: Run LMMs
+```{r lmm-peri-islet}
+## Run MM-model
+results <- test_cols_islet  |> 
+  ## nest per donor_type
+  tidyr::nest(data = -c(donor_type, channel, cell_type)) |> 
+  dplyr::mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(data = ., MeanExprs ~ islet_type + (1 | case_id))))) |> 
+  tidyr::unnest(test)  |> 
+  filter(term == "islet_typeIDI") |>
+  dplyr::select(channel, donor_type, p.value, statistic, estimate, cell_type)
+```
+
+### A1.5.3: Plot LMM results
+
+```{r mm-results-islet-resident} 
+metadata(spe)$channels$Tcell <- c("CD3", 
+                                  "B2M", "HLA_ABC", "NFkB", "ADAR", "MX1",
+                                  "CD155", "CD9", "Ki67", "ATPIF1", 
+                                  "XBP1", "TXNIP", "WFS1", "ERN1")
+
+## Plot results
+purrr::map(c("Macrophage", "Endothelial", "Tcell"), 
+            \(ct){
+  p <- results |> 
+    filter(cell_type == !!ct) |> 
+    filter(p.value < 0.05) |> 
+    filter(channel %in% metadata(spe)$channels[[!!ct]]) |>
+    ggplot(aes(x = channel, y = statistic, fill = donor_type)) +
+    geom_hline(yintercept = 2, linetype = "dashed") +
+    geom_hline(yintercept = -2, linetype = "dashed") +
+    geom_bar(stat = "identity", position = "dodge") +
+    scale_fill_manual(values = palettes[["stages"]]) +
+    labs(x = "Channel", y = "t-statistic", fill = "Stage") +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+    mytheme$standard() + 
+    labs(title = ct)
+  print(p)
+  fn <- paste0(paste(today, ct, "islet_resident", sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param))
+})
+
+## Results: 
+## Islet-resident Endothelial ICI -> Upregulation MHC-I. 
+## Islet-resident ENdothelial IDI (nothing jumps out).
+
+## Peris-Islet-resident Macrophages: 
+## Similarly multiple ER-sterss markers + inflammation markers 
+## upregulated in IDI.
+
+# -> Note MX1 much higher in ICI in Immune Cells as well. 
+## BUT: again across progression no major differences.
+cols_islet |> 
+  filter(cell_type == "Macrophage") |>
+  group_by(donor_type) |>
+  summarise(mean(MX1), .groups = "drop")
+```
+
+### A1.5.4: Plot ICI vs IDI for Peri-islet Macrophages
+Compare ICI vs IDI for Peri-islet Macorphages.
+```{r peri-islet-macrophages}
+cols_islet
+
+p <- plot_ici_insulitic_expression(df = cols_islet, features_oi = c("HLA_ABC", "NFkB", "CD155", "CD163"), 
+                                   cell_types = "Macrophage",
+                                   cur_var = "islet_type", x_var = "islet_type",
+                                   group1 = "ICI", group2 = "IDI", facet_by = "channel", 
+                                   y_label = "Macrophage expression", 
+                                   cur_palette = palettes$colors[3:4]) + 
+                                   geom_line(aes(group = case_id), alpha = 0.5) + 
+                                   theme(legend.position = "none")
+print(p)
+fn <- paste0(paste(today, "Boxplot", "Macrophages", "ICI_IDI", "HLA_ABC", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+extfig9c <- p
+saveRDS(extfig9c, file.path(paths$home_git, "figures", "extfig9c.rds"))
+```
+
+
+# **A2: Insulitis**
+- Insulitis is defined as the presence of 6 >= CD3+ (T-cells) immune cells within the islets.
+- Progression: 
+  - CTRL -> Inflammation ICI -> Insulitic ICI -> Insulitic IDI -> IDI
+
+- Before we compared: Inflammation ICI (containing few Insulitic ICI) vs Inflammation IDI
+- NOW: Inflammation ICI vs Insulitic ICI.
+
+-> Now we hope to identify Insulitic ICI SPECIFIC markers.
+
+## A2.1: Prepare Data.
+```{r insulitic}
+## Define Insulitic Islets.
+channels_islet <- unique(c(metadata(spe)$channels$Endothelial, 
+                          metadata(spe)$channels$Beta, metadata(spe)$channels$Alpha,
+                          metadata(spe)$channels$Delta, metadata(spe)$channels$Macrophage))
+
+## ROI-level Data including ICI information.
+exprs_df <- as_tibble(scuttle::makePerCellDF(spe, features = channels_islet, assay.type = "exprs", use.dimred = FALSE)) |> 
+  select(all_of(channels_islet), case_id, donor_type, image_id, cell_type, distance_to_islet) |> 
+  filter(donor_type != "Pancreatitis") |> 
+  group_by(image_id, case_id, donor_type) |>
+  mutate(islet_type = if_else(sum(cell_type == "Beta") > 0, "ICI", "IDI")) |> 
+  mutate(insulitic = if_else(sum(cell_type == "Tcell" & distance_to_islet >= 0) >= 6, "insulitis", "non-insulitis")) |> 
+  ungroup() |> 
+  mutate(donor_type = factor(donor_type, levels = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration")))
+
+fn <- file.path(paths$folder_out, "13_MarkerExpression_cells_Immune", "insulitic_images.rds")
+if (file.exists(fn)) {
+  image_ids <- readRDS(fn)
+  image_ids <- gsub("_Immune_", "_Islet_", image_ids)
+  exprs_df <- exprs_df |> 
+    mutate(insulitic = if_else(image_id %in% image_ids, "insulitis", "non-insulitis"))
+}
+```
+
+## A2.2: Expression changes between Insulitic and Non-Insulitic Islets:
+
+```{r insulitic-vs-non-insulitic}
+### Prepare the data
+immune_insulitic <- exprs_df |> 
+  filter(cell_type %in% c("Alpha", "Delta", "Endothelial", "Macrophage", "Beta", "Tcell"))
+
+# Take only PERI_ISLET + ICI + INSULITIC Ones.
+stats <- immune_insulitic  |> 
+  filter(donor_type == "RecentOnset", islet_type == "ICI") |>
+  filter(distance_to_islet >= -20) |>
+  group_by(image_id, insulitic, case_id, cell_type) |>
+  summarize(across(channels_islet, \(x) mean(x, na.rm = TRUE)), .groups = "drop") |>
+  tidyr::pivot_longer(cols = all_of(channels_islet), names_to = "channel", values_to = "value") |>
+  tidyr::nest(data = -c(channel, cell_type)) |>
+  dplyr::mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(data = ., value ~ insulitic + (1 | case_id))))) |>
+  tidyr::unnest(test) |>
+  filter(term != "(Intercept)", effect == "fixed") |>
+  arrange(p.value) |> 
+  mutate(p.adj = p.adjust(p.value, method = "fdr"))
+```
+
+## A2.3: Plot overview: Insulitic and Non-Insulitic Islets.
+
+```{r plot-overview-non-insulitic}
+## Plot - Islet:
+palettes$celltypes <- c("Alpha" = palettes$colors[1], "Beta" = palettes$colors[2], 
+                       "Delta" = palettes$colors[4])
+p <- stats |> 
+  filter(p.value < 0.1) |>
+  filter(!channel %in% c("ARX", "PDL1")) |> 
+  filter(!cell_type %in% c("Endothelial", "Macrophage", "Tcell")) |> 
+  ggplot(aes(x = channel, y = statistic, fill = cell_type)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(x = "Channel", y = "Statistic", color = "Channel", title = "random_Int") +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values = palettes$celltypes)
+print(p)
+fn <- paste0(paste(today, "Insulitic_vs_NonInsulitic", "ICI", "Islets", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+### Plot - Non-islet cells:
+palettes$celltypes <- c("Macrophage" = palettes$colors[6], "Endothelial" = palettes$colors[7], "Tcell" = palettes$colors[8]) 
+p <- stats |> 
+  filter(p.value < 0.1) |>
+  filter(!channel %in% c("ARX", "PDL1")) |>
+  filter(cell_type %in% c("Endothelial", "Macrophage", "Tcell")) |> 
+  ggplot(aes(x = channel, y = statistic, fill = cell_type)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(x = "Channel", y = "Statistic", color = "Channel") +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values = palettes$celltypes)
+
+print(p)
+fn <- paste0(paste(today, "Insulitic_vs_NonInsulitic", "ICI", "Non_Islets", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+## A2.4: Insulitic. Cell-Types.
+
+### A2.4.1: Beta-cells Insulitic vs Non-Insulitic ROIs.
+Beta-cells Insulitic vs non-Insulitic ROIs.
+
+Figure 2f.
+```{r plot-fig-3f-beta}
+## Compare between Insulitic and Non-insulitic ICIs.
+insulitic_df <- immune_insulitic |> 
+  mutate(insulitic = ifelse(insulitic == "insulitis", "Insulitic", "Non-Insulitic")) |>
+  mutate(insulitic = factor(insulitic, levels = c("Insulitic", "Non-Insulitic")))
+
+## Cases that have Insulitic Islets (paired).
+insulitic_df |> 
+  filter(islet_type == "ICI") |>
+  distinct(insulitic, donor_type, case_id) |> 
+  filter(insulitic == "Insulitic") |> 
+  filter(donor_type == "RecentOnset") |>
+  pull(case_id) -> cases_insulitic
+
+to_del <- c("6324", "6533")
+
+## 
+p <- plot_ici_insulitic_expression(df = insulitic_df |> filter(case_id %in% cases_insulitic, !case_id %in% to_del, image_id %in% ici_images),
+                                   features_oi = c("HLA_ABC", "MX1", "ADAR", "ECad"), 
+                                   cell_types = "Beta", cur_var = "insulitic", x_var = "insulitic",
+                                   group1 = "Insulitic", group2 = "Non-Insulitic", 
+                                   facet_by = "channel",
+                                   y_label = expression(beta ~"-cell expression"), 
+                                   cur_palette = palettes$colors[1:2]) + 
+                                   mytheme$standard_new() + 
+                                   geom_line(aes(group = case_id), alpha = 0.5, color = "black") + 
+                                   theme(legend.position = "none")
+
+print(p)
+fn <- paste0(paste(today, "Boxplot", "BetaCells", "Insulitic_vs_NonInsulitic", "HLA_ABC", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+fig2f <- p
+saveRDS(fig2f, file.path(paths$home_git, "figures", "fig2f.rds"))
+```
+
+### A2.4.2: Islet-cells Insulitic vs Non-Insulitic ROIs.
+
+We observed islet-wide upregulation of MX1, HLA-ABC, B2M in islet-cells,
+but more specific beta-cell upregulation of ADAR in beta-cells.
+(Non-significant in alpha-cells; and reduced effect size in delta-cells).
+Thus, plot them for beta, alpha and delta cells.
+
+```{r insulitic-islet-cells}
+## Compare between Insulitic and Non-insulitic ICIs.
+insulitic_df <- immune_insulitic |> 
+  mutate(insulitic = ifelse(insulitic == "insulitis", "Insulitic", "Non-Insulitic")) |>
+  mutate(insulitic = factor(insulitic, levels = c("Insulitic", "Non-Insulitic"))) |> 
+  filter(islet_type == "ICI")
+
+insulitic_df <- insulitic_df |> 
+  filter(case_id %in% cases_insulitic, image_id %in% ici_images, !case_id %in% to_del)
+
+p <- plot_ici_insulitic_expression(df = insulitic_df, 
+                                   features_oi = c("HLA_ABC", "MX1", "ADAR", "ECad"), 
+                                   cell_types = c("Alpha", "Delta"),
+                                   cur_var = "insulitic", x_var = "cell_type",
+                                    group1 = "Insulitic", group2 = "Non-Insulitic", facet_by = "channel",
+                                    y_label = "Islet-cell expression", 
+                                    cur_palette = palettes$colors[1:2]) + 
+                                    mytheme$standard_new() +
+                                    theme(legend.position = "none")
+
+fn <- paste0(paste(today, "Boxplot", "IsletCells", "Insulitic_vs_NonInsulitic", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+print(p)
+extfig4f <- p
+saveRDS(extfig4f, file.path(paths$home_git, "figures", "extfig4f.rds"))
+```
+
+### A2.4.3: Beta-cells Insulitic vs Non-Insulitic ROIs - ER-stress
+
+ER-stress markers. Only ERN1 non-significantly higher.
+
+```{r insulitic-beta-cells-er}
+p <- plot_ici_insulitic_expression(df = insulitic_df |> dplyr::filter(!case_id %in% to_del) |> dplyr::rename("IRE1a-P" = ERN1), 
+                                    features_oi = c("IRE1a-P", "WFS1", "XBP1", "ECad", "TXNIP", "NFkB"), 
+                                    cell_types = "Beta", cur_var = "insulitic", x_var = "insulitic",
+                                    group1 = "Insulitic", group2 = "Non-Insulitic", facet_by = "channel",
+                                    y_label = expression(beta ~"-cell mean expression"), 
+                                    cur_palette = palettes$colors[1:2]) + 
+                                    mytheme$standard_new() + 
+                                    geom_line(aes(group = case_id), alpha = 0.5, color = "black") + 
+                                    theme(legend.position = "none")
+                                    
+fn <- paste0(paste(today, "Boxplot", "BetaCells", "Insulitic_vs_NonInsulitic", "ER_stress", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+print(p)
+extfig4h <- p
+saveRDS(extfig4h, file.path(paths$home_git, "figures", "extfig4h.rds"))
+```
+
+### A2.4.4: Islet-cells: Insulitic vs Non-Insulitic ROIs - ER-stress
+
+ER-stress markers. Only ERN1 non-significantly higher.
+
+```{r insulitic-islet-cells-er}
+p <- plot_ici_insulitic_expression(df = insulitic_df |> filter(!case_id %in% to_del), 
+                                   features_oi = c("ERN1", "WFS1", "XBP1", "ECad", "TXNIP", "NFkB"), 
+                                   cell_types = c("Alpha", "Delta"),
+                                   cur_var = "insulitic", x_var = "cell_type",
+                                   group1 = "Insulitic", group2 = "Non-Insulitic", facet_by = "channel",
+                                   y_label = "Islet-cell expression", 
+                                   cur_palette = palettes$colors[1:2]) + 
+                                   mytheme$standard_new() + 
+                                   theme(legend.position = "none")
+                                    
+fn <- paste0(paste(today, "Boxplot", "Islet", "Insulitic_vs_NonInsulitic", "ER_stress", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+print(p)
+```
+
+### A2.4.5: Beta-cells: Lineage markers.
+Lineage markers are higher in insulitic islets. 
+But this is actually driven mainly by outliers; no consistent effect.
+
+```{r insulitic-beta-cells-er}
+p <- plot_ici_insulitic_expression(df = insulitic_df |> filter(!case_id %in% to_del), 
+                                    features_oi = c("ProINS", "INS", "PDX1", "NKX6_1"), 
+                                    cell_types = "Beta", cur_var = "insulitic", x_var = "insulitic",
+                                    group1 = "Insulitic", group2 = "Non-Insulitic", facet_by = "channel",
+                                    y_label = expression(beta ~"-cell mean expression"), 
+                                    cur_palette = palettes$colors[1:2]) + 
+                                    mytheme$standard_new() + 
+                                    geom_line(aes(group = case_id), alpha = 0.5, color = "black") + 
+                                    theme(legend.position = "none")
+                                    
+fn <- paste0(paste(today, "Boxplot", "BetaCells", "Insulitic_vs_NonInsulitic", "Lineage_Markers", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+print(p)
+```

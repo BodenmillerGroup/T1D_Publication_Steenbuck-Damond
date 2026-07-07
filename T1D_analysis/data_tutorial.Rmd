@@ -1,0 +1,334 @@
+# A0: Aims and Summary:
+Here, we show how to access, visualize and analyze the Steenbuck-Damond et al. 2026 IMC datasets. 
+
+```{r}
+library(SpatialExperiment)
+```
+
+# A1: Data Access:
+
+We suggest to use the `imcdatasets` package to access the SingleCellExperiment (SCE) and mask data.
+Per panel, we provide one set of images, masks, and SCE objects.
+And suggest to use the `Zenodo` entry (linked from the publication) to download all other data (images, models, raw data).
+
+## Pancreatlas:
+
+An informative subset of the data can be visualized in the Pancreatlas web portal (https://www.pancreatlas.org).
+Pancreatlas provides a user-friendly interface for visualizing annotated images from the two IMC panels.
+Pancreatlas allows the user to visualize the "Islet" and "Immune" panel side-by-side, which is useful for jointly visualizing and analyzing the 79 unique measured protein markers.  
+Data can be filtered via distinct annotations, such as "Insulitic". 
+
+Pancreatlas uses the same `image_id` as the SCE and image/mask data, which allows for easy linking of the data across the different platforms.
+
+## Zenodo:
+
+Full Data (masks, images, models, processed SCE objects, raw data) are available from:
+- Zenodo: https://zenodo.org/record/14968076 and linked repositories.
+
+## imcdatasets: 
+
+The full data (masks, SCE object) or a subset (masks, images, SCE objects) can be accessed via the `imcdatasets` package.
+
+NOTE: The data is currently being added to `imcdatasets` and uploaded to `ExperimentHub`. 
+Until then, please pull the data from this Zenodo repository (https://zenodo.org/uploads/21167694).
+This is the SAME data as will be available via `imcdatasets`.
+
+Data does not differ strongly from the original Zenodo upload, 
+but additional metadata columns are included and naming conventions have been updated. 
+
+```{r}
+# require(devtools)
+# devtools::install_github("BodenmillerGroup/imcdatasets")
+```
+
+### Import function
+
+Function to download and read RDS files.
+
+```{r import-function}
+importAndReadData <- function(url, output_dir, filename) {
+  # Create full path
+  file_path <- file.path(output_dir, filename)
+  # Download the RDS file
+  if (!file.exists(file_path)) {
+    download.file(url, destfile = file_path, mode = "wb")
+  }
+  # Read and return the RDS object
+  readRDS(file_path)
+}
+```
+
+### Download SCEs
+
+
+```{r dataset-version, echo=FALSE}
+dataset_name <- "SteenbuckDamond_2026_Pancreas"
+dataset_version <- "v1"
+cat("Dataset version:", dataset_version)
+```
+
+Setting the working and output directories
+
+```{r directories}
+# Temporary directory to unzip files
+# workdir <- tempdir()
+workdir <- getwd()
+Sys.setenv(workdir = workdir)
+
+# Output directory
+dataset_dir <- file.path(".", dataset_name)
+if(!(dir.exists(dataset_dir))) dir.create(dataset_dir)
+
+outdir <- file.path(dataset_dir, dataset_version)
+if(!(dir.exists(outdir))) dir.create(outdir)
+
+# Increase timeout period so that large files can be downloaded
+timeout <- getOption('timeout')
+options(timeout = 1000)
+```
+
+Note: this downloads the SUBSET of the SCEs.
+
+```{r download-sce}
+# Download SCE SUBSET.
+url_sce_islet <- "https://zenodo.org/records/21240077/files/sce_islet.rds"
+url_sce_immune <- "https://zenodo.org/records/21240077/files/sce_immune.rds"
+
+# FULL SCEs:
+# url_sce_islet <- "https://zenodo.org/records/21240077/files/sce_full_islet.rds"
+# url_sce_immune <- "https://zenodo.org/records/21240077/files/sce_full_immune.rds"
+
+url_sces <- c(url_sce_islet, url_sce_immune)
+names(url_sces) <- c("islet", "immune")
+
+sce_list <- purrr::imap(url_sces, function(url, name) importAndReadData(url, workdir, paste0("sce_", name, ".rds")))
+```
+
+# A2: Data 
+
+## A2.1: Markers
+
+Per panel, we measured 47 markers, including 2 DNA markers.
+Note: PD-L1 was not specific and was not analyzed. 
+
+```{r markers}
+(rownames(sce_list[["islet"]]))
+(rownames(sce_list[["immune"]]))
+```
+
+Some cell-type expressed markers are given in the SCE metadata (not exhaustive).
+
+```{r channels}
+metadata(sce_list[["islet"]])$channels
+metadata(sce_list[["immune"]])$channels
+```
+
+## A2.2: Cell Categories, Cell Types and Cell States
+
+Cell Type Categories are available via the `cell_category` column in the `colData` of the SingleCellExperiment object 
+and distinguishes major cell categories like `Endocrine`, `Exocrine`, `Immune`, `Mesenchymal` and `Endothelial`.
+
+Cell Type Annotation Information is available via the `cell_type` columns in the `colData` of the SingleCellExperiment object.
+
+```{r}
+(table(colData(sce_list[["islet"]])$cell_category))
+(table(colData(sce_list[["immune"]])$cell_category))
+
+(table(colData(sce_list[["islet"]])$cell_type))
+(table(colData(sce_list[["immune"]])$cell_type))
+```
+
+Cell Subclustering for key Immune cells Information is available via the `cell_cluster_scaled` column in the `colData` of the SingleCellExperiment object
+of the `Immune` panel. Names of the subclusters are available via the `myeloid_labels`, `tcd4_labels` and `tcd8_labels` objects.
+
+```{r}
+table(colData(sce_list[["immune"]])$cell_cluster_scaled)
+
+# Myeloid cells: Macs + cDCs.
+myeloid_labels <- c(
+  "Myeloid_1" = "Exocrine low act.", "Myeloid_2" = "M1/M2-like low act.",
+  "Myeloid_3" = "M1/M2-like act.", "Myeloid_4" = "cDC",
+  "Myeloid_5" = "CD11c+", "Myeloid_6" = "Exocrine act.",
+  "Myeloid_7" = "Exocrine MPO+", "Myeloid_8" = "CD54+", "Myeloid_Other" = "Ambiguous"
+)
+
+# T_CD4.
+tcd4_labels <- c(
+  "T_CD4_1" = "CD4+ Other",  "T_CD4_2" = "T-EM-like low act.",
+  "T_CD4_3" = "PD1+ low act.", "T_CD4_4" = "T-CM-like act.",
+  "T_CD4_5" = "PD1+ act.", "T_CD4_6" = "T-EM-like act.",
+  "T_CD4_7" = "PD1low act.", "T_CD4_8" = "PD1low low act.", 
+  "T_CD4_9" = "CD73+", "T_CD4_10" = "T-reg",
+  "T_CD4_Other" = "Ambiguous"
+)
+
+# T_CD8.
+tcd8_labels <- c(
+  "T_CD8_1" = "T-CD8 Other", "T_CD8_2" = "T-RM low act.",
+  "T_CD8_3" = "GranB+", "T_CD8_4" = "T-EM/CM-like",
+  "T-naive" = "T-naive", "T_CD8_6" = "T-RM act.",
+  "T_CD8_7" = "T-exeff", "T-EMRA" = "T-EMRA"
+)
+```
+
+## A2.3: Cell-specific annotations
+
+### A2.3.1: Distance to islet
+
+The distance of a cell to the nearest islet is available as `cell_distance_to_islet` column in the `colData`.
+A negative distance indicates that the cell is outside the islet, while a positive distance indicates that the cell is located outside of an islet.
+A distance of `-20` indicates that the cell is located 20 µm away from the islet.
+
+```{r}
+summary(colData(sce_list[["islet"]])$cell_distance_to_islet)
+summary(colData(sce_list[["immune"]])$cell_distance_to_islet)
+```
+
+### A2.3.2: Infiltration Score.
+
+The distance to the nearest islet is used to compute the the infiltration score. 
+This weights abundance and distance to islet for each immuen cell. 
+It is available both for Cell Types and Cell Subclusters in the `Immune Panel`.
+The "NormScoreArea" is the islet-area normalized infiltration score, as shown in the manuscript.
+
+```{r}
+metadata(sce_list[["immune"]])$celltype_compo_score |> 
+  tibble::as_tibble() |> 
+  dplyr::select(dplyr::starts_with("NormScoreArea"))
+
+metadata(sce_list[["immune"]])[["cluster_compo_score"]][[1]] |> 
+  tibble::as_tibble() |> 
+  dplyr::select(dplyr::starts_with("NormScoreArea"))
+```
+
+The `image_id` can be used to link the infiltration score to the respective expression data.
+
+### A2.3.3: Pseudotime-Beta cells.
+The pseudotime of a beta cell is available as the `cell_pseudotime_beta` column in the `colData`.
+This is only derived for beta-cells.
+The pseudotime is derived using slingshot and indicates the relative progression of beta-cells along a trajectory of beta-cell loss.
+
+```{r pseudotime_beta}
+colData(sce_list[["islet"]])[, c("cell_type", "cell_pseudotime_beta")] |> 
+    tibble::as_tibble() |> 
+    dplyr::filter(cell_type == "Beta") |>
+    dplyr::select(cell_pseudotime_beta)
+```
+
+## A2.4: Islet-level Information
+
+If one is interested in analyzing islet-level information, for example to analyze structural integrity of islets, 
+one can use the `islet_id` reflective of the islet masks available at `Zenodo`. 
+
+```{r}
+length(unique(colData(sce_list[["islet"]])$islet_id))
+length(unique(colData(sce_list[["immune"]])$islet_id))
+```
+
+
+
+## A2.5: ROI types
+
+Biologically important ROI types.
+These can be used to refine disease staging of islets. 
+IDIs are (if they experienced beta-cell loss) further in disease progression, than ICIs. 
+Insulitic ROIs should be further in disease progression than non-insulitic ROIs (if they are both ICIs).
+
+### A2.5.1: Insulitic ROIs.
+Insulitic ROI annotation are available via the 'image_insulitic' column in the `colData` of the SingleCellExperiment object.
+They were defined using the `Immune Panel`.
+
+```{r}
+colData(sce_list[["immune"]]) |> 
+    tibble::as_tibble() |> 
+    dplyr::group_by(image_id, patient_donor_type) |> 
+    dplyr::summarise(insultic = unique(image_insulitic), 
+                     n_cells = dplyr::n(),
+                     ici_idi = unique(image_ici_idi), .groups = "drop")
+```
+
+### A2.5.2: ICI vs IDIs.
+ICI vs IDIs (Insulitic containing vs deficient Islets) were defined using the `Islet Panel` and are available via the 'image_ici_idi' column in the `colData` of the SingleCellExperiment object.
+
+```{r}
+table(colData(sce_list[["islet"]])$image_ici_idi)
+```
+
+## A2.6: Niche Information:
+
+Spatial Tissue domains were only derived for the Immune panel. They are available via the 
+`CN_cn_k1070` column in the `colData` of the SingleCellExperiment object.
+
+```{r}
+table(colData(sce_list[["immune"]])[["CN_cn_k1070"]])
+```
+
+## A2.7: Metadata and Patient-Information. 
+
+General patient information and metadata is available in all columns with a "patient_" prefix. 
+Metadata of main interest are:
+`patient_case_id`, `patient_age`, `patient_donor_type`, `patient_diabetes_duration`.
+```{r}
+colnames(colData(sce_list[["islet"]])) |> 
+  stringr::str_subset("patient_")
+```
+
+# A3: Masks
+
+Whole-cell segmentation masks are available via `imcdatasets` (a subset and all masks) or via `Zenodo`.
+and can be read into a CytoImageList.
+
+## Download and unzip cell segmentation masks.
+```{r download-cell-masks}
+url_masks <- "https://zenodo.org/records/21240077/files/masks_islet.rds"
+dest_dir <- file.path(workdir, "mask_islet.rds")
+
+if (!file.exists(dest_dir)) {
+  download.file(url_masks, destfile = dest_dir, mode = "wb")
+}
+
+# IMMUNE PANEL
+url_masks <- "https://zenodo.org/records/21240077/files/masks_immune.rds"
+dest_dir <- file.path(workdir, "mask_immune.rds")
+
+if (!file.exists(dest_dir)) {
+  download.file(url_masks, destfile = dest_dir, mode = "wb")
+}
+````
+
+```{r create-cytoimagelist-masks}
+mask_islet <- readRDS(file.path(workdir, "mask_islet.rds"))
+mask_immune <- readRDS(file.path(workdir, "mask_immune.rds"))
+```
+
+
+# Images:
+Processed images (.tiffs):
+
+Data Subset are available in the following repositories:
+
+- Islet + Immune panel: https://zenodo.org/records/21240077
+- Full Image Data (.tiffs) are available via linked repositories (https://zenodo.org/record/14968076).
+
+
+```{r images-islet}
+dest_dir <- file.path(workdir, "images_islet.rds")
+
+if (!dir.exists(dest_dir)) {
+  url_img <- "https://zenodo.org/records/21240077/files/images_islet.rds"
+  download.file(url_img, destfile = dest_dir, mode = "wb")
+}
+
+images_islet <- readRDS(dest_dir)
+```
+
+```{r images-immune}
+dest_dir <- file.path(workdir, "images_immune.rds")
+
+if (!dir.exists(dest_dir)) {
+  url_img <- "https://zenodo.org/records/21240077/files/images_immune.rds"
+  download.file(url_img, destfile = dest_dir, mode = "wb")
+}
+
+images_immune <- readRDS(dest_dir)
+```

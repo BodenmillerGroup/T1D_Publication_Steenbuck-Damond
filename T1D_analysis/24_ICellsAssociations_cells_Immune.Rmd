@@ -455,7 +455,8 @@ p <- compo_cleaned |>
              size = 2, alpha = 0.7) +
   labs(x = "Donor Type", y = "log10: Organ Transport Time (Minutes)") +
   mytheme$standard_new() +
-  scale_fill_manual(values = palettes$stages)
+  scale_fill_manual(values = palettes$stages) + 
+  scale_y_continuous(limits = c(0, NA))
 
 print(p)
 fn <- paste0(paste(today, "Organ_transport_time", "Boxplot", sep = "_"), ".png")
@@ -486,7 +487,8 @@ p <- compo_cleaned |>
            digits = 2, method = "spearman", label.x.npc = "left", label.y.npc = "top", size = 8.5) +
   scale_color_manual(values = palettes$stages2, name = "Stage") + 
   theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
-  facet_wrap(~ cell_cluster, scales = "free_y", axes = "all")
+  facet_wrap(~ cell_cluster, scales = "free_y", axes = "all") + 
+  scale_y_continuous(limits = c(0, NA))
 
 p
 ## 
@@ -517,7 +519,8 @@ q <- compo_cleaned |>
   mytheme$large_new() +
   scale_fill_manual(values = palettes$cause_of_death, name = "Cause of Death") + 
   theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
-  facet_wrap(~ cell_cluster, scales = "free_y", axes = "all")
+  facet_wrap(~ cell_cluster, scales = "free_y", axes = "all") + 
+  scale_y_continuous(limits = c(0, NA))
 
 library(cowplot)
 fig <- (p + q + plot_layout(nrow = 2, guides = "collect")) & 

@@ -454,6 +454,9 @@ EnhancedVolcano::EnhancedVolcano(beta_cells_results,
   legendPosition = 'top') + mytheme$large_new() + 
   theme(plot.margin = unit(c(0, 0, 0, 0), unit = "pt"))
 dev.off()
+
+saveRDS(beta_cells_results, file.path(paths$folder_script, "rev_supplfig3b.rds"))
+
 ```
 
 ```{r}

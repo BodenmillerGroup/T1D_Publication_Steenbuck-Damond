@@ -1,0 +1,1103 @@
+---
+title: "19_TcellsInsulitis_cells_Immune"
+author: "Nathan Steenbuck"
+date: "Created: 15 May, 2024; Compiled: `r format(Sys.time(), '%d %b, %Y')`"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+if (rstudioapi::isAvailable()) {
+  script_name <- basename(rstudioapi::getSourceEditorContext()$path)
+} else {
+  script_name <- knitr::current_input()
+}
+
+cur_user <- Sys.info()[["user"]]
+script_name <- "19_TcellsInsulitis_cells_Immune.Rmd"
+
+if (cur_user == "ubuntu") {
+    source(file.path("/", "mnt", "central_nas", "projects", 
+    "type1_diabetes", "nathan", "T1D_Vol", "T1D_analysis", 
+    "analysis", "helpers.R"))  #n_cores <- future::availableCores() - 1
+    #n_cores <- future::availableCores() - 1
+  n_cores <- 4
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  knitr::opts_knit$set(root_dir = paths$home_data)
+  do_print <- FALSE
+} else {
+  source(file.path("/", "home", "nsteen", "scripts", "T1D_analysis", "analysis", "helpers.R"))
+  n_cores <- 8
+  future::plan(future::multicore(workers = n_cores))
+  paths <- getPaths(script_name)
+  paths$folder_script <- paths$cluster_folder_script
+  paths$folder_in <- paths$cluster_folder_in
+  paths$folder_out <- paths$cluster_home 
+  knitr::opts_knit$set(root_dir = paths$cluster_home)
+  do_print <- TRUE
+}
+
+seed <- 123456
+set.seed(seed)
+options <- furrr::furrr_options(seed = seed)
+paths$prev <- paste("08_CellTypesIslet", paths$object_type, paths$panel_type, sep = "_")
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# **Goal**
+
+Comparisons of T-cells in Insulitc and non-insulitic islets.
+
+# A1: **Settings**
+
+## A1.1: Load packages
+
+```{r packages, results='hide'}
+suppressPackageStartupMessages(c(
+  library(data.table),
+  library(dplyr),
+  library(SpatialExperiment),
+  library(scuttle),
+  library(parallel),
+  library(patchwork),
+  library(tidyr),
+  library(RSpectra),
+  library(rstatix),
+  library(ggpubr),
+  library(emmeans)
+))
+```
+
+## A1.2: Paths and settings
+
+```{r settings}
+# Paths
+if (!dir.exists(paths$folder_script)) dir.create(paths$folder_script)
+plotsave_param$path <- paths$folder_script
+plotsave_param_large$path <- paths$folder_script
+
+# Misc settings
+today <- gsub("-", "", Sys.Date())
+```
+
+## A1.3: Read in the data
+
+Load the SpatialExperiment (SPE) object saved at the previous step.
+
+```{r load-data}
+fn_spe <- file.path(paths$folder_out, paths$prev, paste0(paths$object_type, "_", paths$panel_type, ".rds"))
+spe <- readRDS(fn_spe)
+print(spe)
+```
+
+## A1.4: Read in Immune Subset only
+
+```{r load_sce_imm}
+sce_imm <- spe[, spe$cell_category == "immune"]
+# fn_sceimm <- file.path(paths$folder_script, paste0("sce_imm", "_", paths$object_type, "_", paths$panel_type, ".rds"))
+# saveRDS(sce_imm, fn_sceimm)
+# sce_imm <- readRDS(fn_sceimm)
+```
+
+# **A2: Insulitis**
+
+## A2.1: Define insulitis.
+Define Insulitis as >= 6 infiltrating T-cells. 
+Add DistScore + Infiltration Bins.
+```{r add-inf-score}
+## Prepare the data
+quantiles <- rev(quantile(spe$distance_to_islet[
+  spe$distance_to_islet <= 0], prob = c(0, 0.25, 0.5, 0.75, 0.89, 1)))
+print(quantiles)
+
+bins <- unname(round(quantiles))
+distances <- c("inside", "< 20 um", "20-40 um", "> 40 um")
+names(distances) <- RColorBrewer::brewer.pal(8, "Spectral")[c(1, 3, 4, 6)]
+print(distances)
+
+spe$infiltration <- ifelse(
+  spe$distance_to_islet > bins[1], distances[1],
+  ifelse(
+    spe$distance_to_islet < bins[1] & spe$distance_to_islet >= bins[2], distances[2],
+    ifelse(
+      spe$distance_to_islet < bins[2] & spe$distance_to_islet >= bins[3], distances[3], distances[4])
+    ))
+spe$infiltration <- factor(spe$infiltration, levels = distances)
+
+spe$DistScore = ifelse(spe$distance_to_islet >= -1, 1, 1 / abs(spe$distance_to_islet))
+spe$DistScoreSqrt <- ifelse(spe$distance_to_islet >= -1, 1, sqrt(abs(spe$distance_to_islet)))
+gc()
+```
+
+## A2.2: Define Insulitic Islets + ICIs
+Define Insulitic Islets + ICIs. Filter out Pancreatitis
+```{r label-insulitic}
+channels <- metadata(spe)$channels
+channels_imm <- unique(unlist(channels))
+
+## Define Insulitic Islets + ICIs.
+## Filter Pancreatitis
+exprs_df <- as_tibble(scuttle::makePerCellDF(spe, features = channels_imm, assay.type = "exprs", use.dimred = FALSE)) |> 
+  select(all_of(channels_imm), case_id, age, donor_type, DistScoreSqrt, DistScore, image_id, infiltration, cell_type, distance_to_islet, cell_cluster_scaled) |> 
+  filter(donor_type != "Pancreatitis") |> 
+  group_by(image_id, case_id, donor_type) |>
+  mutate(islet_type = if_else(sum(cell_type == "Beta") > 0, "ICI", "IDI")) |> 
+  mutate(tcell = if_else(cell_type %in% c("T_CD4", "T_CD8"), "T-cell", "non-T-cell")) |>
+  ungroup() |> 
+  mutate(donor_type = factor(donor_type, levels = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration")))
+
+icis <- exprs_df |> filter(islet_type == "ICI") |> pull(image_id) |> unique()
+
+## Get Ins. Islets
+fn <- file.path(paths$folder_out, "13_MarkerExpression_cells_Immune", "insulitic_images.rds")
+
+if (file.exists(fn)) {
+  image_ids <- readRDS(fn)
+  exprs_df <- exprs_df |> 
+    mutate(insulitic = if_else(image_id %in% image_ids, "insulitis", "non-insulitis"))
+}
+```
+
+# A3.: Islet-Infiltration and Insulitic Comparisons
+
+## A3.1: Cell-Type Level
+
+Compare the Infiltration Scores of Cell Types between Insulitic Islet and non-insulitic islets.
+Only ICIs.
+
+```{r infiltration-scores-cell-type-insulitic}
+dist_score <- metadata(spe)$celltype_compo_score |> as_tibble() |> 
+  select(image_id, case_id, donor_type, starts_with("NormScoreArea_"), starts_with("AbsScore")) |> 
+  pivot_longer(cols = starts_with("NormScoreArea_"), 
+               names_to = "cell_type", values_to = "NormScoreArea") |>
+  mutate(cell_type = stringr::str_remove(cell_type, "NormScoreArea_")) |>
+  pivot_longer(cols = starts_with("AbsScore"), 
+               names_to = "cell_type2", values_to = "DistScore") |> 
+  mutate(cell_type2 = stringr::str_remove(cell_type2, "AbsScore_")) |> 
+  filter(cell_type == cell_type2) |> 
+  mutate(insulitic = ifelse(image_id %in% image_ids, "insulitis", "non-insulitis"))
+
+## select only cases with both insulitic and non-insulitic islets. (PAIRED ANALYSIS)
+case_ids <- dist_score |> 
+  dplyr::distinct(case_id, insulitic) |>
+  dplyr::count(case_id) |> filter(n == 2) |> pull(case_id)
+
+## Calculate P-value
+p_vals <- dist_score |> 
+  filter(case_id %in% case_ids) |>
+  filter(donor_type %in% c("mAAb+", "RecentOnset")) |>
+  filter(image_id %in% icis) |>
+  filter(cell_type %in% c("T_CD4", "T_CD8", "Myeloid", "T_DN", "NK", "B", "Neutrophil")) |>
+  tidyr::nest(data = -c(cell_type)) |> 
+  dplyr::mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(data = ., DistScore ~ insulitic + (1 | case_id))))) |> 
+  tidyr::unnest(test) |>
+  filter(term != "(Intercept)", effect == "fixed") |> 
+  mutate(p.adj = p.adjust(p.value, method = "fdr")) |> 
+  arrange(p.adj) |> 
+  mutate(insulitic = stringr::str_remove(term, "insulitic")) |> 
+  mutate(significance = cut(p.adj, breaks = c(-Inf, 0.001, 0.01, 0.05, Inf),
+                            labels = c("***", "**", "*", "")))
+
+ # get max-y-value PER channel.
+max_values <- dist_score|> 
+  group_by(cell_type) |> 
+  summarise(p_vals_pos = max(DistScore)*0.9)
+ # Join with p-vals
+p_vals <- p_vals |> left_join(max_values, by = "cell_type")
+
+## Plot
+p <- dist_score |> 
+  filter(cell_type %in% c("T_CD4", "T_CD8", "Myeloid", "T_DN", "NK", "B", "Neutrophil")) |>
+  ggplot(aes(x = insulitic, y = DistScore, fill = insulitic)) +
+  geom_boxplot() +
+  labs(x = "Cell Type", y = "DistScore", color = "Donor Type") +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  facet_wrap(~cell_type, scales = "free_y")
+
+p <- p + geom_text(data = p_vals, 
+    aes(x = insulitic, y = p_vals_pos, label = significance), 
+     size = 10) + 
+facet_wrap(~cell_type, scales = "free_y")
+
+print(p)
+fn <- paste0(paste(today, "Average_DistScore_CellType", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+
+-> T-cells are obviously highly significant; given that they were used to define insulitis.
+-> Myeloid >> NK > B_cells (because rare) > Neutrophils (barely)
+
+## A3.2: Cell Cluster Level - GLOBAL OVERVIEW.
+Compare DistScore of Insulitic vs Non-Insulitic Islets between Cell Clusters.
+```{r infiltration-scores-cell-clusters-insulitic}
+## Get DistScore for Cell Clusters.
+dist_score_cluster <- metadata(spe)$cluster_compo_score[[1]] |> as_tibble() |> 
+  select(image_id, case_id, donor_type, starts_with("NormScoreArea_"), starts_with("AbsScore")) |> 
+  pivot_longer(cols = starts_with("NormScoreArea_"), 
+               names_to = "cell_cluster_scaled", values_to = "NormScoreArea") |>
+  mutate(cell_cluster_scaled = stringr::str_remove(cell_cluster_scaled, "NormScoreArea_")) |>
+  pivot_longer(cols = starts_with("AbsScore"), 
+               names_to = "cell_cluster_scaled2", values_to = "DistScore") |> 
+  mutate(cell_cluster_scaled2 = stringr::str_remove(cell_cluster_scaled2, "AbsScore_")) |> 
+  filter(cell_cluster_scaled == cell_cluster_scaled2) |> 
+  mutate(insulitic = ifelse(image_id %in% image_ids, "insulitis", "non-insulitis")) |> 
+  mutate(cell_type = stringr::str_remove(cell_cluster_scaled, "_[0-9]+$")) |> 
+  mutate(cell_type = ifelse(cell_cluster_scaled == "T-naive", "T_CD8", cell_type)) |> 
+  mutate(cell_type = ifelse(cell_cluster_scaled == "T-EMRA", "T_CD8", cell_type))
+
+dist_score_cluster |> distinct(cell_type)
+
+## Calculate P-value (OVERVIEW).
+p_full <- dist_score_cluster |> 
+  filter(donor_type %in% c("mAAb+", "RecentOnset")) |>
+  filter(image_id %in% icis) |>
+  tidyr::nest(data = -c(cell_cluster_scaled)) |> 
+  dplyr::mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(data = ., NormScoreArea ~ insulitic + (1 | case_id))))) |> 
+  tidyr::unnest(test) |> 
+  mutate(p.adj = p.adjust(p.value, method = "fdr")) |> 
+  arrange(p.adj) |> 
+  filter(term != "(Intercept)", effect == "fixed") |> 
+  mutate(insulitic = stringr::str_remove(term, "insulitic")) |> 
+  mutate(cell_type = stringr::str_remove(cell_cluster_scaled, "_[0-9]+$")) |> 
+  mutate(cell_type = ifelse(cell_cluster_scaled == "T-naive", "T_CD8", cell_type)) |> 
+  mutate(cell_type = ifelse(cell_cluster_scaled == "T-EMRA", "T_CD8", cell_type))
+
+## Iterate through Cell Types:
+celltypes_oi <- c("T_CD4", "T_CD8", "Myeloid", "NK")
+purrr::map(celltypes_oi, \(cur_ct){
+  message("Plotting DistScore for Cell Type: ", cur_ct)
+  p_vals <- p_full |> filter(cell_type == !!cur_ct)
+  p_vals$significance <- cut(p_vals$p.adj,
+                            breaks = c(-Inf, 0.001, 0.01, 0.05, Inf),
+                            labels = c("***", "**", "*", ""))
+  # get max-y-value PER channel.
+  max_values <- dist_score_cluster |> filter(cell_type == !!cur_ct) |>
+    group_by(cell_cluster_scaled) |> 
+    summarise(p_vals_pos = max(DistScore)*0.9)
+  # Join with p-vals 
+  p_vals <- p_vals |> left_join(max_values, by = "cell_cluster_scaled")
+  p <- dist_score_cluster |> 
+    filter(cell_type %in% !!cur_ct) |>
+    ggplot(aes(x = insulitic, y = DistScore, fill = insulitic)) +
+    geom_boxplot() +
+    labs(x = "Cell Cluster", y = "DistScore", color = "Donor Type") +
+    mytheme$standard() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+    facet_wrap(~cell_cluster_scaled, scales = "free_y") + 
+    scale_fill_manual(values = palettes$colors[1:2])
+
+  p <- p + geom_text(data = p_vals, 
+    aes(x = insulitic, y = p_vals_pos, label = significance), 
+     size = 10) +
+    facet_wrap(~cell_cluster_scaled, scales = "free_y")
+  print(p)
+
+  fn <- paste0(paste(today, "Average_DistScore_Insulitis", cur_ct, sep = "_"), ".png")
+  do.call(ggsave, c(list(fn, p), plotsave_param))
+})
+```
+
+## A3.3: Specific Myeloid Cell Types. 
+### A3.4: Myeloid-3 and Myeloid-4
+
+Plot this plot with Myeloid-3 and Myeloid-4.
+**ONLY INCLUDES paired comparisons!**
+Show increase in DistScore for Myeloid-3 and Myeloid-4 in Insulitic Islets.
+
+```{r prepare_data}
+input_df <- dist_score_cluster |> 
+  filter(donor_type %in% c("mAAb+", "RecentOnset")) |>
+  filter(cell_cluster_scaled %in% c("Myeloid_3", "Myeloid_4", "Myeloid_5")) |>
+  filter(image_id %in% icis)
+
+## My3 cases.
+case_ids_my3 <- input_df |> 
+  filter(cell_cluster_scaled == "Myeloid_3") |>
+  filter(NormScoreArea > 0) |>
+  dplyr::distinct(case_id, insulitic) |>
+  dplyr::count(case_id) |> filter(n == 2) |> pull(case_id) |> unique()
+length(case_ids_my3) ## N = 23
+
+## My4 cases.
+case_ids_my4 <- input_df |> 
+  filter(cell_cluster_scaled == "Myeloid_4") |>
+  filter(NormScoreArea > 0) |> 
+  dplyr::distinct(case_id, insulitic) |>
+  dplyr::count(case_id) |> filter(n == 2) |> pull(case_id) |> unique()
+
+length(case_ids_my4) ## N = 11
+
+## My5 cases.
+case_ids_my5 <- input_df |> 
+  filter(cell_cluster_scaled == "Myeloid_5") |>
+  filter(NormScoreArea > 0) |> 
+  dplyr::distinct(case_id, insulitic) |>
+  dplyr::count(case_id) |> filter(n == 2) |> pull(case_id) |> unique()
+length(case_ids_my5) ## N = 23
+```
+
+Plot Myeloid 3 + Myeloid-4.
+```{r}
+case_stages <- colData(spe)[, c("case_id", "age")] |> as_tibble() |> distinct() |> 
+  mutate(age_group = ifelse(age < 13, "< 13", ">= 13"))
+
+input_df2 <- input_df |> 
+  inner_join(case_stages, by = "case_id") |>
+  filter((cell_cluster_scaled == "Myeloid_3" & case_id %in% case_ids_my3) |
+         (cell_cluster_scaled == "Myeloid_4" & case_id %in% case_ids_my4))  |> 
+  filter(donor_type == "RecentOnset")
+
+p_vals <- input_df2  |>
+  tidyr::nest(data = -c(cell_cluster_scaled)) |>
+  dplyr::mutate(test = purrr::map(data, 
+    ~ broom.mixed::tidy(lmerTest::lmer(data = ., log1p(NormScoreArea) ~ insulitic + age_group +  (1 | case_id))))) |>
+  tidyr::unnest(test) |> 
+  filter(term != "(Intercept)", effect == "fixed", term != "age_group>= 13") |> 
+  mutate(.y. = "NormScoreArea",
+          p = p.value,
+          p.adj = p.adjust(p, method = "fdr"),
+          p.signif = cut(p.adj, breaks = c(-Inf, 0.001, 0.01, 0.05, Inf), labels = c("***", "**", "*", ""))
+          ) |> 
+  select(.y., p, p.adj, p.signif, cell_cluster_scaled)
+
+# Final plot.
+plot_df <- input_df2 |> 
+  filter(cell_cluster_scaled %in% c("Myeloid_3", "Myeloid_4")) |>
+  group_by(cell_cluster_scaled, case_id, insulitic, age_group) |> 
+  summarize(NormScoreArea = mean(NormScoreArea, na.rm = TRUE), .groups = "drop") |> 
+  mutate(NormScoreArea = log1p(NormScoreArea))
+
+# get max-y-value PER channel.
+p_vals <- plot_df |> 
+  filter(cell_cluster_scaled %in% c("Myeloid_3", "Myeloid_4")) |>
+  group_by(cell_cluster_scaled) |> 
+  summarise(p_vals_pos = log1p(max(NormScoreArea))) |> 
+  right_join(p_vals, by = "cell_cluster_scaled")
+
+# Join with p-vals.
+stat.test <- plot_df |> 
+  group_by(cell_cluster_scaled) |> 
+  rstatix::t_test(
+    NormScoreArea ~ insulitic, paired = TRUE,
+  ) |> 
+    add_xy_position(x = "insulitic", step.increase = 0.07, dodge = 0.8) |> 
+    distinct() |> 
+    select(cell_cluster_scaled, group1, group2, y.position)
+
+stat.test.test <- p_vals |> 
+  left_join(stat.test, by = "cell_cluster_scaled")
+stat.test.test
+
+p <- 
+  ggpubr::ggviolin(plot_df, x = "insulitic", y = "NormScoreArea", 
+                   fill = "insulitic", add = "point", facet.by = "cell_cluster_scaled",
+                   draw_quantiles = c(0.25, 0.5, 0.75), 
+          add.params = list(alpha = 1, size = 1.5)) +
+  stat_pvalue_manual(stat.test.test, label = "p.signif", tip.length = 0.05,
+                      size = 10, label.size = 10, vjust = 0.5) + 
+  labs(x = "", y = "Log: Infiltration Score", color = "Donor Type") +
+  mytheme$standard_new() +
+  facet_wrap(~cell_cluster_scaled, scales = "free_y",
+             labeller = labeller(cell_cluster_scaled = c("Myeloid_3" = "Act. M1/M2-like",
+                                                         "Myeloid_4" = "cDC"))) + 
+  scale_fill_manual(values = palettes$colors[1:2]) + 
+  scale_x_discrete(labels = c("insulitis" = "Insulitic", "non-insulitis" = "Non-Insulitic")) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  theme(
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 22),
+        axis.text.y = element_text(size = 22),
+        axis.title.x = element_text(size = 25),
+        axis.title.y = element_text(size = 25),
+        strip.text = element_text(size = 25)) + 
+  geom_line(aes(group = case_id), alpha = 0.5)
+print(p)
+
+fn <- paste0(paste(today, "Average_DistScore_Insulitis_Myeloid3_Myeloid4", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+extfig9d <- p
+saveRDS(extfig9d, file.path(paths$home_git, "figures", "extfig9d.rds"))
+```
+
+Plot Myeloid 5. NOTE: AGE-GROUP is significant here as co-variate (*).
+```{r}
+input_df2 <- input_df |> 
+  filter((cell_cluster_scaled == "Myeloid_5" & case_id %in% case_ids_my5)) |> 
+  inner_join(case_stages, by = "case_id")  |> 
+  mutate(insulitic = ifelse(insulitic == "insulitis", "Insulitic", "Non-Insulitic")) |> 
+  mutate(cell_cluster_scaled = ifelse(cell_cluster_scaled == "Myeloid_5", "CD11c+ Macrophages", cell_cluster_scaled)) |> 
+  filter(donor_type == "RecentOnset")
+
+p_vals <- input_df2  |>
+  tidyr::nest(data = -c(cell_cluster_scaled)) |>
+  dplyr::mutate(test = purrr::map(data, 
+    ~ broom.mixed::tidy(lmerTest::lmer(data = ., log1p(NormScoreArea) ~ insulitic + age_group + (1 | case_id))))) |>
+  tidyr::unnest(test) |> 
+  filter(term != "(Intercept)", effect == "fixed", term != "age_group>= 13") |> 
+  mutate(.y. = "NormScoreArea",
+          p = p.value,
+          p.adj = p.adjust(p, method = "fdr"),
+          p.signif = cut(p.adj, breaks = c(-Inf, 0.001, 0.01, 0.05, Inf), labels = c("***", "**", "*", ""))
+          ) |> 
+  select(.y., p, p.adj, p.signif, cell_cluster_scaled)
+
+# Final plot.
+plot_df <- input_df2 |> 
+  filter(cell_cluster_scaled %in% c("CD11c+ Macrophages")) |>
+  group_by(cell_cluster_scaled, case_id, insulitic) |> 
+  summarize(NormScoreArea = mean(NormScoreArea, na.rm = TRUE), .groups = "drop") |> 
+  mutate(NormScoreArea = log1p(NormScoreArea))
+
+# get max-y-value PER channel.
+p_vals <- plot_df |> 
+  filter(cell_cluster_scaled %in% c("CD11c+ Macrophages")) |>
+  group_by(cell_cluster_scaled) |> 
+  summarise(p_vals_pos = log1p(max(NormScoreArea))) |> 
+  right_join(p_vals, by = "cell_cluster_scaled")
+
+# Join with p-vals. This just for easier formating. Other P-values are used.
+stat.test <- plot_df |> 
+  group_by(cell_cluster_scaled) |> 
+  rstatix::t_test(
+    NormScoreArea ~ insulitic, paired = TRUE,
+  ) |> 
+    add_xy_position(x = "insulitic", step.increase = 0.07, dodge = 0.8) |> 
+    distinct() |> 
+    select(cell_cluster_scaled, group1, group2, y.position)
+
+stat.test.test <- p_vals |> 
+  left_join(stat.test, by = "cell_cluster_scaled") |> 
+  mutate(y.position = y.position *1.3)
+stat.test.test
+
+p <- 
+  ggpubr::ggviolin(plot_df, x = "insulitic", y = "NormScoreArea", 
+                   fill = "insulitic", add = "point", facet.by = "cell_cluster_scaled",
+                   draw_quantiles = c(0.25, 0.5, 0.75), 
+          add.params = list(alpha = 1, size = 1.5)) +
+  stat_pvalue_manual(stat.test.test, label = "p.signif", tip.length = 0.05,
+                      size = 10, label.size = 10, vjust = 0.5) + 
+  labs(x = "", y = "log: Infiltration Score", color = "Donor Type") +
+  mytheme$standard_new() +
+  scale_fill_manual(values = palettes$insulitic) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 22),
+        axis.text.y = element_text(size = 22),
+        axis.title.x = element_text(size = 25),
+        axis.title.y = element_text(size = 25),
+        strip.text = element_text(size = 25)) + 
+  geom_line(aes(group = case_id), alpha = 0.5) 
+
+print(p)
+
+fn <- paste0(paste(today, "Average_DistScore_Insulitis_Myeloid5", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+# Save the plot
+extfig10c <- p
+saveRDS(extfig10c, file.path(paths$home_git, "figures", "extfig10c.rds"))
+```
+
+
+# A4: Cluster and Identify Peri-Insulitic Lesions
+
+## A4.1: Prepare Data.
+For REC-ICI-Insulitis; cluster NormScoreArea.
+-> Use AbsScore!
+-> Normalized Scores will be correlated, due to the normalization.
+
+Identify co-regulated Cell Clusters associated to Insulitis.
+
+```{r peri-insulitic-lesions}
+not_rel_clusters <- readRDS(file.path(paths$folder_out, "09_CellTypeCompo_cells_Immune", "not_ins_relevant_clusters.rds"))
+
+peri_insulitic <- exprs_df  |> 
+  filter(cell_type %in% c("Myeloid", "T_CD4", "T_CD8", "B")) |>
+  filter(!cell_cluster_scaled %in% not_rel_clusters) |>
+  filter(distance_to_islet >= -20) |>
+  mutate(cell_cluster_scaled = ifelse(cell_type == "B", "B", cell_cluster_scaled))  |>
+  # -70 IDI insulitic images.
+  filter(islet_type == "ICI") |>
+  # Average for: Image, Insulitic, Cell Cluster
+  group_by(donor_type, case_id, image_id, cell_cluster_scaled, insulitic) |>
+  summarize(n = sum(DistScoreSqrt), .groups = "drop") |> 
+  tidyr::complete(image_id, cell_cluster_scaled, fill = list(n = 0)) |>
+  group_by(image_id) |>
+  mutate(insulitic = insulitic %>% table() %>%  which.max() %>% names()) |>
+  mutate(donor_type = donor_type %>% table() %>%  which.max() %>% names()) |>
+  ungroup() |> 
+  tidyr::drop_na()
+
+## Subset to only mAA/RecentOnset + Insulitic 
+peri_insulitic_df <- peri_insulitic |> 
+  ungroup() |> 
+  # Remove clusters ending in "_Other"
+  filter(!grepl("_Other", cell_cluster_scaled)) |>
+  tidyr::pivot_wider(names_from = cell_cluster_scaled, values_from = n, values_fill = 0) |>
+  dplyr::filter(donor_type %in% c("mAAb+", "RecentOnset")) |> 
+  filter(insulitic == "insulitis")
+
+rec_per_islet <- peri_insulitic_df |>
+  select(-c(image_id, case_id, donor_type, insulitic))
+```
+
+### A4.2: Correlate DistScores between Cell Clusters.
+### A4.2.1: Pearson
+
+PEARSON Correlation of DistScores between Cell Clusters.
+```{r pearson-peri-insulitic}
+## Pearson
+recent_onset_islet_pearson <- rec_per_islet |> 
+  cor(use = "pairwise.complete.obs", method = "pearson")
+
+saveRDS(recent_onset_islet_pearson, file.path(paths$home_git, "figures", "ch_fig6e.rds"))
+
+## Complex-heatmap
+set.seed(222)
+fn <- paste0(paste(today, "Correlations", "peri_islet_pearson", sep = "_"), ".png")
+png(file.path(paths$folder_script, fn), width = 1000, height = 1000)
+p <- ComplexHeatmap::Heatmap(recent_onset_islet_pearson, col = circlize::colorRamp2(c(-1, 0, 1), c("blue", "white", "red")), 
+                             name = "Correlation", 
+                             clustering_distance_rows = "euclidean", clustering_method_rows = "complete", 
+                             clustering_distance_columns = "euclidean", clustering_method_columns = "complete",
+                             show_row_names = TRUE, show_column_names = TRUE,
+                             # increase row and column names font
+                             row_names_gp = grid::gpar(fontsize = 25),
+                             column_names_gp = grid::gpar(fontsize = 25),
+                             # increase legend font size
+                                                           heatmap_legend_param = list(legend_direction = "vertical",
+                                                          title_gp = grid::gpar(fontsize = 20, fontfamily = "Arial"),
+                                                          labels_gp = grid::gpar(fontsize = 20, fontfamily = "Arial")),)
+ComplexHeatmap::draw(p)
+dev.off()
+```
+
+
+### A4.2.2: Pearson + log1p
+
+PEARSON Correlation of DistScores between Cell Clusters.
+```{r pearson-peri-insulitic}
+## Pearson
+recent_onset_islet_pearson <- rec_per_islet |> 
+  # log-transform
+  mutate(across(everything(), ~ log1p(.))) |>
+  cor(use = "pairwise.complete.obs", method = "pearson")
+
+## Complex-heatmap
+set.seed(222)
+fn <- paste0(paste(today, "Correlations", "peri_islet_pearson_log1p", sep = "_"), ".png")
+png(file.path(paths$folder_script, fn), width = 1000, height = 1000)
+p <- ComplexHeatmap::Heatmap(recent_onset_islet_pearson, col = circlize::colorRamp2(c(-1, 0, 1), c("blue", "white", "red")), 
+                             name = "Correlation", 
+                             clustering_distance_rows = "euclidean", clustering_method_rows = "complete", 
+                             clustering_distance_columns = "euclidean", clustering_method_columns = "complete",
+                             show_row_names = TRUE, show_column_names = TRUE,
+                             # increase row and column names font
+                             row_names_gp = grid::gpar(fontsize = 25),
+                             column_names_gp = grid::gpar(fontsize = 25),
+                             # increase legend font size
+                                                           heatmap_legend_param = list(legend_direction = "vertical",
+                                                          title_gp = grid::gpar(fontsize = 20, fontfamily = "Arial"),
+                                                          labels_gp = grid::gpar(fontsize = 20, fontfamily = "Arial")),)
+ComplexHeatmap::draw(p)
+dev.off()
+```
+
+## A4.3: Correlation of Cell Clusters in Peri-Insulitic Islets.
+
+-> Correlation of specific cell clusters in the peri-insulitic islets.
+
+Plotting the correlations of specific cell clusters in the peri-insulitic islets.
+```{r}
+## Plot correlation scores of T-CD4-5 + B
+age_cases <- exprs_df |> 
+  select(age, case_id, donor_type) |>
+  distinct()
+
+input_df <- peri_insulitic |> 
+  filter(cell_cluster_scaled %in% c("T_CD4_5", "T_CD8_7", "Myeloid_3", "B", "Myeloid_4", "T-naive")) |> 
+  mutate(case_id = stringr::str_sub(image_id, 1, 4)) |> 
+  left_join(age_cases, by = c("case_id", "donor_type")) |> 
+  filter(donor_type %in% c("mAAb+", "RecentOnset")) |> 
+  filter(insulitic == "insulitis") |> 
+  pivot_wider(names_from = cell_cluster_scaled, values_from = n, values_fill = 0) |> 
+  mutate(age_group = ifelse(age < 13, "<13", ">=13")) |>
+  select(c("case_id", "age_group", "Myeloid_4", "Myeloid_3", "T-naive", "T_CD4_5", "B", "T_CD8_7", "age"))
+
+p <- input_df |> 
+  filter(T_CD4_5 > 0, `T-naive` > 0) |>
+  ggplot(aes(x = T_CD4_5, y = `T-naive`, color = age_group)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm", se = TRUE) +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggpubr::stat_cor(method = "pearson", aes(color = age_group), size = 6) +  # Correlation per group  
+  theme(axis.text.x = element_text(size = 22),
+        axis.text.y = element_text(size = 22),
+        axis.title.x = element_text(size = 25),
+        axis.title.y = element_text(size = 25),
+        strip.text = element_text(size = 25))  + 
+  labs(x = "Infiltration score: PD1+ act. cells", 
+       y = "Infiltration score: T-naive") + 
+  scale_color_manual(name = "Age Group (years)", 
+                     values = palettes$colors50[c(9, 12)]) + 
+  theme(legend.position = "top", 
+        legend.orientation = "horizontal")
+print(p)
+fn <- paste0(paste(today, "Correlations", "Insulitic_T_CD4_5_T_naive", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+# saveRDS(p, file.path(paths$home_git, "figures", "extfig10b.rds"))
+
+## T-naive + B-cells.
+p <- input_df |> 
+  filter(B > 0, `T-naive` > 0) |>
+  ggplot(aes(x = log1p(B), y = log1p(`T-naive`), color = age_group)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm", se = TRUE) +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggpubr::stat_cor(method = "pearson",  aes(group = age_group), size = 6) +  # Correlation per group  
+  theme(axis.text.x = element_text(size = 22),
+        axis.text.y = element_text(size = 22),
+        axis.title.x = element_text(size = 25),
+        axis.title.y = element_text(size = 25),
+        strip.text = element_text(size = 25))  + 
+  labs(x = "Infiltration Score: B-cells", 
+       y = "Infiltration Score: T-naive") + 
+  scale_color_manual(name = "Age Group (years)", 
+                     values = palettes$colors50[c(9, 12)]) + 
+  theme(legend.position = "top", 
+        legend.orientation = "horizontal")
+print(p)
+fn <- paste0(paste(today, "Correlations", "Insulitic_B_Tnaive", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+## T-CD8-7 + Myeloid-3
+p <- input_df |> 
+  filter(T_CD8_7 > 0, Myeloid_3 > 0) |>
+  ggplot(aes(x = log1p(Myeloid_3), y = log1p(T_CD8_7), color = age_group)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm", se = TRUE) +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggpubr::stat_cor(method = "pearson", aes(color = age_group), size = 6) +  # Correlation per group  
+  theme(axis.text.x = element_text(size = 22),
+        axis.text.y = element_text(size = 22),
+        axis.title.x = element_text(size = 25),
+        axis.title.y = element_text(size = 25),
+        strip.text = element_text(size = 25))  + 
+  labs(x = "log1p: Infiltration Score: T_CD8_7s", 
+       y = "log1p: Infiltration Score: Myeloid_3") + 
+  scale_color_manual(name = "Age Group (years)", 
+                     values = palettes$colors50[c(9, 15)]) + 
+  theme(legend.position = "top", 
+        legend.orientation = "horizontal")
+print(p)
+fn <- paste0(paste(today, "Correlations", "Insulitic_T_CD8_7_Myeloid3_AGE", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+## T-CD8-7 + Myeloid-3
+p <- input_df |> 
+  filter(T_CD8_7 > 0, Myeloid_3 > 0) |>
+  ggplot(aes(x = log1p(Myeloid_3), y = log1p(T_CD8_7))) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm", se = TRUE) +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggpubr::stat_cor(method = "pearson", size = 6) +  # Correlation per group  
+  theme(axis.text.x = element_text(size = 22),
+        axis.text.y = element_text(size = 22),
+        axis.title.x = element_text(size = 25),
+        axis.title.y = element_text(size = 25),
+        strip.text = element_text(size = 25))  + 
+  labs(x = "log1p: Infiltration Score: T_CD8_7s", 
+       y = "log1p: Infiltration Score: Myeloid_3") + 
+  scale_color_manual(name = "Age Group (years)", 
+                     values = palettes$colors50[c(9, 15)]) + 
+  theme(legend.position = "top", 
+        legend.orientation = "horizontal")
+print(p)
+fn <- paste0(paste(today, "Correlations", "Insulitic_T_CD8_7_Myeloid3_NOAGE", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+## Note: also aggregating by donor is highly significant.
+summary(lmerTest::lmer(log1p(T_CD8_7) ~ log1p(Myeloid_3) + (1|case_id), 
+  data = input_df |> 
+  filter(T_CD8_7 > 0, Myeloid_3 > 0)))
+```
+
+
+```{r}
+peri_insulitic <- exprs_df  |> 
+  filter(cell_type %in% c("Myeloid", "T_CD4", "T_CD8", "B")) |>
+  filter(!cell_cluster_scaled %in% not_rel_clusters) |>
+  filter(distance_to_islet >= -20) |>
+  mutate(cell_cluster_scaled = ifelse(cell_type == "B", "B", cell_cluster_scaled))  |>
+  # -70 IDI insulitic images.
+  filter(islet_type == "ICI") |>
+  # Average for: Image, Insulitic, Cell Cluster
+  group_by(donor_type, case_id, image_id, cell_cluster_scaled, insulitic) |>
+  summarize(n = sum(DistScore), .groups = "drop") |> 
+  tidyr::complete(image_id, cell_cluster_scaled, fill = list(n = 0)) |>
+  group_by(image_id) |>
+  mutate(insulitic = insulitic %>% table() %>%  which.max() %>% names()) |>
+  mutate(donor_type = donor_type %>% table() %>%  which.max() %>% names()) |>
+  ungroup() |> 
+  tidyr::drop_na()
+
+## Correlation of DistScores.
+data_tt <- peri_insulitic |> 
+    filter(donor_type %in% c("RecentOnset", "mAAb+")) |>
+    mutate(insulitic = if_else(image_id %in% image_ids, "insulitis", "non-insulitis")) |> 
+    filter(cell_cluster_scaled %in% c("Myeloid_3", "T_CD8_7")) |> 
+    pivot_wider(names_from = cell_cluster_scaled, values_from = n, values_fill = 0) |> 
+    filter(insulitic == "insulitis")
+
+cor_test <- cor.test(log1p(data_tt$Myeloid_3), log1p(data_tt$T_CD8_7), method = "pearson")
+cor_test_sp <- cor.test(data_tt$Myeloid_3, data_tt$T_CD8_7, method = "spearman")
+
+(round(cor_test_sp$estimate, 2))
+(signif(cor_test_sp$p.value, 3))
+# Extract correlation coefficient and p-value
+(pearson_r <- round(cor_test$estimate, 2))
+(p_value <- signif(cor_test$p.value, 3))
+
+p <- data_tt |>
+    ggplot(aes(x = log1p(Myeloid_3), y = log1p(T_CD8_7))) +
+    geom_point() +
+    geom_smooth(method = "lm", se = TRUE) +
+    labs(x = "Infiltration Score: M1/M2-like act.", 
+         y = "Infiltration Score: PD1+,CD27+ T-CD8") +
+    mytheme$standard() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+    ggpubr::stat_cor(method = "spearman", label.x = 0, label.y = 3.5, size = 10) + 
+    theme(axis.text.x = element_text(size = 22),
+          axis.text.y = element_text(size = 22),
+          axis.title.x = element_text(size = 25),
+          axis.title.y = element_text(size = 25),
+          strip.text = element_text(size = 25))
+
+print(p)
+fn <- paste0(paste(today, "DistScore_Myeloid3_vs_T_CD8_7", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+fig5i <- p
+saveRDS(fig5i, file.path(paths$home_git, "figures", "fig5i.rds"))
+```
+
+
+# A6: Expression changes between Insulitic and Non-Insulitic Islets:
+
+Filter Peri-insulitic Cells. In REC.
+```{r}
+### Prepare the data.
+### ICI. Peri-insulitic.
+ici_immune <- exprs_df |> 
+  filter(islet_type == "ICI", 
+         cell_type %in% c("T_CD4", "T_CD8", "Myeloid", "T_DN", "NK", "B", "Neutrophil", "Endothelial")) |> 
+  filter(infiltration %in% c("inside", "< 20 um"))
+```
+
+
+## A6.3: Endothelial Insulitis EXPRESSION ANALYSIS.
+Compare insulitic vs non-insulitic ICIs.
+```{r endothelial-insulitic-changes}
+## Endothelial cells:
+## COmpare expression for Endothelial cells next:
+features_oi <- unique(c("CD54", metadata(spe)$channels$Endothelial))
+
+## 
+endo_df <- ici_immune  |> 
+    filter(cell_type == "Endothelial", donor_type %in% c("RecentOnset", "mAAb+")) |> 
+    select(all_of(features_oi), cell_cluster_scaled, case_id, insulitic, image_id, donor_type)
+
+# Select paired case-ids with insulitic + non-insulitic images.
+case_ids <- endo_df |> 
+  filter(donor_type %in% c("RecentOnset", "mAAb+")) |>
+  distinct(case_id, insulitic) |>
+  dplyr::count(case_id) |> 
+  filter(n == 2) |> pull(case_id) |> 
+  unique()
+
+## Calculate Expression Differences.
+stats <- endo_df |> 
+  filter(case_id %in% case_ids) |>
+  group_by(image_id, insulitic, case_id, cell_cluster_scaled) |>
+  summarize(across(all_of(features_oi), \(x) mean(x, na.rm = TRUE)), .groups = "drop") |>
+  pivot_longer(cols = all_of(features_oi), names_to = "channel", values_to = "value") |>
+  tidyr::nest(data = -c(cell_cluster_scaled, channel)) |>
+  dplyr::mutate(test = purrr::map(data, ~ broom.mixed::tidy(lmerTest::lmer(data = ., value ~ insulitic + (1 | case_id))))) |>
+  tidyr::unnest(test) |>
+  filter(term != "(Intercept)", effect == "fixed") |>
+  arrange(p.value) |> 
+  mutate(p.adj = p.adjust(p.value, method = "fdr"))
+
+## Plot:
+p <- stats |> 
+  filter(p.adj < 0.1) |>
+  ggplot(aes(x = channel, y = statistic, fill = cell_cluster_scaled)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(x = "Channel", y = "Statistic", color = "Channel") +
+  mytheme$standard() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(p)
+
+fn <- paste0(paste(today, "Expression_Endo_Insulitis", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+```
+-> As expected, strong upregulated in HLA-DR and CD54.
+
+
+
+# A8: Insulitis in endocrine Cells.
+
+## A8.1: Prepare Data.
+```{r}
+channels <- metadata(spe)$channels
+channels_imm <- unique(c("VIM", unlist(channels)))
+
+## Define Insulitic Islets + ICIs.
+## Filter Pancreatitis
+exprs_df <- as_tibble(scuttle::makePerCellDF(spe, features = channels_imm, assay.type = "exprs", use.dimred = FALSE)) |> 
+  select(all_of(channels_imm), case_id, DistScore, donor_type, image_id, infiltration, cell_type, distance_to_islet, cell_cluster_scaled) |> 
+  filter(donor_type != "Pancreatitis") |> 
+  group_by(image_id, case_id, donor_type) |>
+  mutate(islet_type = if_else(sum(cell_type == "Beta") > 0, "ICI", "IDI")) |> 
+  mutate(tcell = if_else(cell_type %in% c("T_CD4", "T_CD8"), "T-cell", "non-T-cell")) |>  ungroup() |> 
+  mutate(donor_type = factor(donor_type, levels = c("NoDiabetes", "sAAb+", "mAAb+", "RecentOnset", "LongDuration")))
+
+fn <- file.path(paths$folder_out, "13_MarkerExpression_cells_Immune", "insulitic_images.rds")
+
+if (file.exists(fn)) {
+  image_ids <- readRDS(fn)
+  exprs_df <- exprs_df |> 
+    mutate(insulitic = if_else(image_id %in% image_ids, "insulitis", "non-insulitis"))
+}
+```
+
+## A8.2: Define Insulitic Endocrine Cells.
+```{r insulitic-endocrine-cells}
+endocrine_insulitic <- exprs_df |> 
+  filter(islet_type == "ICI", cell_type %in% c("Beta", "Alpha", "Endothelial"))
+
+endocrine_insulitic_df <- endocrine_insulitic |> 
+  group_by(image_id, cell_type, insulitic, case_id, donor_type) |> 
+  summarize(across(all_of(channels_imm), \(x) mean(x, na.rm = TRUE)), .groups = "drop")  |> 
+  arrange(image_id)
+
+beta_df <- endocrine_insulitic_df |> 
+  filter(cell_type == "Beta") |> 
+  pivot_longer(cols = all_of(channels_imm), names_to = "channel", values_to = "MeanExprs")
+```
+
+
+## A8.3: Expression Changes in Insulitic vs Non-Insulitic Beta Cells.
+```{r insulitic-vs-non-insulitic-beta}
+## Compare between Insulitic and Non-insulitic ICIs.
+features_oi <- c("HLA_DR", "SYP", "VIM", "CD54")
+
+## Select only case-ids with insulitic + non-insulitic images.
+case_ids <- beta_df |> 
+  filter(donor_type %in% c("RecentOnset", "mAAb+")) |>
+  distinct(case_id, insulitic) |>
+  dplyr::count(case_id) |> 
+  filter(n == 2) |> 
+  pull(case_id) |> 
+  unique()
+
+## Delete rare beta-cell instances (to_del).
+data_tt <- beta_df |> 
+  filter(donor_type %in% c("RecentOnset")) |> 
+  filter(case_id %in% case_ids) |>
+  filter(channel %in% features_oi) |> 
+  mutate(insulitic = ifelse(insulitic == "insulitis", "Insulitic", "Non-Insulitic")) |>
+  mutate(insulitic = factor(insulitic, levels = c("Insulitic", "Non-Insulitic")))
+
+beta_df_plot <- data_tt |> 
+  group_by(case_id, donor_type, channel, insulitic) |> 
+  summarize(MeanExprs = mean(MeanExprs, na.rm = TRUE), .groups = "drop")
+
+## Calculate difference between INsulitic and Non-insulitic
+p_vals <- data_tt |> 
+  tidyr::nest(data = -c(channel)) |>
+  dplyr::mutate(test = purrr::map(data, ~ 
+            broom.mixed::tidy(lmerTest::lmer(data = ., MeanExprs ~ insulitic + (1 | case_id))))) |>
+  tidyr::unnest(test) |>
+  filter(effect == "fixed", term != "(Intercept)") |>
+  dplyr::select(channel, p.value, statistic, estimate, term) |> 
+  arrange(statistic) |> mutate(p.adj = p.adjust(p.value, method = "fdr")) |> 
+  mutate(significance = cut(p.adj, breaks = c(-Inf, 0.001, 0.01, 0.05, Inf), labels = c("***", "**", "*", "")) ) |> 
+  mutate(insulitic = stringr::str_remove(term, "insulitic"))
+
+# Use this for actual P-Values.
+p_vals <- p_vals |> 
+  mutate(.y. = "MeanExprs",
+         donor_type = stringr::str_remove(term, "donor_type"),
+         group1 = "Insulitic",
+         group2 = insulitic,
+         p = p.value,
+         p.adj = p.adjust(p, method = "fdr"),
+        p.signif = cut(p.adj, breaks = c(-Inf, 0.001, 0.01, 0.05, 0.1, Inf), labels = c("***", "**", "*", "•", ""))
+         ) |> 
+  select(channel, .y., group1, group2,
+         statistic, p, p.adj, p.signif)
+
+max_values <- beta_df_plot |> 
+  group_by(channel) |> 
+  summarize(max = max(MeanExprs, na.rm = TRUE) + 0.4, .groups = "drop")
+
+p_vals <- p_vals  |> 
+  left_join(max_values, by = "channel")
+
+## Calculate p-values with ggpubr.
+# Use this for right formatting of DF.
+stat.test <- data_tt  |> 
+  group_by(channel) |> 
+  t_test(MeanExprs ~ insulitic, ref.group = "Insulitic") |> 
+  adjust_pvalue()  |> 
+  add_significance("p.adj") |> 
+  add_xy_position(x = "insulitic", step.increase = 0.07, dodge = 0.8) |> 
+  select(-c(statistic, p, p.adj))
+
+# Combine formatting + P-value dataframe.
+stat.test.test <- p_vals |> 
+  left_join(stat.test, by = c("channel", ".y.", "group1", "group2")) |> 
+  mutate(y.position = max)
+
+# Plot.
+p <- ggviolin(beta_df_plot, x = "insulitic", y = "MeanExprs", fill = "insulitic", 
+        facet.by = "channel", palette = palettes$colors[1:2], add = "point",
+        draw_quantiles = c(0.25, 0.5, 0.75)) + 
+  stat_pvalue_manual(stat.test.test, label = "p.signif", tip.length = 0.02,
+                    size = 10, label.size = 10, vjust = +0.1, inherit.aes = FALSE) + 
+  facet_wrap(~channel, scales = "free_y") +
+  mytheme$standard() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 22),
+        axis.text.y = element_text(size = 22),
+        strip.text = element_text(size = 25),
+        axis.title.y = element_text(size = 25),
+        legend.position = "none") + 
+  labs(x = "", y = expression(beta ~ "-cell expression")) + 
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) + 
+  geom_line(aes(group = case_id), alpha = 0.5)
+print(p)
+
+fn <- paste0(paste(today, "Insulitic_Beta", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+extfig4g <- p
+saveRDS(extfig4g, file.path(paths$home_git, "figures", "extfig4g.rds"))
+```
+-> HLA-DR + CD54 are significantly upregulated in insulitic beta-cells.
+
+
+```{r select-endothelial-cells}
+endo_df <- endocrine_insulitic_df |> 
+  filter(cell_type == "Endothelial") |> 
+  pivot_longer(cols = all_of(channels_imm), names_to = "channel", values_to = "MeanExprs")
+```
+
+
+## A8.3: Expression Changes in Insulitic vs Non-Insulitic Endothelial Cells.
+```{r insulitic-vs-non-insulitic-endothelial}
+## Compare between Insulitic and Non-insulitic ICIs.
+features_oi <- c("HLA_DR", "VIM", "CD54")
+
+## Select only case-ids with insulitic + non-insulitic images.
+case_ids <- endo_df |> 
+  filter(donor_type %in% c("RecentOnset", "mAAb+")) |>
+  distinct(case_id, insulitic) |>
+  dplyr::count(case_id) |> 
+  filter(n == 2) |> 
+  pull(case_id) |> 
+  unique()
+  
+## Delete rare endothelial-cell instances (to_del).
+data_tt <- endo_df |> 
+  filter(donor_type %in% c("RecentOnset")) |> 
+  filter(case_id %in% case_ids) |>
+  filter(channel %in% features_oi) |> 
+  mutate(insulitic = ifelse(insulitic == "insulitis", "Insulitic", "Non-Insulitic")) |>
+  mutate(insulitic = factor(insulitic, levels = c("Insulitic", "Non-Insulitic")))
+
+endo_df_plot <- data_tt |> 
+  group_by(case_id, donor_type, channel, insulitic) |> 
+  summarize(MeanExprs = mean(MeanExprs, na.rm = TRUE), .groups = "drop")
+
+## Calculate difference between INsulitic and Non-insulitic
+p_vals <- data_tt |> 
+  tidyr::nest(data = -c(channel)) |>
+  dplyr::mutate(test = purrr::map(data, ~ 
+            broom.mixed::tidy(lmerTest::lmer(data = ., MeanExprs ~ insulitic + (1 | case_id))))) |>
+  tidyr::unnest(test) |>
+  filter(effect == "fixed", term != "(Intercept)") |>
+  dplyr::select(channel, p.value, statistic, estimate, term) |> 
+  arrange(statistic) |> mutate(p.adj = p.adjust(p.value, method = "fdr")) |> 
+  mutate(significance = cut(p.adj, breaks = c(-Inf, 0.001, 0.01, 0.05, Inf), labels = c("***", "**", "*", "")) ) |> 
+  mutate(insulitic = stringr::str_remove(term, "insulitic"))
+
+# Use this for actual P-Values.
+p_vals <- p_vals |> 
+  mutate(.y. = "MeanExprs",
+         donor_type = stringr::str_remove(term, "donor_type"),
+         group1 = "Insulitic",
+         group2 = insulitic,
+         p = p.value,
+         p.adj = p.adjust(p, method = "fdr"),
+        p.signif = cut(p.adj, breaks = c(-Inf, 0.001, 0.01, 0.05, 0.1, Inf), labels = c("***", "**", "*", "•", ""))
+         ) |> 
+  select(channel, .y., group1, group2,
+         statistic, p, p.adj, p.signif)
+
+max_values <- endo_df_plot |> 
+  group_by(channel) |> 
+  summarize(max = max(MeanExprs, na.rm = TRUE) + 0.4, .groups = "drop")
+
+p_vals <- p_vals  |> 
+  left_join(max_values, by = "channel")
+
+## Calculate p-values with ggpubr.
+# Use this for right formatting of DF.
+stat.test <- data_tt  |> 
+  group_by(channel) |> 
+  t_test(MeanExprs ~ insulitic, ref.group = "Insulitic") |> 
+  adjust_pvalue()  |> 
+  add_significance("p.adj") |> 
+  add_xy_position(x = "insulitic", step.increase = 0.07, dodge = 0.8) |> 
+  select(-c(statistic, p, p.adj))
+
+# Combine formatting + P-value dataframe.
+stat.test.test <- p_vals |> 
+  left_join(stat.test, by = c("channel", ".y.", "group1", "group2")) |> 
+  mutate(y.position = max)
+
+# Plot.
+p <- ggviolin(endo_df_plot, x = "insulitic", y = "MeanExprs", fill = "insulitic", 
+        facet.by = "channel", palette = palettes$colors[1:2], add = "point",
+        draw_quantiles = c(0.25, 0.5, 0.75)) + 
+  stat_pvalue_manual(stat.test.test, label = "p.signif", tip.length = 0.02,
+                    size = 10, label.size = 10, vjust = +0.1, inherit.aes = FALSE) + 
+  facet_wrap(~channel, scales = "free_y") +
+  mytheme$standard() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 22),
+        axis.text.y = element_text(size = 22),
+        strip.text = element_text(size = 25),
+        axis.title.y = element_text(size = 25),
+        legend.position = "none") + 
+  labs(x = "", y = "Endothelial-cell expression") + 
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) + 
+  geom_line(aes(group = case_id), alpha = 0.5)
+print(p)
+
+fn <- paste0(paste(today, "Insulitic_Endothelial", sep = "_"), ".png")
+do.call(ggsave, c(list(fn, p), plotsave_param))
+
+suppfig9 <- p
+saveRDS(suppfig9, file.path(paths$home_git, "figures", "suppfig9.rds"))
+```
+-> HLA-DR + CD54 are significantly upregulated in insulitic endothelial-cells.
