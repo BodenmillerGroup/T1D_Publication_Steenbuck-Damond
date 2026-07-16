@@ -31,7 +31,7 @@ Full Data (masks, images, models, processed SCE objects, raw data) are available
 The full data (masks, SCE object) or a subset (masks, images, SCE objects) can be accessed via the `imcdatasets` package.
 
 NOTE: The data is currently being added to `imcdatasets` and uploaded to `ExperimentHub`. 
-Until then, please pull the data from this Zenodo repository (https://zenodo.org/uploads/21167694).
+Until then, please pull the data from this Zenodo repository (https://zenodo.org/uploads/21371432).
 This is the SAME data as will be available via `imcdatasets`.
 
 Data does not differ strongly from the original Zenodo upload, 
